@@ -21,7 +21,11 @@ logger = get_logger(__name__)
 class TaskService:
     """Service class for task operations"""
 
-    VALID_STATUSES = ["todo", "doing", "review", "done"]
+    VALID_STATUSES = [
+        "draft", "proposed", "approved", "planning", "owner-qa",
+        "assigned", "executing", "architect-review", "review",
+        "done", "failed", "escalated", "on-hold", "cancelled",
+    ]
 
     def __init__(self, supabase_client=None):
         """Initialize with optional supabase client"""
@@ -52,6 +56,16 @@ class TaskService:
             )
         return True, ""
 
+    def validate_complexity(self, complexity: str) -> tuple[bool, str]:
+        """Validate task complexity"""
+        VALID_COMPLEXITIES = ["simple", "complex"]
+        if complexity not in VALID_COMPLEXITIES:
+            return (
+                False,
+                f"Invalid complexity '{complexity}'. Must be one of: {', '.join(VALID_COMPLEXITIES)}",
+            )
+        return True, ""
+
     async def create_task(
         self,
         project_id: str,
@@ -63,6 +77,13 @@ class TaskService:
         feature: str | None = None,
         sources: list[dict[str, Any]] = None,
         code_examples: list[dict[str, Any]] = None,
+        owner: str | None = None,
+        acceptance_criteria: list[dict[str, Any]] | None = None,
+        execution_prompt: str | None = None,
+        source_app: str | None = None,
+        complexity: str = "simple",
+        max_retries: int = 3,
+        status: str = "draft",
     ) -> tuple[bool, dict[str, Any]]:
         """
         Create a new task under a project with automatic reordering.
@@ -88,11 +109,20 @@ class TaskService:
             if not is_valid:
                 return False, {"error": error_msg}
 
-            task_status = "todo"
+            # Validate status
+            is_valid, error_msg = self.validate_status(status)
+            if not is_valid:
+                return False, {"error": error_msg}
+
+            # Validate complexity
+            is_valid, error_msg = self.validate_complexity(complexity)
+            if not is_valid:
+                return False, {"error": error_msg}
+
+            task_status = status
 
             # REORDERING LOGIC: If inserting at a specific position, increment existing tasks
             if task_order > 0:
-                # Get all tasks in the same project and status with task_order >= new task's order
                 existing_tasks_response = (
                     self.supabase_client.table("archon_tasks")
                     .select("id, task_order")
@@ -105,7 +135,6 @@ class TaskService:
                 if existing_tasks_response.data:
                     logger.info(f"Reordering {len(existing_tasks_response.data)} existing tasks")
 
-                    # Increment task_order for all affected tasks
                     for existing_task in existing_tasks_response.data:
                         new_order = existing_task["task_order"] + 1
                         self.supabase_client.table("archon_tasks").update({
@@ -113,7 +142,8 @@ class TaskService:
                             "updated_at": datetime.now().isoformat(),
                         }).eq("id", existing_task["id"]).execute()
 
-            task_data = {
+            now = datetime.now().isoformat()
+            task_data: dict[str, Any] = {
                 "project_id": project_id,
                 "title": title,
                 "description": description,
@@ -123,18 +153,30 @@ class TaskService:
                 "priority": priority,
                 "sources": sources or [],
                 "code_examples": code_examples or [],
-                "created_at": datetime.now().isoformat(),
-                "updated_at": datetime.now().isoformat(),
+                "complexity": complexity,
+                "max_retries": max_retries,
+                "retry_count": 0,
+                "state_history": [],
+                "state_changed_at": now,
+                "created_at": now,
+                "updated_at": now,
             }
 
             if feature:
                 task_data["feature"] = feature
+            if owner:
+                task_data["owner"] = owner
+            if acceptance_criteria:
+                task_data["acceptance_criteria"] = acceptance_criteria
+            if execution_prompt:
+                task_data["execution_prompt"] = execution_prompt
+            if source_app:
+                task_data["source_app"] = source_app
 
             response = self.supabase_client.table("archon_tasks").insert(task_data).execute()
 
             if response.data:
                 task = response.data[0]
-
 
                 return True, {
                     "task": {
@@ -146,6 +188,9 @@ class TaskService:
                         "assignee": task["assignee"],
                         "task_order": task["task_order"],
                         "priority": task["priority"],
+                        "complexity": task.get("complexity", "simple"),
+                        "owner": task.get("owner"),
+                        "source_app": task.get("source_app"),
                         "created_at": task["created_at"],
                     }
                 }
@@ -210,9 +255,9 @@ class TaskService:
                 # When filtering by specific status, don't apply include_closed filter
                 # as it would be redundant or potentially conflicting
             elif not include_closed:
-                # Only exclude done tasks if no specific status filter is applied
-                query = query.neq("status", "done")
-                filters_applied.append("exclude done tasks")
+                # Exclude terminal states if no specific status filter is applied
+                query = query.not_.in_("status", ["done", "cancelled"])
+                filters_applied.append("exclude terminal tasks (done, cancelled)")
 
             # Apply keyword search if provided
             if search_query:
@@ -299,17 +344,26 @@ class TaskService:
                     "task_order": task.get("task_order", 0),
                     "priority": task.get("priority", "medium"),
                     "feature": task.get("feature"),
+                    "complexity": task.get("complexity", "simple"),
+                    "owner": task.get("owner"),
+                    "source_app": task.get("source_app"),
+                    "retry_count": task.get("retry_count", 0),
+                    "max_retries": task.get("max_retries", 3),
+                    "state_changed_at": task.get("state_changed_at"),
                     "created_at": task["created_at"],
                     "updated_at": task["updated_at"],
                     "archived": task.get("archived", False),
                 }
 
                 if not exclude_large_fields:
-                    # Include full JSONB fields
                     task_data["sources"] = task.get("sources", [])
                     task_data["code_examples"] = task.get("code_examples", [])
+                    task_data["acceptance_criteria"] = task.get("acceptance_criteria", [])
+                    task_data["execution_result"] = task.get("execution_result")
+                    task_data["architect_review"] = task.get("architect_review")
+                    task_data["execution_prompt"] = task.get("execution_prompt")
+                    task_data["state_history"] = task.get("state_history", [])
                 else:
-                    # Add counts instead of full content
                     task_data["stats"] = {
                         "sources_count": len(task.get("sources", [])),
                         "code_examples_count": len(task.get("code_examples", []))
@@ -363,13 +417,15 @@ class TaskService:
     ) -> tuple[bool, dict[str, Any]]:
         """
         Update task with specified fields.
+        NOTE: For status changes, prefer TaskLifecycleService.execute_transition()
+        which validates transitions and records audit trail.
 
         Returns:
             Tuple of (success, result_dict)
         """
         try:
             # Build update data
-            update_data = {"updated_at": datetime.now().isoformat()}
+            update_data: dict[str, Any] = {"updated_at": datetime.now().isoformat()}
 
             # Validate and add fields
             if "title" in update_fields:
@@ -402,6 +458,25 @@ class TaskService:
             if "feature" in update_fields:
                 update_data["feature"] = update_fields["feature"]
 
+            if "complexity" in update_fields:
+                is_valid, error_msg = self.validate_complexity(update_fields["complexity"])
+                if not is_valid:
+                    return False, {"error": error_msg}
+                update_data["complexity"] = update_fields["complexity"]
+
+            # New lifecycle fields (no validation needed, just pass through)
+            for field in [
+                "owner", "execution_prompt", "source_app",
+                "rejection_reason", "hold_reason", "max_retries",
+            ]:
+                if field in update_fields:
+                    update_data[field] = update_fields[field]
+
+            # JSONB fields
+            for field in ["acceptance_criteria", "execution_result", "architect_review"]:
+                if field in update_fields:
+                    update_data[field] = update_fields[field]
+
             # Update task
             response = (
                 self.supabase_client.table("archon_tasks")
@@ -412,7 +487,6 @@ class TaskService:
 
             if response.data:
                 task = response.data[0]
-
 
                 return True, {"task": task, "message": "Task updated successfully"}
             else:
@@ -506,15 +580,10 @@ class TaskService:
 
                 # Initialize project counts if not exists
                 if project_id not in counts_by_project:
-                    counts_by_project[project_id] = {
-                        "todo": 0,
-                        "doing": 0,
-                        "review": 0,
-                        "done": 0
-                    }
+                    counts_by_project[project_id] = dict.fromkeys(self.VALID_STATUSES, 0)
 
-                # Count all statuses separately
-                if status in ["todo", "doing", "review", "done"]:
+                # Count all statuses
+                if status in self.VALID_STATUSES:
                     counts_by_project[project_id][status] += 1
 
             logger.debug(f"Task counts fetched for {len(counts_by_project)} projects")

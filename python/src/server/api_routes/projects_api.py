@@ -30,6 +30,7 @@ from ..services.projects import (
     ProjectCreationService,
     ProjectService,
     SourceLinkingService,
+    TaskLifecycleService,
     TaskService,
 )
 from ..services.projects.document_service import DocumentService
@@ -68,11 +69,17 @@ class CreateTaskRequest(BaseModel):
     project_id: str
     title: str
     description: str | None = None
-    status: str | None = "todo"
+    status: str | None = "draft"
     assignee: str | None = "User"
     task_order: int | None = 0
     priority: str | None = "medium"
     feature: str | None = None
+    owner: str | None = None
+    acceptance_criteria: list[dict[str, Any]] | None = None
+    execution_prompt: str | None = None
+    source_app: str | None = None
+    complexity: str | None = "simple"
+    max_retries: int | None = 3
 
 
 @router.get("/projects")
@@ -668,6 +675,13 @@ async def create_task(request: CreateTaskRequest):
             task_order=request.task_order or 0,
             priority=request.priority or "medium",
             feature=request.feature,
+            owner=request.owner,
+            acceptance_criteria=request.acceptance_criteria,
+            execution_prompt=request.execution_prompt,
+            source_app=request.source_app,
+            complexity=request.complexity or "simple",
+            max_retries=request.max_retries or 3,
+            status=request.status or "draft",
         )
 
         if not success:
@@ -806,6 +820,14 @@ class UpdateTaskRequest(BaseModel):
     task_order: int | None = None
     priority: str | None = None
     feature: str | None = None
+    owner: str | None = None
+    acceptance_criteria: list[dict[str, Any]] | None = None
+    execution_result: dict[str, Any] | None = None
+    architect_review: dict[str, Any] | None = None
+    execution_prompt: str | None = None
+    source_app: str | None = None
+    complexity: str | None = None
+    max_retries: int | None = None
 
 
 class CreateDocumentRequest(BaseModel):
@@ -856,6 +878,22 @@ async def update_task(task_id: str, request: UpdateTaskRequest):
             update_fields["priority"] = request.priority
         if request.feature is not None:
             update_fields["feature"] = request.feature
+        if request.owner is not None:
+            update_fields["owner"] = request.owner
+        if request.acceptance_criteria is not None:
+            update_fields["acceptance_criteria"] = request.acceptance_criteria
+        if request.execution_result is not None:
+            update_fields["execution_result"] = request.execution_result
+        if request.architect_review is not None:
+            update_fields["architect_review"] = request.architect_review
+        if request.execution_prompt is not None:
+            update_fields["execution_prompt"] = request.execution_prompt
+        if request.source_app is not None:
+            update_fields["source_app"] = request.source_app
+        if request.complexity is not None:
+            update_fields["complexity"] = request.complexity
+        if request.max_retries is not None:
+            update_fields["max_retries"] = request.max_retries
 
         # Use TaskService to update the task
         task_service = TaskService()
@@ -946,6 +984,112 @@ async def mcp_update_task_status(task_id: str, status: str):
             f"Failed to update task status | error={str(e)} | task_id={task_id}"
         )
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ==================== TASK LIFECYCLE ENDPOINTS ====================
+
+
+class TransitionTaskRequest(BaseModel):
+    new_status: str
+    changed_by: str = "api"
+    reason: str | None = None
+
+
+@router.post("/tasks/{task_id}/transition")
+async def transition_task(task_id: str, request: TransitionTaskRequest):
+    """Execute a lifecycle state transition on a task with validation and audit trail."""
+    try:
+        logfire.info(
+            f"Task transition requested | task_id={task_id} | "
+            f"new_status={request.new_status} | changed_by={request.changed_by}"
+        )
+
+        lifecycle_service = TaskLifecycleService()
+        success, result = await lifecycle_service.execute_transition(
+            task_id=task_id,
+            new_status=request.new_status,
+            changed_by=request.changed_by,
+            reason=request.reason,
+        )
+
+        if not success:
+            error_msg = result.get("error", "Unknown error")
+            if "not found" in error_msg.lower():
+                raise HTTPException(status_code=404, detail=error_msg)
+            else:
+                raise HTTPException(status_code=400, detail=error_msg)
+
+        logfire.info(
+            f"Task transition completed | task_id={task_id} | "
+            f"{result['transition']['from']} → {result['transition']['to']}"
+        )
+
+        return {
+            "message": "Task transitioned successfully",
+            "task": result["task"],
+            "transition": result["transition"],
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logfire.error(f"Failed to transition task | error={str(e)} | task_id={task_id}")
+        raise HTTPException(status_code=500, detail={"error": str(e)})
+
+
+@router.get("/tasks/{task_id}/history")
+async def get_task_history(task_id: str):
+    """Get the full state transition history for a task."""
+    try:
+        lifecycle_service = TaskLifecycleService()
+        success, result = lifecycle_service.get_state_history(task_id)
+
+        if not success:
+            error_msg = result.get("error", "Unknown error")
+            if "not found" in error_msg.lower():
+                raise HTTPException(status_code=404, detail=error_msg)
+            else:
+                raise HTTPException(status_code=500, detail=result)
+
+        return result
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logfire.error(f"Failed to get task history | error={str(e)} | task_id={task_id}")
+        raise HTTPException(status_code=500, detail={"error": str(e)})
+
+
+@router.get("/tasks/{task_id}/next-states")
+async def get_task_next_states(task_id: str):
+    """Get valid next states for a task based on its current status."""
+    try:
+        # Get task to find current status
+        task_service = TaskService()
+        success, result = task_service.get_task(task_id)
+
+        if not success:
+            error_msg = result.get("error", "Unknown error")
+            if "not found" in error_msg.lower():
+                raise HTTPException(status_code=404, detail=error_msg)
+            else:
+                raise HTTPException(status_code=500, detail=result)
+
+        current_status = result["task"]["status"]
+        lifecycle_service = TaskLifecycleService()
+        next_states = lifecycle_service.get_valid_next_states(current_status)
+
+        return {
+            "task_id": task_id,
+            "current_status": current_status,
+            "next_states": next_states,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logfire.error(f"Failed to get next states | error={str(e)} | task_id={task_id}")
+        raise HTTPException(status_code=500, detail={"error": str(e)})
 
 
 # Progress tracking via HTTP polling - see /api/progress endpoints

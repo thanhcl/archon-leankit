@@ -10,12 +10,14 @@ from .document_service import DocumentService
 from .project_creation_service import ProjectCreationService
 from .project_service import ProjectService
 from .source_linking_service import SourceLinkingService
+from .task_lifecycle_service import TaskLifecycleService
 from .task_service import TaskService
 from .versioning_service import VersioningService
 
 __all__ = [
     "ProjectService",
     "TaskService",
+    "TaskLifecycleService",
     "DocumentService",
     "VersioningService",
     "ProjectCreationService",
