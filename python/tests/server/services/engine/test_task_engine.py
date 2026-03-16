@@ -4,6 +4,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from src.server.services.engine.architect_reviewer import ArchitectReviewResult, ReviewAction
 from src.server.services.engine.cc_spawner import CCExecutionResult
 from src.server.services.engine.task_engine import TaskEngine
 
@@ -42,6 +43,14 @@ def _success_result() -> CCExecutionResult:
         exit_code=0,
         duration_seconds=30.0,
         parsed={"result": "SUCCESS", "files_changed": 2, "summary": "Done"},
+    )
+
+
+def _mock_reviewer_approve() -> tuple[ArchitectReviewResult, ReviewAction]:
+    """Return a mock approve review result + action."""
+    return (
+        ArchitectReviewResult(verdict="approve", confidence=0.95, summary="Looks good"),
+        ReviewAction(next_status="review", reason="Approved by architect"),
     )
 
 
@@ -185,15 +194,18 @@ class TestExecuteTask:
         engine.spawner = MagicMock()
         engine.spawner.spawn = AsyncMock(return_value=_success_result())
 
+        engine.architect_reviewer = MagicMock()
+        engine.architect_reviewer.review = AsyncMock(return_value=_mock_reviewer_approve())
+
         result = await engine._execute_task(_make_task())
 
         assert result.success is True
 
-        # Should have transitioned to executing, then to architect-review
+        # executing → architect-review → review (from reviewer approve)
         transitions = engine.lifecycle_service.execute_transition.call_args_list
-        assert len(transitions) == 2
         assert transitions[0][1]["new_status"] == "executing"
         assert transitions[1][1]["new_status"] == "architect-review"
+        assert transitions[2][1]["new_status"] == "review"
 
     @pytest.mark.asyncio
     async def test_execute_failure_transitions_to_failed(self):
@@ -241,11 +253,14 @@ class TestExecuteTask:
         engine.spawner = MagicMock()
         engine.spawner.spawn = AsyncMock(return_value=_success_result())
 
+        engine.architect_reviewer = MagicMock()
+        engine.architect_reviewer.review = AsyncMock(return_value=_mock_reviewer_approve())
+
         await engine._execute_task(_make_task())
 
-        # Check execution_result was stored
-        update_call = engine.task_service.update_task.call_args
-        stored = update_call[1]["update_fields"]["execution_result"]
+        # First update_task call stores execution_result
+        first_update = engine.task_service.update_task.call_args_list[0]
+        stored = first_update[1]["update_fields"]["execution_result"]
         assert stored["exit_code"] == 0
         assert stored["result"] == "SUCCESS"
         assert stored["files_changed"] == 2
@@ -280,13 +295,18 @@ class TestOnCcComplete:
             return_value=(True, {})
         )
         engine.task_service = MagicMock()
+        engine.task_service.get_task.return_value = (True, {"task": _make_task()})
         engine.task_service.update_task = AsyncMock(return_value=(True, {}))
+
+        engine.architect_reviewer = MagicMock()
+        engine.architect_reviewer.review = AsyncMock(return_value=_mock_reviewer_approve())
 
         await engine._on_cc_complete("task-1", _success_result())
 
-        # Verify transition to architect-review
-        transition_call = engine.lifecycle_service.execute_transition.call_args
-        assert transition_call[1]["new_status"] == "architect-review"
+        # First transition is architect-review, then reviewer decides review
+        transitions = engine.lifecycle_service.execute_transition.call_args_list
+        assert transitions[0][1]["new_status"] == "architect-review"
+        assert transitions[1][1]["new_status"] == "review"
 
     @pytest.mark.asyncio
     async def test_failure_includes_reason(self):
@@ -297,10 +317,12 @@ class TestOnCcComplete:
             return_value=(True, {})
         )
         engine.task_service = MagicMock()
+        engine.task_service.get_task.return_value = (True, {"task": _make_task()})
         engine.task_service.update_task = AsyncMock(return_value=(True, {}))
 
         await engine._on_cc_complete("task-2", _failure_result())
 
+        # Failure path goes directly to failed, no reviewer call
         transition_call = engine.lifecycle_service.execute_transition.call_args
         assert transition_call[1]["new_status"] == "failed"
         assert "Build broke" in transition_call[1]["reason"]

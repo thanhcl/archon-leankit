@@ -16,6 +16,7 @@ from typing import Any
 from ...config.logfire_config import get_logger
 from ..projects.task_lifecycle_service import TaskLifecycleService
 from ..projects.task_service import TaskService
+from .architect_reviewer import ArchitectReviewer
 from .cc_spawner import CCExecutionResult, CCSpawner, ProjectConfig
 from .prompt_builder import PromptBuilder
 
@@ -48,6 +49,7 @@ class TaskEngine:
         self.task_service = TaskService()
         self.lifecycle_service = TaskLifecycleService()
         self.prompt_builder = PromptBuilder()
+        self.architect_reviewer = ArchitectReviewer()
         self.spawner = CCSpawner(
             default_timeout=default_timeout,
             max_parallel=max_parallel,
@@ -225,7 +227,11 @@ class TaskEngine:
         task_id: str,
         result: CCExecutionResult,
     ) -> None:
-        """Handle CC session completion: update task and transition state."""
+        """Handle CC session completion: update task and transition state.
+
+        On success: transition to architect-review, run auto-review, apply decision.
+        On failure: transition directly to failed.
+        """
         execution_result = {
             "exit_code": result.exit_code,
             "duration_seconds": result.duration_seconds,
@@ -249,6 +255,9 @@ class TaskEngine:
                 changed_by="task-engine",
             )
             logger.info(f"Task execution succeeded → architect-review | task_id={task_id}")
+
+            # Run auto-review and apply decision
+            await self._run_architect_review(task_id, execution_result)
         else:
             # Failure
             reason = (
@@ -263,3 +272,50 @@ class TaskEngine:
                 reason=reason,
             )
             logger.warning(f"Task execution failed | task_id={task_id} | reason={reason[:200]}")
+
+    async def _run_architect_review(
+        self,
+        task_id: str,
+        execution_result: dict[str, Any],
+    ) -> None:
+        """Run architect auto-review and transition based on decision."""
+        # Get full task for review
+        ok, full = self.task_service.get_task(task_id)
+        if not ok:
+            logger.error(f"Cannot fetch task for review | task_id={task_id}")
+            return
+
+        task = full["task"]
+
+        review_result, action = await self.architect_reviewer.review(task, execution_result)
+
+        # Store review on task
+        review_data: dict[str, Any] = {
+            "verdict": review_result.verdict,
+            "confidence": review_result.confidence,
+            "findings": review_result.findings,
+            "feedback": review_result.feedback,
+            "summary": review_result.summary,
+        }
+        if action.warning:
+            review_data["warning"] = action.warning
+        if review_result.error:
+            review_data["error"] = review_result.error
+
+        await self.task_service.update_task(
+            task_id=task_id,
+            update_fields={"architect_review": review_data},
+        )
+
+        # Apply lifecycle transition
+        await self.lifecycle_service.execute_transition(
+            task_id=task_id,
+            new_status=action.next_status,
+            changed_by=action.changed_by,
+            reason=action.reason,
+        )
+
+        logger.info(
+            f"Architect review applied | task_id={task_id} | "
+            f"verdict={review_result.verdict} → {action.next_status}"
+        )
