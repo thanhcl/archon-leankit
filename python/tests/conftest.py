@@ -30,7 +30,25 @@ mock_select.order.return_value = mock_select
 mock_table.select.return_value = mock_select
 mock_client.table.return_value = mock_table
 
-# Apply global patches immediately
+# Apply global patches immediately.
+# On Python 3.14+, patch() uses pkgutil.resolve_name which requires the
+# target module to be importable. We eagerly import the modules so the
+# dotted path resolves, then patch the attribute.
+import importlib
+import sys
+
+def _safe_import(mod_path: str):
+    """Import a module, returning a MagicMock stub if it fails."""
+    try:
+        return importlib.import_module(mod_path)
+    except Exception:
+        stub = MagicMock()
+        sys.modules[mod_path] = stub
+        return stub
+
+_safe_import("src.server.utils")
+_safe_import("src.server.services.client_manager")
+
 from unittest.mock import patch
 _global_patches = [
     patch("supabase.create_client", return_value=mock_client),
