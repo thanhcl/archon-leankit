@@ -10,6 +10,7 @@ Usage:
 """
 
 import asyncio
+import json
 import re
 import subprocess
 import time
@@ -56,6 +57,9 @@ _ASSESS_RE = re.compile(r"TASK_ASSESSMENT:\s*(simple|complex)", re.IGNORECASE)
 _EST_FILES_RE = re.compile(r"ESTIMATED_FILES:\s*(\d+)", re.IGNORECASE)
 _EST_RISK_RE = re.compile(r"ESTIMATED_RISK:\s*(low|medium|high)", re.IGNORECASE)
 _ASSESS_REASON_RE = re.compile(r"ASSESSMENT_REASONING:\s*(.+)", re.IGNORECASE)
+
+# Learnings pattern — captures JSON array
+_LEARNINGS_RE = re.compile(r"LEARNINGS:\s*(\[.*?\])", re.IGNORECASE | re.DOTALL)
 
 
 class CCSpawner:
@@ -357,6 +361,19 @@ class CCSpawner:
         m = _ASSESS_REASON_RE.search(stdout)
         if m:
             parsed["assessment_reasoning"] = m.group(1).strip()
+
+        # Learnings
+        m = _LEARNINGS_RE.search(stdout)
+        if m:
+            try:
+                learnings = json.loads(m.group(1))
+                if isinstance(learnings, list):
+                    parsed["learnings"] = learnings
+            except json.JSONDecodeError:
+                logger.warning("Failed to parse LEARNINGS JSON from CC output")
+                parsed["learnings"] = []
+        else:
+            parsed["learnings"] = []
 
         # If no structured block, try to extract a one-line summary from the
         # last non-empty line of stdout.

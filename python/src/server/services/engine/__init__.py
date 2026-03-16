@@ -13,6 +13,7 @@ Modules:
 from .architect_reviewer import ArchitectReviewer, ArchitectReviewResult, ReviewAction, ReviewConfig
 from .cc_spawner import CCExecutionResult, CCSpawner, ProjectConfig
 from .health_monitor import EngineMetrics, HealthAlert, HealthMonitor, HealthThresholds
+from .learning_processor import LearningProcessor
 from .notifier import Notifier, NotifierConfig, TaskEvent
 from .prompt_builder import PromptBuilder
 from .task_engine import TaskEngine
@@ -26,6 +27,7 @@ __all__ = [
     "HealthAlert",
     "HealthMonitor",
     "HealthThresholds",
+    "LearningProcessor",
     "Notifier",
     "NotifierConfig",
     "ProjectConfig",

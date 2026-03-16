@@ -66,7 +66,7 @@ class TestParseResult:
 
     def test_empty_output(self):
         parsed = CCSpawner.parse_result("")
-        assert parsed == {}
+        assert parsed == {"learnings": []}
 
     def test_task_assessment_parsed(self):
         stdout = (

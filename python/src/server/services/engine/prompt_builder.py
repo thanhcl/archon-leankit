@@ -213,6 +213,13 @@ class PromptBuilder:
             "3. Backward compatibility: existing APIs must not break",
             "4. Performance: no N+1 queries, no large allocations",
             "",
+            "## Learnings (REQUIRED in output)",
+            "After completing this task, reflect on what you learned:",
+            "- What errors did you encounter and fix?",
+            "- What patterns did you discover?",
+            "- What knowledge was missing that would have helped?",
+            "- What should future tasks in this area know?",
+            "",
             "## Report (REQUIRED — structured output)",
             "SELF_REVIEW: PASS|NEEDS_ATTENTION",
             "REVIEW_CONFIDENCE: 0.0-1.0",
@@ -221,6 +228,13 @@ class PromptBuilder:
             "FILES_CHANGED: {count}",
             "TESTS_ADDED: {count}",
             "SUMMARY: {description}",
+            "LEARNINGS: [",
+            '  {"type":"error|correction|best_practice|knowledge_gap",',
+            '   "description":"concise description",',
+            '   "area":"frontend|backend|infra|tests|config|security|database",',
+            '   "suggested_rule":"optional rule for CLAUDE.md"}',
+            "]",
+            "If no learnings, output: LEARNINGS: []",
         ]
 
         return "\n".join(parts)
