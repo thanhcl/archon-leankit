@@ -7,7 +7,7 @@ Modules:
 - task_engine: Main daemon loop — polls, spawns, monitors
 """
 
-from .architect_reviewer import ArchitectReviewer, ArchitectReviewResult, ReviewAction
+from .architect_reviewer import ArchitectReviewer, ArchitectReviewResult, ReviewAction, ReviewConfig
 from .cc_spawner import CCExecutionResult, CCSpawner, ProjectConfig
 from .prompt_builder import PromptBuilder
 from .task_engine import TaskEngine
@@ -20,5 +20,6 @@ __all__ = [
     "ProjectConfig",
     "PromptBuilder",
     "ReviewAction",
+    "ReviewConfig",
     "TaskEngine",
 ]

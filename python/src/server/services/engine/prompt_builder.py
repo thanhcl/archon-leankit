@@ -54,6 +54,7 @@ class PromptBuilder:
         task: dict[str, Any],
         project: dict[str, Any] | None = None,
         build_command: str | None = None,
+        include_self_review: bool = False,
     ) -> str:
         """
         Build a complete execution prompt for the given task.
@@ -63,6 +64,8 @@ class PromptBuilder:
             project: Optional project dict for extra context.
             build_command: Override build/test command. Falls back to
                            project config → default.
+            include_self_review: If True, append self-review instructions
+                for CC to evaluate its own changes.
 
         Returns:
             Ready-to-use prompt string.
@@ -73,8 +76,14 @@ class PromptBuilder:
         kb_context = await self._fetch_kb_context(task)
 
         if complexity == "complex":
-            return self._render_complex(task, project, kb_context, cmd)
-        return self._render_simple(task, project, kb_context, cmd)
+            prompt = self._render_complex(task, project, kb_context, cmd)
+        else:
+            prompt = self._render_simple(task, project, kb_context, cmd)
+
+        if include_self_review:
+            prompt += "\n" + self._self_review_section()
+
+        return prompt
 
     # ------------------------------------------------------------------
     # KB integration
@@ -126,6 +135,23 @@ class PromptBuilder:
             lines.append(content)
             lines.append("")
         return "\n".join(lines)
+
+    @staticmethod
+    def _self_review_section() -> str:
+        """Return the self-review instructions block for CC prompts."""
+        return (
+            "\n## Self-Review (REQUIRED before reporting)\n"
+            "After implementation, review your own changes:\n"
+            "1. Check each acceptance criteria — all must pass\n"
+            "2. Security scan: XSS, injection, auth bypass, key exposure\n"
+            "3. Backward compatibility: existing APIs must not break\n"
+            "4. Performance: no N+1 queries, no large allocations\n"
+            "\n"
+            "Include in your output:\n"
+            "SELF_REVIEW: PASS|NEEDS_ATTENTION\n"
+            "REVIEW_CONFIDENCE: 0.0-1.0\n"
+            'REVIEW_FINDINGS: [{"severity":"critical|warning|suggestion","category":"...","description":"..."}]\n'
+        )
 
     @staticmethod
     def _format_acceptance_criteria(task: dict[str, Any]) -> str:

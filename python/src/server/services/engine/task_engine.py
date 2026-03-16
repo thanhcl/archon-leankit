@@ -16,7 +16,7 @@ from typing import Any
 from ...config.logfire_config import get_logger
 from ..projects.task_lifecycle_service import TaskLifecycleService
 from ..projects.task_service import TaskService
-from .architect_reviewer import ArchitectReviewer
+from .architect_reviewer import ArchitectReviewer, ReviewConfig
 from .cc_spawner import CCExecutionResult, CCSpawner, ProjectConfig
 from .prompt_builder import PromptBuilder
 
@@ -36,6 +36,7 @@ class TaskEngine:
         build_command: str = "pnpm build && pnpm test",
         isolation: str = "shared",
         repository_url: str | None = None,
+        review_config: ReviewConfig | None = None,
     ):
         self.project_config = ProjectConfig(
             project_path=project_path,
@@ -43,6 +44,7 @@ class TaskEngine:
             isolation=isolation,
             repository_url=repository_url,
         )
+        self.review_config = review_config or ReviewConfig()
         self.poll_interval = poll_interval
         self.shutdown_grace = shutdown_grace
 
@@ -205,10 +207,15 @@ class TaskEngine:
 
         full_task = full["task"]
 
+        # Determine if self-review mode applies for this task
+        review_mode = self.architect_reviewer._get_mode(full_task, self.review_config)
+        include_self_review = review_mode == "self-review"
+
         # Build prompt
         prompt = await self.prompt_builder.build(
             task=full_task,
             build_command=self.project_config.build_command,
+            include_self_review=include_self_review,
         )
 
         # Spawn CC
@@ -287,7 +294,9 @@ class TaskEngine:
 
         task = full["task"]
 
-        review_result, action = await self.architect_reviewer.review(task, execution_result)
+        review_result, action = await self.architect_reviewer.review(
+            task, execution_result, config=self.review_config,
+        )
 
         # Store review on task
         review_data: dict[str, Any] = {

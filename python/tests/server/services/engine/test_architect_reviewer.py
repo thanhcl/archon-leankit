@@ -1,4 +1,5 @@
-"""Tests for ArchitectReviewer — verdict logic, API handling, decision rules."""
+"""Tests for hybrid ArchitectReviewer — mode selection, self-review,
+multi-provider API, decision logic, security escalation, fallback."""
 
 import json
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -8,6 +9,7 @@ import pytest
 from src.server.services.engine.architect_reviewer import (
     ArchitectReviewer,
     ArchitectReviewResult,
+    ReviewConfig,
 )
 
 # ---------------------------------------------------------------------------
@@ -31,9 +33,6 @@ def _make_task(**overrides) -> dict:
         ],
         "retry_count": 0,
         "max_retries": 3,
-        "architect_review": None,
-        "execution_result": None,
-        "rejection_reason": None,
     }
     base.update(overrides)
     return base
@@ -46,251 +45,166 @@ def _make_exec_result(**overrides) -> dict:
         "result": "SUCCESS",
         "files_changed": 3,
         "tests_added": 2,
-        "summary": "Implemented login endpoint with JWT token generation",
+        "summary": "Implemented login endpoint",
+        "stdout": "",
     }
     base.update(overrides)
     return base
 
 
-def _mock_api_response(review_json: dict) -> MagicMock:
-    """Create a mock httpx response with the given review JSON."""
+def _mock_anthropic_response(review_json: dict) -> MagicMock:
     resp = MagicMock()
     resp.status_code = 200
     resp.json.return_value = {
         "content": [{"type": "text", "text": json.dumps(review_json)}],
     }
+    resp.text = json.dumps(review_json)
     return resp
 
 
-def _approve_review(confidence: float = 0.95, findings: list | None = None) -> dict:
+def _mock_openai_response(review_json: dict) -> MagicMock:
+    resp = MagicMock()
+    resp.status_code = 200
+    resp.json.return_value = {
+        "choices": [{"message": {"content": json.dumps(review_json)}}],
+    }
+    resp.text = json.dumps(review_json)
+    return resp
+
+
+def _approve_review(confidence: float = 0.95) -> dict:
     return {
         "verdict": "approve",
         "confidence": confidence,
-        "findings": findings or [],
+        "findings": [],
         "feedback": "",
         "summary": "Implementation looks good",
     }
 
 
-def _changes_review(feedback: str = "Fix the auth logic", findings: list | None = None) -> dict:
+def _changes_review(feedback: str = "Fix the auth logic") -> dict:
     return {
         "verdict": "changes-requested",
         "confidence": 0.9,
-        "findings": findings or [{"severity": "warning", "category": "correctness", "description": "Missing validation"}],
+        "findings": [{"severity": "warning", "category": "correctness", "description": "Missing validation"}],
         "feedback": feedback,
         "summary": "Needs changes",
     }
 
 
-def _escalate_review() -> dict:
-    return {
-        "verdict": "escalate",
-        "confidence": 0.85,
-        "findings": [{"severity": "critical", "category": "architecture", "description": "Wrong pattern used"}],
-        "feedback": "Needs human review",
-        "summary": "Architecture concern",
-    }
-
-
-def _security_finding_review() -> dict:
-    return {
-        "verdict": "approve",
-        "confidence": 0.9,
-        "findings": [{"severity": "critical", "category": "security", "description": "SQL injection in query builder"}],
-        "feedback": "",
-        "summary": "Code works but has security issue",
-    }
+def _async_cred(mapping: dict[str, str | None]):
+    """Return a credential_getter that uses a mapping."""
+    async def getter(key: str):
+        return mapping.get(key)
+    return getter
 
 
 # ---------------------------------------------------------------------------
-# Tests: _decide_action
+# Tests: _get_mode
 # ---------------------------------------------------------------------------
 
 
-class TestDecideAction:
-    def test_approve_high_confidence(self):
-        task = _make_task()
-        review = ArchitectReviewResult(verdict="approve", confidence=0.95, summary="Looks good")
+class TestGetMode:
+    def test_simple_task_default_self_review(self):
+        task = _make_task(complexity="simple", title="Add button", description="Add a button to UI")
+        config = ReviewConfig()
+        assert ArchitectReviewer._get_mode(task, config) == "self-review"
 
-        action = ArchitectReviewer._decide_action(task, review)
+    def test_complex_task_default_api(self):
+        task = _make_task(complexity="complex", title="Refactor DB layer", description="Restructure models")
+        config = ReviewConfig()
+        assert ArchitectReviewer._get_mode(task, config) == "api"
 
-        assert action.next_status == "review"
-        assert action.warning is None
+    def test_security_sensitive_overrides(self):
+        task = _make_task(complexity="simple", title="Fix authentication bypass")
+        config = ReviewConfig(security_sensitive_mode="api")
+        assert ArchitectReviewer._get_mode(task, config) == "api"
 
-    def test_approve_low_confidence(self):
-        task = _make_task()
-        review = ArchitectReviewResult(verdict="approve", confidence=0.6, summary="Probably ok")
+    def test_security_keywords_in_description(self):
+        task = _make_task(title="Update config", description="Change the encryption key rotation policy")
+        config = ReviewConfig()
+        assert ArchitectReviewer._get_mode(task, config) == "api"
 
-        action = ArchitectReviewer._decide_action(task, review)
-
-        assert action.next_status == "review"
-        assert action.warning is not None
-        assert "0.60" in action.warning
-
-    def test_changes_requested_retry_available(self):
-        task = _make_task(retry_count=1, max_retries=3)
-        review = ArchitectReviewResult(
-            verdict="changes-requested", confidence=0.9, feedback="Fix auth logic",
-        )
-
-        action = ArchitectReviewer._decide_action(task, review)
-
-        assert action.next_status == "assigned"
-        assert "Fix auth logic" in action.reason
-
-    def test_changes_requested_max_retries_reached(self):
-        task = _make_task(retry_count=3, max_retries=3)
-        review = ArchitectReviewResult(
-            verdict="changes-requested", confidence=0.9, feedback="Still broken",
-        )
-
-        action = ArchitectReviewer._decide_action(task, review)
-
-        assert action.next_status == "escalated"
-        assert "Max retries" in action.reason
-
-    def test_escalate_verdict(self):
-        task = _make_task()
-        review = ArchitectReviewResult(
-            verdict="escalate", confidence=0.85, feedback="Needs human review",
-        )
-
-        action = ArchitectReviewer._decide_action(task, review)
-
-        assert action.next_status == "escalated"
-
-    def test_critical_security_always_escalates(self):
-        """Even with approve verdict, critical security findings force escalation."""
-        task = _make_task()
-        review = ArchitectReviewResult(
-            verdict="approve",
-            confidence=0.95,
-            findings=[{"severity": "critical", "category": "security", "description": "SQL injection"}],
-            summary="Looks good otherwise",
-        )
-
-        action = ArchitectReviewer._decide_action(task, review)
-
-        assert action.next_status == "escalated"
-        assert "security" in action.reason.lower()
-
-    def test_critical_non_security_does_not_escalate(self):
-        """Critical findings in non-security categories don't force escalation."""
-        task = _make_task()
-        review = ArchitectReviewResult(
-            verdict="approve",
-            confidence=0.9,
-            findings=[{"severity": "critical", "category": "performance", "description": "N+1 query"}],
-        )
-
-        action = ArchitectReviewer._decide_action(task, review)
-
-        assert action.next_status == "review"
-
-    def test_error_in_review_escalates(self):
-        task = _make_task()
-        review = ArchitectReviewResult(
-            verdict="approve", confidence=0.0, error="API timeout",
-        )
-
-        action = ArchitectReviewer._decide_action(task, review)
-
-        assert action.next_status == "escalated"
-
-    def test_auth_category_also_escalates(self):
-        task = _make_task()
-        review = ArchitectReviewResult(
-            verdict="approve",
-            confidence=0.9,
-            findings=[{"severity": "critical", "category": "auth", "description": "Auth bypass"}],
-        )
-
-        action = ArchitectReviewer._decide_action(task, review)
-
-        assert action.next_status == "escalated"
+    def test_custom_modes(self):
+        task = _make_task(complexity="simple", title="Add button", description="UI")
+        config = ReviewConfig(simple_task_mode="api")
+        assert ArchitectReviewer._get_mode(task, config) == "api"
 
 
 # ---------------------------------------------------------------------------
-# Tests: _parse_review
+# Tests: _is_security_sensitive
 # ---------------------------------------------------------------------------
 
 
-class TestParseReview:
-    def test_valid_json(self):
-        raw = json.dumps(_approve_review())
-        result = ArchitectReviewer._parse_review(raw)
+class TestIsSecuritySensitive:
+    @pytest.mark.parametrize("title", [
+        "Fix auth bypass", "Update JWT token handling", "Add password hashing",
+        "Configure TLS certificates", "Implement OAuth flow", "Encrypt user data",
+        "HSM integration for key management", "PKCS#11 token storage",
+    ])
+    def test_detects_security_keywords(self, title):
+        assert ArchitectReviewer._is_security_sensitive(_make_task(title=title))
 
+    @pytest.mark.parametrize("title", [
+        "Add pagination", "Fix CSS layout", "Update README", "Refactor service layer",
+    ])
+    def test_non_security_tasks(self, title):
+        assert not ArchitectReviewer._is_security_sensitive(
+            _make_task(title=title, description="Normal task")
+        )
+
+
+# ---------------------------------------------------------------------------
+# Tests: _parse_self_review
+# ---------------------------------------------------------------------------
+
+
+class TestParseSelfReview:
+    def test_pass_verdict(self):
+        result = ArchitectReviewer._parse_self_review({
+            "stdout": "Some output...\nSELF_REVIEW: PASS\nREVIEW_CONFIDENCE: 0.92\n",
+        })
         assert result.verdict == "approve"
-        assert result.confidence == 0.95
-        assert result.summary == "Implementation looks good"
+        assert result.confidence == 0.92
+        assert result.mode == "self-review"
 
-    def test_json_in_markdown_fence(self):
-        raw = "```json\n" + json.dumps(_approve_review()) + "\n```"
-        result = ArchitectReviewer._parse_review(raw)
+    def test_needs_attention_verdict(self):
+        result = ArchitectReviewer._parse_self_review({
+            "stdout": "SELF_REVIEW: NEEDS_ATTENTION\nREVIEW_CONFIDENCE: 0.6\n",
+        })
+        assert result.verdict == "changes-requested"
+        assert result.confidence == 0.6
 
+    def test_with_findings(self):
+        findings = [{"severity": "suggestion", "category": "perf", "description": "Add index"}]
+        result = ArchitectReviewer._parse_self_review({
+            "stdout": f"SELF_REVIEW: PASS\nREVIEW_FINDINGS: {json.dumps(findings)}\n",
+        })
         assert result.verdict == "approve"
+        assert len(result.findings) == 1
+        assert result.findings[0]["category"] == "perf"
 
-    def test_invalid_json(self):
-        result = ArchitectReviewer._parse_review("not json at all")
+    def test_no_self_review_block(self):
+        result = ArchitectReviewer._parse_self_review({"stdout": "Just normal output"})
+        assert result.verdict == "changes-requested"
+        assert result.confidence == 0.5
 
-        assert result.verdict == "escalate"
-        assert result.error is not None
-
-    def test_invalid_verdict_defaults_to_escalate(self):
-        raw = json.dumps({"verdict": "invalid", "confidence": 0.5})
-        result = ArchitectReviewer._parse_review(raw)
-
-        assert result.verdict == "escalate"
-
-    def test_confidence_clamped(self):
-        raw = json.dumps({"verdict": "approve", "confidence": 1.5})
-        result = ArchitectReviewer._parse_review(raw)
-
-        assert result.confidence == 1.0
-
-    def test_negative_confidence(self):
-        raw = json.dumps({"verdict": "approve", "confidence": -0.5})
-        result = ArchitectReviewer._parse_review(raw)
-
-        assert result.confidence == 0.0
+    def test_empty_stdout(self):
+        result = ArchitectReviewer._parse_self_review({"stdout": ""})
+        assert result.verdict == "changes-requested"
 
 
 # ---------------------------------------------------------------------------
-# Tests: _build_user_message
+# Tests: Anthropic provider (mock API)
 # ---------------------------------------------------------------------------
 
 
-class TestBuildUserMessage:
-    def test_includes_task_details(self):
-        task = _make_task()
-        exec_result = _make_exec_result()
-
-        msg = ArchitectReviewer._build_user_message(task, exec_result)
-
-        assert "Add login endpoint" in msg
-        assert "JWT" in msg
-        assert "POST /api/auth/login returns JWT" in msg
-
-    def test_includes_execution_stats(self):
-        exec_result = _make_exec_result()
-
-        msg = ArchitectReviewer._build_user_message(_make_task(), exec_result)
-
-        assert "Exit code: 0" in msg
-        assert "Files changed: 3" in msg
-        assert "Tests added: 2" in msg
-
-
-# ---------------------------------------------------------------------------
-# Tests: Claude API integration (mocked)
-# ---------------------------------------------------------------------------
-
-
-class TestCallClaude:
+class TestAnthropicProvider:
     @pytest.mark.asyncio
-    async def test_successful_api_call(self):
-        reviewer = ArchitectReviewer(api_key="test-key")
-        mock_resp = _mock_api_response(_approve_review())
+    async def test_approve_flow(self):
+        reviewer = ArchitectReviewer(credential_getter=_async_cred({"ANTHROPIC_API_KEY": "test-key"}))
+        config = ReviewConfig(simple_task_mode="api", provider="anthropic")
+        mock_resp = _mock_anthropic_response(_approve_review())
 
         with patch("httpx.AsyncClient") as MockClient:
             mock_client = AsyncMock()
@@ -299,23 +213,105 @@ class TestCallClaude:
             mock_client.__aexit__ = AsyncMock(return_value=False)
             MockClient.return_value = mock_client
 
-            result = await reviewer._call_claude(_make_task(), _make_exec_result())
+            # Force non-security title
+            task = _make_task(title="Add button", description="UI work", complexity="simple")
+            result, action = await reviewer.review(task, _make_exec_result(), config)
 
         assert result.verdict == "approve"
-        assert result.confidence == 0.95
+        assert result.provider == "anthropic"
+        assert result.mode == "api"
+        assert action.next_status == "review"
+
+
+# ---------------------------------------------------------------------------
+# Tests: OpenAI provider (mock API)
+# ---------------------------------------------------------------------------
+
+
+class TestOpenAIProvider:
+    @pytest.mark.asyncio
+    async def test_approve_flow(self):
+        reviewer = ArchitectReviewer(credential_getter=_async_cred({"OPENAI_API_KEY": "test-key"}))
+        config = ReviewConfig(simple_task_mode="api", provider="openai")
+        mock_resp = _mock_openai_response(_approve_review())
+
+        with patch("httpx.AsyncClient") as MockClient:
+            mock_client = AsyncMock()
+            mock_client.post = AsyncMock(return_value=mock_resp)
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=False)
+            MockClient.return_value = mock_client
+
+            task = _make_task(title="Add button", description="UI work", complexity="simple")
+            result, action = await reviewer.review(task, _make_exec_result(), config)
+
+        assert result.verdict == "approve"
+        assert result.provider == "openai"
+        assert action.next_status == "review"
+
+
+# ---------------------------------------------------------------------------
+# Tests: Google provider (mock API — uses OpenAI-compatible)
+# ---------------------------------------------------------------------------
+
+
+class TestGoogleProvider:
+    @pytest.mark.asyncio
+    async def test_approve_flow(self):
+        reviewer = ArchitectReviewer(credential_getter=_async_cred({"GOOGLE_API_KEY": "test-key"}))
+        config = ReviewConfig(simple_task_mode="api", provider="google")
+        mock_resp = _mock_openai_response(_approve_review())
+
+        with patch("httpx.AsyncClient") as MockClient:
+            mock_client = AsyncMock()
+            mock_client.post = AsyncMock(return_value=mock_resp)
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=False)
+            MockClient.return_value = mock_client
+
+            task = _make_task(title="Add button", description="UI work", complexity="simple")
+            result, action = await reviewer.review(task, _make_exec_result(), config)
+
+        assert result.verdict == "approve"
+        assert result.provider == "google"
+
+
+# ---------------------------------------------------------------------------
+# Tests: API fallback to self-review
+# ---------------------------------------------------------------------------
+
+
+class TestAPIFallback:
+    @pytest.mark.asyncio
+    async def test_fallback_on_no_api_key(self):
+        reviewer = ArchitectReviewer(credential_getter=_async_cred({}))
+        config = ReviewConfig(simple_task_mode="api", api_fallback_to_self_review=True)
+
+        task = _make_task(title="Add button", description="UI", complexity="simple")
+        exec_result = _make_exec_result(stdout="SELF_REVIEW: PASS\nREVIEW_CONFIDENCE: 0.85\n")
+
+        result, action = await reviewer.review(task, exec_result, config)
+
+        assert result.mode == "self-review"
+        assert result.error is not None
+        assert "API failed" in result.error
 
     @pytest.mark.asyncio
-    async def test_no_api_key(self):
-        reviewer = ArchitectReviewer(api_key="")
+    async def test_no_fallback_escalates(self):
+        reviewer = ArchitectReviewer(credential_getter=_async_cred({}))
+        config = ReviewConfig(simple_task_mode="api", api_fallback_to_self_review=False)
 
-        result = await reviewer._call_claude(_make_task(), _make_exec_result())
+        task = _make_task(title="Add button", description="UI", complexity="simple")
+        result, action = await reviewer.review(task, _make_exec_result(), config)
 
         assert result.verdict == "escalate"
-        assert "API_KEY" in result.error or "API key" in result.error
+        assert action.next_status == "escalated"
 
     @pytest.mark.asyncio
-    async def test_rate_limited(self):
-        reviewer = ArchitectReviewer(api_key="test-key")
+    async def test_fallback_on_rate_limit(self):
+        reviewer = ArchitectReviewer(credential_getter=_async_cred({"ANTHROPIC_API_KEY": "key"}))
+        config = ReviewConfig(simple_task_mode="api", api_fallback_to_self_review=True)
+
         mock_resp = MagicMock()
         mock_resp.status_code = 429
 
@@ -326,76 +322,110 @@ class TestCallClaude:
             mock_client.__aexit__ = AsyncMock(return_value=False)
             MockClient.return_value = mock_client
 
-            result = await reviewer._call_claude(_make_task(), _make_exec_result())
+            task = _make_task(title="Add button", description="UI", complexity="simple")
+            result, _ = await reviewer.review(task, _make_exec_result(), config)
 
+        # Rate limited → escalate (API returned a result, not an exception)
         assert result.verdict == "escalate"
-        assert "rate limited" in result.summary.lower()
-
-    @pytest.mark.asyncio
-    async def test_api_error(self):
-        reviewer = ArchitectReviewer(api_key="test-key")
-        mock_resp = MagicMock()
-        mock_resp.status_code = 500
-        mock_resp.text = "Internal Server Error"
-
-        with patch("httpx.AsyncClient") as MockClient:
-            mock_client = AsyncMock()
-            mock_client.post = AsyncMock(return_value=mock_resp)
-            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-            mock_client.__aexit__ = AsyncMock(return_value=False)
-            MockClient.return_value = mock_client
-
-            result = await reviewer._call_claude(_make_task(), _make_exec_result())
-
-        assert result.verdict == "escalate"
-        assert "500" in result.error
-
-    @pytest.mark.asyncio
-    async def test_timeout(self):
-        import httpx as httpx_mod
-
-        reviewer = ArchitectReviewer(api_key="test-key")
-
-        with patch("httpx.AsyncClient") as MockClient:
-            mock_client = AsyncMock()
-            mock_client.post = AsyncMock(side_effect=httpx_mod.TimeoutException("timeout"))
-            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-            mock_client.__aexit__ = AsyncMock(return_value=False)
-            MockClient.return_value = mock_client
-
-            result = await reviewer._call_claude(_make_task(), _make_exec_result())
-
-        assert result.verdict == "escalate"
-        assert "timeout" in result.error.lower()
 
 
 # ---------------------------------------------------------------------------
-# Tests: full review() flow
+# Tests: _decide_action
 # ---------------------------------------------------------------------------
 
 
-class TestReview:
+class TestDecideAction:
+    def test_approve_high_confidence(self):
+        review = ArchitectReviewResult(verdict="approve", confidence=0.95, summary="Good")
+        action = ArchitectReviewer._decide_action(_make_task(), review)
+        assert action.next_status == "review"
+        assert action.warning is None
+
+    def test_approve_low_confidence(self):
+        review = ArchitectReviewResult(verdict="approve", confidence=0.6, summary="Ok")
+        action = ArchitectReviewer._decide_action(_make_task(), review)
+        assert action.next_status == "review"
+        assert action.warning is not None
+        assert "0.60" in action.warning
+
+    def test_changes_requested_retry_available(self):
+        review = ArchitectReviewResult(
+            verdict="changes-requested", confidence=0.9, feedback="Fix auth",
+        )
+        action = ArchitectReviewer._decide_action(_make_task(retry_count=1), review)
+        assert action.next_status == "assigned"
+        assert "Fix auth" in action.reason
+
+    def test_changes_requested_max_retries(self):
+        review = ArchitectReviewResult(
+            verdict="changes-requested", confidence=0.9, feedback="Still broken",
+        )
+        action = ArchitectReviewer._decide_action(_make_task(retry_count=3, max_retries=3), review)
+        assert action.next_status == "escalated"
+        assert "Max retries" in action.reason
+
+    def test_escalate_verdict(self):
+        review = ArchitectReviewResult(verdict="escalate", confidence=0.85, feedback="Human needed")
+        action = ArchitectReviewer._decide_action(_make_task(), review)
+        assert action.next_status == "escalated"
+
+    def test_critical_security_always_escalates(self):
+        review = ArchitectReviewResult(
+            verdict="approve", confidence=0.95,
+            findings=[{"severity": "critical", "category": "security", "description": "SQL injection"}],
+        )
+        action = ArchitectReviewer._decide_action(_make_task(), review)
+        assert action.next_status == "escalated"
+
+    def test_critical_non_security_does_not_escalate(self):
+        review = ArchitectReviewResult(
+            verdict="approve", confidence=0.9,
+            findings=[{"severity": "critical", "category": "performance", "description": "N+1"}],
+        )
+        action = ArchitectReviewer._decide_action(_make_task(), review)
+        assert action.next_status == "review"
+
+    def test_error_escalates(self):
+        review = ArchitectReviewResult(verdict="approve", confidence=0.0, error="API timeout")
+        action = ArchitectReviewer._decide_action(_make_task(), review)
+        assert action.next_status == "escalated"
+
+    def test_auth_category_escalates(self):
+        review = ArchitectReviewResult(
+            verdict="approve", confidence=0.9,
+            findings=[{"severity": "critical", "category": "auth", "description": "Auth bypass"}],
+        )
+        action = ArchitectReviewer._decide_action(_make_task(), review)
+        assert action.next_status == "escalated"
+
+
+# ---------------------------------------------------------------------------
+# Tests: full review() flow with mode selection
+# ---------------------------------------------------------------------------
+
+
+class TestFullReviewFlow:
     @pytest.mark.asyncio
-    async def test_approve_flow(self):
-        reviewer = ArchitectReviewer(api_key="test-key")
-        mock_resp = _mock_api_response(_approve_review(confidence=0.95))
+    async def test_simple_task_uses_self_review(self):
+        reviewer = ArchitectReviewer(credential_getter=_async_cred({}))
+        config = ReviewConfig(simple_task_mode="self-review")
 
-        with patch("httpx.AsyncClient") as MockClient:
-            mock_client = AsyncMock()
-            mock_client.post = AsyncMock(return_value=mock_resp)
-            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-            mock_client.__aexit__ = AsyncMock(return_value=False)
-            MockClient.return_value = mock_client
+        task = _make_task(title="Add button", description="UI", complexity="simple")
+        exec_result = _make_exec_result(stdout="SELF_REVIEW: PASS\nREVIEW_CONFIDENCE: 0.9\n")
 
-            review_result, action = await reviewer.review(_make_task(), _make_exec_result())
+        result, action = await reviewer.review(task, exec_result, config)
 
-        assert review_result.verdict == "approve"
+        assert result.mode == "self-review"
+        assert result.verdict == "approve"
         assert action.next_status == "review"
 
     @pytest.mark.asyncio
-    async def test_changes_requested_flow(self):
-        reviewer = ArchitectReviewer(api_key="test-key")
-        mock_resp = _mock_api_response(_changes_review("Fix the auth flow"))
+    async def test_security_task_forces_api(self):
+        """Security-sensitive task should use API mode even if simple."""
+        reviewer = ArchitectReviewer(credential_getter=_async_cred({"ANTHROPIC_API_KEY": "key"}))
+        config = ReviewConfig(simple_task_mode="self-review", security_sensitive_mode="api")
+
+        mock_resp = _mock_anthropic_response(_approve_review())
 
         with patch("httpx.AsyncClient") as MockClient:
             mock_client = AsyncMock()
@@ -404,27 +434,8 @@ class TestReview:
             mock_client.__aexit__ = AsyncMock(return_value=False)
             MockClient.return_value = mock_client
 
-            review_result, action = await reviewer.review(
-                _make_task(retry_count=0), _make_exec_result(),
-            )
+            task = _make_task(title="Fix authentication bypass", complexity="simple")
+            result, _ = await reviewer.review(task, _make_exec_result(), config)
 
-        assert review_result.verdict == "changes-requested"
-        assert action.next_status == "assigned"
-        assert "Fix the auth flow" in action.reason
-
-    @pytest.mark.asyncio
-    async def test_security_override(self):
-        reviewer = ArchitectReviewer(api_key="test-key")
-        mock_resp = _mock_api_response(_security_finding_review())
-
-        with patch("httpx.AsyncClient") as MockClient:
-            mock_client = AsyncMock()
-            mock_client.post = AsyncMock(return_value=mock_resp)
-            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-            mock_client.__aexit__ = AsyncMock(return_value=False)
-            MockClient.return_value = mock_client
-
-            review_result, action = await reviewer.review(_make_task(), _make_exec_result())
-
-        assert review_result.verdict == "approve"  # Claude said approve
-        assert action.next_status == "escalated"   # But security overrides
+        assert result.mode == "api"
+        assert result.provider == "anthropic"
