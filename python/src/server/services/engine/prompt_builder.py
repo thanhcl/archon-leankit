@@ -27,11 +27,13 @@ class PromptBuilder:
     def __init__(
         self,
         rag_service: Any | None = None,
+        learning_processor: Any | None = None,
         max_kb_chunks: int = MAX_KB_CHUNKS,
         max_chunk_length: int = MAX_CHUNK_LENGTH,
         default_build_command: str = DEFAULT_BUILD_COMMAND,
     ):
         self._rag_service = rag_service
+        self._learning_processor = learning_processor
         self.max_kb_chunks = max_kb_chunks
         self.max_chunk_length = max_chunk_length
         self.default_build_command = default_build_command
@@ -62,7 +64,8 @@ class PromptBuilder:
         """
         cmd = build_command or self.default_build_command
         kb_context = await self._fetch_kb_context(task)
-        return self._render(task, project, kb_context, cmd)
+        code_patterns = self._fetch_relevant_patterns(task)
+        return self._render(task, project, kb_context, cmd, code_patterns)
 
     # ------------------------------------------------------------------
     # KB integration
@@ -92,6 +95,47 @@ class PromptBuilder:
         desc = (task.get("description") or "").strip()[:100]
         parts = [p for p in (title, desc) if p]
         return " ".join(parts)
+
+    # ------------------------------------------------------------------
+    # Code pattern integration
+    # ------------------------------------------------------------------
+
+    def _fetch_relevant_patterns(self, task: dict[str, Any]) -> list[dict[str, Any]]:
+        """Fetch relevant code patterns from the pattern library."""
+        if self._learning_processor is None:
+            return []
+        try:
+            return self._learning_processor.get_relevant_patterns(
+                project_id=task.get("project_id"), limit=5,
+            )
+        except Exception as e:
+            logger.warning(f"Failed to fetch code patterns (non-fatal): {e}")
+            return []
+
+    @staticmethod
+    def _format_code_patterns(patterns: list[dict[str, Any]]) -> str:
+        if not patterns:
+            return ""
+        lines: list[str] = [
+            "## Expert Code Patterns (from project library)",
+            "The following patterns are proven expert-level implementations for this project.",
+            "Follow these patterns when applicable:",
+            "",
+        ]
+        for p in patterns:
+            lang = p.get("language", "java")
+            usage = p.get("usage_count", 1)
+            conf = p.get("confidence", 0.7)
+            lines.append(f"### Pattern: {p.get('pattern_name', 'Unknown')} (used {usage}x, confidence: {conf:.2f})")
+            lines.append(f"```{lang}")
+            lines.append(p.get("code_example", ""))
+            lines.append("```")
+            lines.append(f"**Use when:** {p.get('context', 'N/A')}")
+            anti = p.get("anti_pattern")
+            if anti:
+                lines.append(f"**Don't:** {anti}")
+            lines.append("")
+        return "\n".join(lines)
 
     # ------------------------------------------------------------------
     # Rendering helpers
@@ -158,6 +202,7 @@ class PromptBuilder:
         project: dict[str, Any] | None,
         kb_chunks: list[dict[str, Any]],
         build_command: str,
+        code_patterns: list[dict[str, Any]] | None = None,
     ) -> str:
         title = task.get("title", "Untitled")
         priority = task.get("priority", "medium")
@@ -174,6 +219,11 @@ class PromptBuilder:
             "## Context (from Knowledge Base)",
             self._format_kb_chunks(kb_chunks),
         ]
+
+        # Inject relevant code patterns from the pattern library
+        patterns_section = self._format_code_patterns(code_patterns or [])
+        if patterns_section:
+            parts += ["", patterns_section]
 
         retry_section = self._format_retry_feedback(task)
         if retry_section:
@@ -220,6 +270,14 @@ class PromptBuilder:
             "- What knowledge was missing that would have helped?",
             "- What should future tasks in this area know?",
             "",
+            "## Code Patterns (REQUIRED in output)",
+            "After completing this task, extract reusable expert-level code patterns:",
+            "- Patterns that solve common problems elegantly",
+            "- Error handling approaches worth standardizing",
+            "- Security patterns that should be replicated",
+            "- Testing patterns that ensure quality",
+            "- Architecture patterns for similar future tasks",
+            "",
             "## Report (REQUIRED — structured output)",
             "SELF_REVIEW: PASS|NEEDS_ATTENTION",
             "REVIEW_CONFIDENCE: 0.0-1.0",
@@ -235,6 +293,16 @@ class PromptBuilder:
             '   "suggested_rule":"optional rule for CLAUDE.md"}',
             "]",
             "If no learnings, output: LEARNINGS: []",
+            "",
+            "CODE_PATTERNS: [",
+            '  {"pattern_name":"descriptive name",',
+            '   "category":"security|error-handling|testing|architecture|performance|api-design",',
+            '   "code_example":"the actual code (keep concise, 5-30 lines)",',
+            '   "context":"when and why to use this pattern",',
+            '   "anti_pattern":"what NOT to do instead (optional)",',
+            '   "source_files":["file1.java","file2.java"]}',
+            "]",
+            "If no patterns, output: CODE_PATTERNS: []",
         ]
 
         return "\n".join(parts)

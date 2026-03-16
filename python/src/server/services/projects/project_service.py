@@ -16,6 +16,27 @@ from ...config.logfire_config import get_logger
 
 logger = get_logger(__name__)
 
+# Virtual Office defaults — applied when creating a project without explicit team_config
+DEFAULT_TEAM_CONFIG: list[dict[str, Any]] = [
+    {"slotIndex": 0, "agentId": "coder-a", "name": "Coder A", "role": "backend-dev", "color": "#FF6B00", "decorations": []},
+    {"slotIndex": 1, "agentId": "coder-b", "name": "Coder B", "role": "backend-dev", "color": "#2563EB", "decorations": []},
+    {"slotIndex": 2, "agentId": "tester", "name": "Tester", "role": "qa", "color": "#16A34A", "decorations": []},
+    {"slotIndex": 3, "agentId": "reviewer", "name": "Reviewer", "role": "senior-dev", "color": "#7C3AED", "decorations": []},
+    {"slotIndex": 4, "agentId": "db-admin", "name": "DB Admin", "role": "dba", "color": "#92400E", "decorations": []},
+]
+DEFAULT_DIRECTOR_CONFIG: dict[str, str] = {"name": "Director", "color": "#1B3A5C"}
+DEFAULT_TEAM_LEAD_CONFIG: dict[str, str] = {"name": "Team Lead", "color": "#4F46E5"}
+
+# Fields that belong to office configuration
+OFFICE_FIELDS = [
+    "source_app",
+    "layout_id",
+    "team_config",
+    "director_config",
+    "team_lead_config",
+    "office_settings",
+]
+
 
 class ProjectService:
     """Service class for project operations"""
@@ -24,9 +45,18 @@ class ProjectService:
         """Initialize with optional supabase client"""
         self.supabase_client = supabase_client or get_supabase_client()
 
-    def create_project(self, title: str, github_repo: str = None) -> tuple[bool, dict[str, Any]]:
+    def create_project(
+        self,
+        title: str,
+        github_repo: str = None,
+        **kwargs: Any,
+    ) -> tuple[bool, dict[str, Any]]:
         """
-        Create a new project with optional PRD and GitHub repo.
+        Create a new project with optional PRD, GitHub repo, and office config.
+
+        Accepts Virtual Office fields via kwargs:
+            source_app, layout_id, team_config, director_config,
+            team_lead_config, office_settings
 
         Returns:
             Tuple of (success, result_dict)
@@ -48,6 +78,19 @@ class ProjectService:
 
             if github_repo and isinstance(github_repo, str) and len(github_repo.strip()) > 0:
                 project_data["github_repo"] = github_repo.strip()
+
+            # Apply Virtual Office fields from kwargs
+            for field in OFFICE_FIELDS:
+                if field in kwargs and kwargs[field] is not None:
+                    project_data[field] = kwargs[field]
+
+            # Auto-generate default team config if not provided
+            if "team_config" not in project_data:
+                project_data["team_config"] = DEFAULT_TEAM_CONFIG
+            if "director_config" not in project_data:
+                project_data["director_config"] = DEFAULT_DIRECTOR_CONFIG
+            if "team_lead_config" not in project_data:
+                project_data["team_lead_config"] = DEFAULT_TEAM_LEAD_CONFIG
 
             # Insert project
             response = self.supabase_client.table("archon_projects").insert(project_data).execute()
@@ -107,6 +150,7 @@ class ProjectService:
                         "docs": project.get("docs", []),
                         "features": project.get("features", []),
                         "data": project.get("data", []),
+                        **self._extract_office_fields(project),
                     })
             else:
                 # Lightweight response for MCP - fetch all data but only return metadata + stats
@@ -138,7 +182,8 @@ class ProjectService:
                             "docs_count": docs_count,
                             "features_count": features_count,
                             "has_data": has_data
-                        }
+                        },
+                        **self._extract_office_fields(project),
                     })
 
             return True, {"projects": projects, "total_count": len(projects)}
@@ -314,6 +359,48 @@ class ProjectService:
             logger.error(f"Error getting project features: {e}")
             return False, {"error": f"Error getting project features: {str(e)}"}
 
+    @staticmethod
+    def _extract_office_fields(project: dict[str, Any]) -> dict[str, Any]:
+        """Extract Virtual Office fields from a project row."""
+        return {
+            "source_app": project.get("source_app"),
+            "layout_id": project.get("layout_id", "classic"),
+            "team_config": project.get("team_config", []),
+            "director_config": project.get("director_config", DEFAULT_DIRECTOR_CONFIG),
+            "team_lead_config": project.get("team_lead_config", DEFAULT_TEAM_LEAD_CONFIG),
+            "office_settings": project.get("office_settings", {}),
+        }
+
+    def list_office_configs(self) -> tuple[bool, dict[str, Any]]:
+        """Return all projects with their Virtual Office configuration.
+
+        Optimized endpoint: only fetches the columns Virtual Office needs.
+        """
+        try:
+            response = (
+                self.supabase_client.table("archon_projects")
+                .select(
+                    "id, title, description, source_app, layout_id, "
+                    "team_config, director_config, team_lead_config, office_settings"
+                )
+                .order("created_at", desc=True)
+                .execute()
+            )
+
+            projects = []
+            for p in response.data or []:
+                projects.append({
+                    "id": p["id"],
+                    "title": p.get("title", ""),
+                    "description": p.get("description", ""),
+                    **self._extract_office_fields(p),
+                })
+
+            return True, {"projects": projects, "count": len(projects)}
+        except Exception as e:
+            logger.error(f"Error listing office configs: {e}")
+            return False, {"error": str(e)}
+
     def update_project(
         self, project_id: str, update_fields: dict[str, Any]
     ) -> tuple[bool, dict[str, Any]]:
@@ -338,6 +425,7 @@ class ProjectService:
                 "technical_sources",
                 "business_sources",
                 "pinned",
+                *OFFICE_FIELDS,
             ]
 
             for field in allowed_fields:

@@ -67,6 +67,7 @@ EVENT_TASK_FAILED = "task_failed"
 EVENT_HEALTH_ALERT = "health_alert"
 EVENT_LEARNING_PROMOTED = "learning_promoted"
 EVENT_LEARNING_PATTERN = "learning_pattern_detected"
+EVENT_PATTERN_PROMOTED = "code_pattern_promoted"
 
 _CRITICAL_EVENTS = frozenset({EVENT_TASK_ESCALATED, EVENT_TASK_FAILED, EVENT_HEALTH_ALERT})
 
@@ -162,6 +163,14 @@ class Notifier:
             "description": learning.get("description"),
             "recurrence_count": learning.get("recurrence_count"),
             "type": learning.get("type"),
+        })
+
+    async def on_pattern_promoted(self, pattern: dict[str, Any]) -> None:
+        await self.emit(EVENT_PATTERN_PROMOTED, "", {
+            "id": pattern.get("id"),
+            "pattern_name": pattern.get("pattern_name"),
+            "category": pattern.get("category"),
+            "usage_count": pattern.get("usage_count"),
         })
 
     # ── Channel implementations ───────────────────────────────────────

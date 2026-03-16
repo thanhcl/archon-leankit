@@ -1,0 +1,144 @@
+{
+  "env": {
+    "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1"
+  },
+  "mcpServers": {
+    "archon": {
+      "type": "http",
+      "url": "http://localhost:8051/mcp"
+    }
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "uv run .claude/hooks/pre_tool_use.py"
+          },
+          {
+            "type": "command",
+            "command": "uv run .claude/hooks/send_event.py --source-app archon-leankit --event-type PreToolUse --summarize"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "uv run .claude/hooks/post_tool_use.py"
+          },
+          {
+            "type": "command",
+            "command": "uv run .claude/hooks/send_event.py --source-app archon-leankit --event-type PostToolUse --summarize"
+          }
+        ]
+      }
+    ],
+    "PostToolUseFailure": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "uv run .claude/hooks/send_event.py --source-app archon-leankit --event-type PostToolUseFailure --summarize"
+          }
+        ]
+      }
+    ],
+    "SubagentStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "uv run .claude/hooks/send_event.py --source-app archon-leankit --event-type SubagentStart"
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "uv run .claude/hooks/send_event.py --source-app archon-leankit --event-type SubagentStop --summarize"
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "uv run .claude/hooks/send_event.py --source-app archon-leankit --event-type SessionStart"
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "uv run .claude/hooks/send_event.py --source-app archon-leankit --event-type SessionEnd"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "uv run .claude/hooks/send_event.py --source-app archon-leankit --event-type Stop --summarize --add-chat"
+          }
+        ]
+      }
+    ],
+    "Notification": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "uv run .claude/hooks/send_event.py --source-app archon-leankit --event-type Notification"
+          }
+        ]
+      }
+    ],
+    "PermissionRequest": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "uv run .claude/hooks/send_event.py --source-app archon-leankit --event-type PermissionRequest"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "uv run .claude/hooks/send_event.py --source-app archon-leankit --event-type UserPromptSubmit --summarize"
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "uv run .claude/hooks/send_event.py --source-app archon-leankit --event-type PreCompact"
+          }
+        ]
+      }
+    ]
+  }
+}

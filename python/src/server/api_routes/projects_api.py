@@ -51,6 +51,13 @@ class CreateProjectRequest(BaseModel):
     technical_sources: list[str] | None = None  # List of knowledge source IDs
     business_sources: list[str] | None = None  # List of knowledge source IDs
     pinned: bool | None = None  # Whether this project should be pinned to top
+    # Virtual Office config
+    source_app: str | None = None
+    layout_id: str | None = None
+    team_config: list[dict[str, Any]] | None = None
+    director_config: dict[str, Any] | None = None
+    team_lead_config: dict[str, Any] | None = None
+    office_settings: dict[str, Any] | None = None
 
 
 class UpdateProjectRequest(BaseModel):
@@ -63,6 +70,13 @@ class UpdateProjectRequest(BaseModel):
     technical_sources: list[str] | None = None  # List of knowledge source IDs
     business_sources: list[str] | None = None  # List of knowledge source IDs
     pinned: bool | None = None  # Whether this project is pinned to top
+    # Virtual Office config
+    source_app: str | None = None
+    layout_id: str | None = None
+    team_config: list[dict[str, Any]] | None = None
+    director_config: dict[str, Any] | None = None
+    team_lead_config: dict[str, Any] | None = None
+    office_settings: dict[str, Any] | None = None
 
 
 class CreateTaskRequest(BaseModel):
@@ -189,6 +203,12 @@ async def create_project(request: CreateProjectRequest):
             kwargs["features"] = request.features
         if request.data:
             kwargs["data"] = request.data
+
+        # Virtual Office config fields
+        for field in ("source_app", "layout_id", "team_config", "director_config", "team_lead_config", "office_settings"):
+            val = getattr(request, field, None)
+            if val is not None:
+                kwargs[field] = val
 
         # Create project directly with AI assistance
         project_service = ProjectCreationService()
@@ -342,6 +362,26 @@ async def get_all_task_counts(
         raise HTTPException(status_code=500, detail={"error": str(e)})
 
 
+@router.get("/projects/office-configs")
+async def list_office_configs():
+    """Return all projects with their Virtual Office configuration.
+
+    Optimized for Virtual Office fetch — only returns id, title, description,
+    and office-related fields (source_app, layout_id, team_config, etc.).
+    """
+    try:
+        project_service = ProjectService()
+        ok, result = project_service.list_office_configs()
+        if not ok:
+            raise HTTPException(status_code=500, detail=result)
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        logfire.error(f"Failed to list office configs | error={str(e)}")
+        raise HTTPException(status_code=500, detail={"error": str(e)})
+
+
 @router.get("/projects/{project_id}")
 async def get_project(project_id: str):
     """Get a specific project."""
@@ -404,6 +444,12 @@ async def update_project(project_id: str, request: UpdateProjectRequest):
             update_fields["data"] = request.data
         if request.pinned is not None:
             update_fields["pinned"] = request.pinned
+
+        # Virtual Office config fields
+        for field in ("source_app", "layout_id", "team_config", "director_config", "team_lead_config", "office_settings"):
+            val = getattr(request, field, None)
+            if val is not None:
+                update_fields[field] = val
 
         # Create version snapshots for JSONB fields before updating
         if update_fields:

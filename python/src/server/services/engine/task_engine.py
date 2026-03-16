@@ -54,10 +54,10 @@ class TaskEngine:
 
         self.task_service = TaskService()
         self.lifecycle_service = TaskLifecycleService()
-        self.prompt_builder = PromptBuilder()
         self.architect_reviewer = ArchitectReviewer()
         self.notifier = Notifier()
         self.learning_processor = LearningProcessor(notifier=self.notifier)
+        self.prompt_builder = PromptBuilder(learning_processor=self.learning_processor)
         self.health_monitor = HealthMonitor(
             task_service=self.task_service,
             notifier=self.notifier,
@@ -314,10 +314,11 @@ class TaskEngine:
         elif action.next_status == "escalated":
             await self.notifier.on_task_escalated(task_id, action.reason)
 
-        # Process learnings from CC output (regardless of review outcome)
+        # Process learnings and code patterns from CC output (regardless of review outcome)
         learnings = execution_result.get("learnings", [])
-        if learnings:
-            await self.learning_processor.process(task, learnings)
+        code_patterns = execution_result.get("code_patterns", [])
+        if learnings or code_patterns:
+            await self.learning_processor.process(task, learnings, code_patterns)
 
         logger.info(
             f"Architect review applied | task_id={task_id} | "

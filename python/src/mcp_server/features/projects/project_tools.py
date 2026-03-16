@@ -152,22 +152,35 @@ def register_project_tools(mcp: FastMCP):
         title: str | None = None,
         description: str | None = None,
         github_repo: str | None = None,
+        # Virtual Office config
+        source_app: str | None = None,
+        layout_id: str | None = None,
+        team_config: list | None = None,
+        director_config: dict | None = None,
+        team_lead_config: dict | None = None,
+        office_settings: dict | None = None,
     ) -> str:
         """
         Manage projects (consolidated: create/update/delete).
-        
+
         Args:
             action: "create" | "update" | "delete"
             project_id: Project UUID for update/delete
             title: Project title (required for create)
             description: Project goals and scope
             github_repo: GitHub URL (e.g. "https://github.com/org/repo")
-        
+            source_app: Virtual Office source app identifier (e.g. "sesb-kms-project")
+            layout_id: Office layout theme (e.g. "classic", "executive-suite", "central-hub")
+            team_config: Array of workstation assignments [{slotIndex, agentId, name, role, color, decorations}]
+            director_config: Director display config {name, color}
+            team_lead_config: Team lead display config {name, color}
+            office_settings: Virtual Office settings {defaultView, showAgentLabels, mockMode, ...}
+
         Examples:
             manage_project("create", title="Auth System")
-            manage_project("update", project_id="p-1", description="Updated")
+            manage_project("update", project_id="p-1", source_app="my-app", layout_id="executive-suite")
             manage_project("delete", project_id="p-1")
-        
+
         Returns: {success: bool, project?: object, message: string}
         """
         try:
@@ -181,14 +194,24 @@ def register_project_tools(mcp: FastMCP):
                             "validation_error",
                             "title required for create"
                         )
-                    
+
+                    body: dict = {
+                        "title": title,
+                        "description": description or "",
+                        "github_repo": github_repo,
+                    }
+                    # Attach office config fields when provided
+                    for key, val in [
+                        ("source_app", source_app), ("layout_id", layout_id),
+                        ("team_config", team_config), ("director_config", director_config),
+                        ("team_lead_config", team_lead_config), ("office_settings", office_settings),
+                    ]:
+                        if val is not None:
+                            body[key] = val
+
                     response = await client.post(
                         urljoin(api_url, "/api/projects"),
-                        json={
-                            "title": title,
-                            "description": description or "",
-                            "github_repo": github_repo
-                        }
+                        json=body,
                     )
                     
                     if response.status_code == 200:
@@ -270,7 +293,15 @@ def register_project_tools(mcp: FastMCP):
                         update_data["description"] = description
                     if github_repo is not None:
                         update_data["github_repo"] = github_repo
-                    
+                    # Office config fields
+                    for key, val in [
+                        ("source_app", source_app), ("layout_id", layout_id),
+                        ("team_config", team_config), ("director_config", director_config),
+                        ("team_lead_config", team_lead_config), ("office_settings", office_settings),
+                    ]:
+                        if val is not None:
+                            update_data[key] = val
+
                     if not update_data:
                         return MCPErrorFormatter.format_error(
                             "validation_error",

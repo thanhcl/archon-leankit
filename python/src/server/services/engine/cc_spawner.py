@@ -61,6 +61,9 @@ _ASSESS_REASON_RE = re.compile(r"ASSESSMENT_REASONING:\s*(.+)", re.IGNORECASE)
 # Learnings pattern — captures JSON array
 _LEARNINGS_RE = re.compile(r"LEARNINGS:\s*(\[.*?\])", re.IGNORECASE | re.DOTALL)
 
+# Code patterns — captures JSON array
+_CODE_PATTERNS_RE = re.compile(r"CODE_PATTERNS:\s*(\[.*?\])", re.IGNORECASE | re.DOTALL)
+
 
 class CCSpawner:
     """Spawns and manages Claude Code CLI sessions."""
@@ -374,6 +377,19 @@ class CCSpawner:
                 parsed["learnings"] = []
         else:
             parsed["learnings"] = []
+
+        # Code patterns
+        m = _CODE_PATTERNS_RE.search(stdout)
+        if m:
+            try:
+                code_patterns = json.loads(m.group(1))
+                if isinstance(code_patterns, list):
+                    parsed["code_patterns"] = code_patterns
+            except json.JSONDecodeError:
+                logger.warning("Failed to parse CODE_PATTERNS JSON from CC output")
+                parsed["code_patterns"] = []
+        else:
+            parsed["code_patterns"] = []
 
         # If no structured block, try to extract a one-line summary from the
         # last non-empty line of stdout.
