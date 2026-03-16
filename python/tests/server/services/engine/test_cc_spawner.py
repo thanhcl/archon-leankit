@@ -68,6 +68,33 @@ class TestParseResult:
         parsed = CCSpawner.parse_result("")
         assert parsed == {}
 
+    def test_task_assessment_parsed(self):
+        stdout = (
+            "TASK_ASSESSMENT: complex\n"
+            "ESTIMATED_FILES: 12\n"
+            "ESTIMATED_RISK: high\n"
+            "ASSESSMENT_REASONING: Touches auth middleware and 3 service layers\n"
+            "RESULT: SUCCESS\n"
+        )
+        parsed = CCSpawner.parse_result(stdout)
+        assert parsed["task_assessment"] == "complex"
+        assert parsed["estimated_files"] == 12
+        assert parsed["estimated_risk"] == "high"
+        assert "auth middleware" in parsed["assessment_reasoning"]
+        assert parsed["result"] == "SUCCESS"
+
+    def test_task_assessment_simple_low_risk(self):
+        stdout = "TASK_ASSESSMENT: simple\nESTIMATED_FILES: 2\nESTIMATED_RISK: low\n"
+        parsed = CCSpawner.parse_result(stdout)
+        assert parsed["task_assessment"] == "simple"
+        assert parsed["estimated_risk"] == "low"
+
+    def test_assessment_missing_is_ok(self):
+        stdout = "RESULT: SUCCESS\nSUMMARY: Done\n"
+        parsed = CCSpawner.parse_result(stdout)
+        assert "task_assessment" not in parsed
+        assert "estimated_risk" not in parsed
+
     def test_case_insensitive(self):
         stdout = "result: success\nfiles_changed: 5\n"
         parsed = CCSpawner.parse_result(stdout)

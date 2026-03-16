@@ -20,9 +20,8 @@ _CONFIG_CATEGORY = "engine"
 
 
 class ReviewConfigRequest(BaseModel):
-    simple_task_mode: str | None = None
-    complex_task_mode: str | None = None
-    security_sensitive_mode: str | None = None
+    review_mode: str | None = None
+    security_override_to_api: bool | None = None
     provider: str | None = None
     model: str | None = None
     temperature: float | None = None
@@ -34,9 +33,8 @@ class ReviewConfigRequest(BaseModel):
 
 
 _DEFAULTS: dict[str, Any] = {
-    "simple_task_mode": "self-review",
-    "complex_task_mode": "api",
-    "security_sensitive_mode": "api",
+    "review_mode": "self-review",
+    "security_override_to_api": True,
     "provider": "anthropic",
     "model": "",
     "temperature": 0.3,
@@ -78,14 +76,13 @@ async def update_review_config(request: ReviewConfigRequest):
         if not updates:
             raise HTTPException(status_code=400, detail="No fields to update")
 
-        # Validate modes
+        # Validate mode
         valid_modes = {"self-review", "api"}
-        for field in ("simple_task_mode", "complex_task_mode", "security_sensitive_mode"):
-            if field in updates and updates[field] not in valid_modes:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Invalid {field}: must be 'self-review' or 'api'",
-                )
+        if "review_mode" in updates and updates["review_mode"] not in valid_modes:
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid review_mode: must be 'self-review' or 'api'",
+            )
 
         valid_providers = {"anthropic", "openai", "google"}
         if "provider" in updates and updates["provider"] not in valid_providers:

@@ -207,9 +207,10 @@ class TaskEngine:
 
         full_task = full["task"]
 
-        # Determine if self-review mode applies for this task
-        review_mode = self.architect_reviewer._get_mode(full_task, self.review_config)
-        include_self_review = review_mode == "self-review"
+        # Include self-review instructions when global mode is self-review.
+        # CC assessment may override to API at review time, but self-review
+        # data in stdout is always useful as fallback.
+        include_self_review = self.review_config.review_mode == "self-review"
 
         # Build prompt
         prompt = await self.prompt_builder.build(

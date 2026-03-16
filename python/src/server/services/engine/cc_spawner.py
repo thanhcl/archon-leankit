@@ -51,6 +51,12 @@ _FILES_RE = re.compile(r"FILES_CHANGED:\s*(\d+)", re.IGNORECASE)
 _TESTS_RE = re.compile(r"TESTS_ADDED:\s*(\d+)", re.IGNORECASE)
 _SUMMARY_RE = re.compile(r"SUMMARY:\s*(.+)", re.IGNORECASE)
 
+# Task assessment patterns
+_ASSESS_RE = re.compile(r"TASK_ASSESSMENT:\s*(simple|complex)", re.IGNORECASE)
+_EST_FILES_RE = re.compile(r"ESTIMATED_FILES:\s*(\d+)", re.IGNORECASE)
+_EST_RISK_RE = re.compile(r"ESTIMATED_RISK:\s*(low|medium|high)", re.IGNORECASE)
+_ASSESS_REASON_RE = re.compile(r"ASSESSMENT_REASONING:\s*(.+)", re.IGNORECASE)
+
 
 class CCSpawner:
     """Spawns and manages Claude Code CLI sessions."""
@@ -334,6 +340,23 @@ class CCSpawner:
         m = _SUMMARY_RE.search(stdout)
         if m:
             parsed["summary"] = m.group(1).strip()
+
+        # Task assessment fields
+        m = _ASSESS_RE.search(stdout)
+        if m:
+            parsed["task_assessment"] = m.group(1).lower()
+
+        m = _EST_FILES_RE.search(stdout)
+        if m:
+            parsed["estimated_files"] = int(m.group(1))
+
+        m = _EST_RISK_RE.search(stdout)
+        if m:
+            parsed["estimated_risk"] = m.group(1).lower()
+
+        m = _ASSESS_REASON_RE.search(stdout)
+        if m:
+            parsed["assessment_reasoning"] = m.group(1).strip()
 
         # If no structured block, try to extract a one-line summary from the
         # last non-empty line of stdout.

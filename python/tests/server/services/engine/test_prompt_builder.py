@@ -87,6 +87,9 @@ async def test_simple_prompt_structure():
     assert "## Context (from Knowledge Base)" in prompt
     assert "## Requirements" in prompt
     assert "## Acceptance Criteria" in prompt
+    assert "## Task Assessment" in prompt
+    assert "TASK_ASSESSMENT: simple|complex" in prompt
+    assert "ESTIMATED_RISK: low|medium|high" in prompt
     assert "## Instructions" in prompt
     assert "RESULT: SUCCESS|FAILURE" in prompt
 
@@ -164,9 +167,11 @@ async def test_complex_prompt_structure():
     assert "## 1. Overview" in prompt
     assert "## 2. Execution Strategy" in prompt
     assert "## 3. Context (from Knowledge Base)" in prompt
-    assert "## 5. Acceptance Criteria" in prompt
-    assert "## 6. Cross-Cutting Concerns" in prompt
-    assert "## 7. Validation" in prompt
+    assert "## 5. Task Assessment" in prompt
+    assert "TASK_ASSESSMENT: simple|complex" in prompt
+    assert "## 6. Acceptance Criteria" in prompt
+    assert "## 7. Cross-Cutting Concerns" in prompt
+    assert "## 8. Validation" in prompt
 
 
 @pytest.mark.asyncio

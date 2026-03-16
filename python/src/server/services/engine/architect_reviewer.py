@@ -68,9 +68,8 @@ PROVIDER_DEFAULTS: dict[str, dict[str, Any]] = {
 class ReviewConfig:
     """Per-project reviewer configuration."""
 
-    simple_task_mode: str = "self-review"  # "self-review" | "api"
-    complex_task_mode: str = "api"
-    security_sensitive_mode: str = "api"
+    review_mode: str = "self-review"  # "self-review" | "api" — global default
+    security_override_to_api: bool = True  # CC high-risk + security → force API
 
     provider: str = "anthropic"  # "anthropic" | "openai" | "google"
     model: str = ""  # empty → auto from PROVIDER_DEFAULTS
@@ -407,7 +406,7 @@ class ArchitectReviewer:
     ) -> tuple[ArchitectReviewResult, ReviewAction]:
         """Review execution results and decide next action."""
         cfg = config or ReviewConfig()
-        mode = self._get_mode(task, cfg)
+        mode = self._get_mode(task, cfg, execution_result)
 
         if mode == "self-review":
             review_result = self._parse_self_review(execution_result)
@@ -427,12 +426,22 @@ class ArchitectReviewer:
     # ── Mode selection ────────────────────────────────────────────────────
 
     @staticmethod
-    def _get_mode(task: dict[str, Any], config: ReviewConfig) -> str:
-        if ArchitectReviewer._is_security_sensitive(task):
-            return config.security_sensitive_mode
-        if task.get("complexity") == "complex":
-            return config.complex_task_mode
-        return config.simple_task_mode
+    def _get_mode(
+        task: dict[str, Any],
+        config: ReviewConfig,
+        execution_result: dict[str, Any] | None = None,
+    ) -> str:
+        """Determine review mode using CC's own task assessment.
+
+        If CC assessed the task as high-risk AND task is security-sensitive,
+        override to API mode regardless of global setting.
+        Otherwise use the global review_mode.
+        """
+        if config.security_override_to_api and execution_result:
+            estimated_risk = execution_result.get("estimated_risk", "").lower()
+            if estimated_risk == "high" and ArchitectReviewer._is_security_sensitive(task):
+                return "api"
+        return config.review_mode
 
     @staticmethod
     def _is_security_sensitive(task: dict[str, Any]) -> bool:
