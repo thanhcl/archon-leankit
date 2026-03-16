@@ -335,60 +335,124 @@ class TestAPIFallback:
 
 
 class TestDecideAction:
-    def test_approve_high_confidence(self):
+    """Tests for _decide_action with configurable confidence thresholds."""
+
+    # -- Approve with thresholds --
+
+    def test_approve_above_threshold_goes_to_review(self):
+        """confidence >= 0.8 + approve → review (Owner final check)"""
         review = ArchitectReviewResult(verdict="approve", confidence=0.95, summary="Good")
         action = ArchitectReviewer._decide_action(_make_task(), review)
         assert action.next_status == "review"
-        assert action.warning is None
+        assert action.escalation_reason is None
 
-    def test_approve_low_confidence(self):
-        review = ArchitectReviewResult(verdict="approve", confidence=0.6, summary="Ok")
+    def test_approve_exactly_at_threshold(self):
+        """confidence == 0.8 → review"""
+        review = ArchitectReviewResult(verdict="approve", confidence=0.8, summary="Ok")
         action = ArchitectReviewer._decide_action(_make_task(), review)
         assert action.next_status == "review"
-        assert action.warning is not None
-        assert "0.60" in action.warning
 
-    def test_changes_requested_retry_available(self):
+    def test_approve_below_threshold_escalates(self):
+        """confidence 0.5-0.8 + approve → escalated (low confidence)"""
+        review = ArchitectReviewResult(verdict="approve", confidence=0.6, summary="Unsure")
+        action = ArchitectReviewer._decide_action(_make_task(), review)
+        assert action.next_status == "escalated"
+        assert action.escalation_reason == "low_confidence_approve"
+        assert "0.60" in action.reason
+
+    def test_approve_very_low_confidence_escalates(self):
+        """confidence < 0.5 + approve → escalated"""
+        review = ArchitectReviewResult(verdict="approve", confidence=0.3, summary="Guess")
+        action = ArchitectReviewer._decide_action(_make_task(), review)
+        assert action.next_status == "escalated"
+        assert action.escalation_reason == "low_confidence_approve"
+
+    def test_approve_custom_threshold(self):
+        """Custom threshold 0.9 — confidence 0.85 should escalate."""
+        config = ReviewConfig(confidence_approve_threshold=0.9)
+        review = ArchitectReviewResult(verdict="approve", confidence=0.85, summary="Ok")
+        action = ArchitectReviewer._decide_action(_make_task(), review, config)
+        assert action.next_status == "escalated"
+        assert action.escalation_reason == "low_confidence_approve"
+
+    # -- Changes-requested with retries --
+
+    def test_changes_requested_low_confidence_retry(self):
+        """confidence < 0.5 + changes-requested + retries left → assigned"""
+        review = ArchitectReviewResult(
+            verdict="changes-requested", confidence=0.3, feedback="Fix auth",
+        )
+        action = ArchitectReviewer._decide_action(_make_task(retry_count=0), review)
+        assert action.next_status == "assigned"
+        assert "Fix auth" in action.reason
+
+    def test_changes_requested_mid_confidence_retry(self):
+        """confidence 0.5-0.8 + changes-requested + retries left → assigned"""
+        review = ArchitectReviewResult(
+            verdict="changes-requested", confidence=0.7, feedback="Missing validation",
+        )
+        action = ArchitectReviewer._decide_action(_make_task(retry_count=1), review)
+        assert action.next_status == "assigned"
+
+    def test_changes_requested_high_confidence_retry(self):
+        """confidence >= 0.8 + changes-requested + retries left → assigned"""
         review = ArchitectReviewResult(
             verdict="changes-requested", confidence=0.9, feedback="Fix auth",
         )
         action = ArchitectReviewer._decide_action(_make_task(retry_count=1), review)
         assert action.next_status == "assigned"
-        assert "Fix auth" in action.reason
 
-    def test_changes_requested_max_retries(self):
+    def test_changes_requested_max_retries_escalates(self):
+        """changes-requested + max retries exceeded → escalated"""
         review = ArchitectReviewResult(
             verdict="changes-requested", confidence=0.9, feedback="Still broken",
         )
-        action = ArchitectReviewer._decide_action(_make_task(retry_count=3, max_retries=3), review)
+        action = ArchitectReviewer._decide_action(
+            _make_task(retry_count=3, max_retries=3), review,
+        )
         assert action.next_status == "escalated"
-        assert "Max retries" in action.reason
+        assert action.escalation_reason == "max_retries_exceeded"
+        assert "max_retries_exceeded" in action.reason
+
+    def test_changes_requested_mid_confidence_max_retries_escalates(self):
+        """confidence 0.5-0.8 + changes-requested + max retries → escalated"""
+        review = ArchitectReviewResult(
+            verdict="changes-requested", confidence=0.6, feedback="Ongoing issue",
+        )
+        action = ArchitectReviewer._decide_action(
+            _make_task(retry_count=3, max_retries=3), review,
+        )
+        assert action.next_status == "escalated"
+        assert action.escalation_reason == "max_retries_exceeded"
+
+    # -- Escalate verdict --
 
     def test_escalate_verdict(self):
         review = ArchitectReviewResult(verdict="escalate", confidence=0.85, feedback="Human needed")
         action = ArchitectReviewer._decide_action(_make_task(), review)
         assert action.next_status == "escalated"
+        assert action.escalation_reason == "reviewer_escalate"
+
+    # -- Security overrides --
 
     def test_critical_security_always_escalates(self):
+        """Critical security finding overrides even high-confidence approve."""
         review = ArchitectReviewResult(
-            verdict="approve", confidence=0.95,
+            verdict="approve", confidence=0.99,
             findings=[{"severity": "critical", "category": "security", "description": "SQL injection"}],
         )
         action = ArchitectReviewer._decide_action(_make_task(), review)
         assert action.next_status == "escalated"
+        assert action.escalation_reason == "critical_security_finding"
 
     def test_critical_non_security_does_not_escalate(self):
+        """Critical findings in non-security categories don't force escalation."""
         review = ArchitectReviewResult(
             verdict="approve", confidence=0.9,
             findings=[{"severity": "critical", "category": "performance", "description": "N+1"}],
         )
         action = ArchitectReviewer._decide_action(_make_task(), review)
         assert action.next_status == "review"
-
-    def test_error_escalates(self):
-        review = ArchitectReviewResult(verdict="approve", confidence=0.0, error="API timeout")
-        action = ArchitectReviewer._decide_action(_make_task(), review)
-        assert action.next_status == "escalated"
 
     def test_auth_category_escalates(self):
         review = ArchitectReviewResult(
@@ -397,6 +461,30 @@ class TestDecideAction:
         )
         action = ArchitectReviewer._decide_action(_make_task(), review)
         assert action.next_status == "escalated"
+        assert action.escalation_reason == "critical_security_finding"
+
+    # -- Error handling --
+
+    def test_error_escalates(self):
+        review = ArchitectReviewResult(verdict="approve", confidence=0.0, error="API timeout")
+        action = ArchitectReviewer._decide_action(_make_task(), review)
+        assert action.next_status == "escalated"
+        assert action.escalation_reason == "api_failure"
+
+    # -- Escalation reason stored correctly --
+
+    def test_escalation_reason_format(self):
+        """Escalation reason includes confidence and feedback details."""
+        review = ArchitectReviewResult(
+            verdict="approve", confidence=0.5,
+            feedback="Not sure about error handling",
+            summary="Needs review",
+        )
+        action = ArchitectReviewer._decide_action(_make_task(), review)
+        assert action.next_status == "escalated"
+        assert "0.50" in action.reason
+        assert "low_confidence_approve" in action.reason
+        assert action.escalation_reason == "low_confidence_approve"
 
 
 # ---------------------------------------------------------------------------

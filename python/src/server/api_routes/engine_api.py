@@ -29,6 +29,8 @@ class ReviewConfigRequest(BaseModel):
     max_tokens: int | None = None
     timeout: int | None = None
     api_fallback_to_self_review: bool | None = None
+    confidence_approve_threshold: float | None = None
+    confidence_retry_threshold: float | None = None
 
 
 _DEFAULTS: dict[str, Any] = {
@@ -41,6 +43,8 @@ _DEFAULTS: dict[str, Any] = {
     "max_tokens": 2000,
     "timeout": 60,
     "api_fallback_to_self_review": True,
+    "confidence_approve_threshold": 0.8,
+    "confidence_retry_threshold": 0.5,
 }
 
 

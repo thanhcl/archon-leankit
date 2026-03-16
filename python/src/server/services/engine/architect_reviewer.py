@@ -80,6 +80,9 @@ class ReviewConfig:
 
     api_fallback_to_self_review: bool = True
 
+    confidence_approve_threshold: float = 0.8
+    confidence_retry_threshold: float = 0.5
+
 
 @dataclass
 class ArchitectReviewResult:
@@ -104,6 +107,7 @@ class ReviewAction:
     reason: str
     changed_by: str = "architect-reviewer"
     warning: str | None = None
+    escalation_reason: str | None = None  # structured reason code for escalations
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -410,7 +414,7 @@ class ArchitectReviewer:
         else:
             review_result = await self._api_review(task, execution_result, cfg)
 
-        action = self._decide_action(task, review_result)
+        action = self._decide_action(task, review_result, cfg)
 
         logger.info(
             f"Architect review | task_id={task.get('id')} | "
@@ -527,53 +531,83 @@ class ArchitectReviewer:
     def _decide_action(
         task: dict[str, Any],
         review: ArchitectReviewResult,
+        config: ReviewConfig | None = None,
     ) -> ReviewAction:
-        """Map review verdict to lifecycle transition.
+        """Map review verdict + confidence to lifecycle transition.
 
-        Rules:
-        - Critical security finding → ALWAYS escalated
-        - verdict=escalate or error → escalated
-        - verdict=approve, confidence >= 0.8 → review
-        - verdict=approve, confidence < 0.8 → review with warning
-        - verdict=changes-requested, retries left → assigned (auto-retry)
-        - verdict=changes-requested, no retries → escalated
+        Uses configurable thresholds (same logic for self-review and API):
+
+        1. Critical security finding → ALWAYS escalated
+        2. verdict=approve + confidence >= approve_threshold → review (Owner)
+        3. verdict=approve + confidence < approve_threshold → escalated (low confidence)
+        4. verdict=changes-requested + retries left → assigned (auto-retry)
+        5. verdict=changes-requested + no retries → escalated
+        6. verdict=escalate or error → escalated
         """
+        cfg = config or ReviewConfig()
+        confidence = review.confidence
+        retry_count = task.get("retry_count") or 0
+        max_retries = task.get("max_retries") or 3
+
+        def _esc_reason(feedback: str, conf: float) -> str:
+            return f"Escalated: {feedback}. Review confidence: {conf:.2f}. Details: {review.feedback or review.summary}"
+
+        # Rule 1: Critical security finding → ALWAYS escalate
         has_critical_security = any(
             f.get("severity") == "critical"
             and f.get("category", "").lower() in ("security", "auth", "injection", "xss")
             for f in review.findings
         )
         if has_critical_security:
+            reason = _esc_reason("critical_security_finding", confidence)
             return ReviewAction(
                 next_status="escalated",
-                reason=f"Critical security finding: {review.feedback or review.summary}",
+                reason=reason,
+                escalation_reason="critical_security_finding",
             )
 
-        if review.verdict == "escalate" or review.error:
+        # Rule 6 (early): error → escalated
+        if review.error:
+            reason = _esc_reason("api_failure", confidence)
             return ReviewAction(
                 next_status="escalated",
-                reason=review.feedback or review.summary or review.error or "Architect escalation",
+                reason=reason,
+                escalation_reason="api_failure",
             )
 
+        # Rule 6: verdict=escalate → escalated
+        if review.verdict == "escalate":
+            reason = _esc_reason("reviewer_escalate", confidence)
+            return ReviewAction(
+                next_status="escalated",
+                reason=reason,
+                escalation_reason="reviewer_escalate",
+            )
+
+        # Rule 2–3: verdict=approve
         if review.verdict == "approve":
-            warning = None
-            if review.confidence < 0.8:
-                warning = f"Low confidence approval ({review.confidence:.2f})"
+            if confidence >= cfg.confidence_approve_threshold:
+                return ReviewAction(
+                    next_status="review",
+                    reason=review.summary or "Approved by architect",
+                )
+            # Low confidence approve → escalate for Owner decision
+            reason = _esc_reason("low_confidence_approve", confidence)
             return ReviewAction(
-                next_status="review",
-                reason=review.summary or "Approved by architect",
-                warning=warning,
+                next_status="escalated",
+                reason=reason,
+                escalation_reason="low_confidence_approve",
             )
 
-        # changes-requested
-        retry_count = task.get("retry_count") or 0
-        max_retries = task.get("max_retries") or 3
+        # Rule 4–5: verdict=changes-requested
         if retry_count < max_retries:
             return ReviewAction(
                 next_status="assigned",
                 reason=review.feedback or review.summary or "Changes requested",
             )
+        reason = _esc_reason("max_retries_exceeded", confidence)
         return ReviewAction(
             next_status="escalated",
-            reason=f"Max retries ({max_retries}) reached. Last feedback: {review.feedback or review.summary}",
+            reason=reason,
+            escalation_reason="max_retries_exceeded",
         )

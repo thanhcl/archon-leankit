@@ -310,10 +310,18 @@ class TaskEngine:
             review_data["warning"] = action.warning
         if review_result.error:
             review_data["error"] = review_result.error
+        if action.escalation_reason:
+            review_data["escalation_reason"] = action.escalation_reason
+
+        update_fields: dict[str, Any] = {"architect_review": review_data}
+
+        # When escalating, store structured reason in rejection_reason
+        if action.next_status == "escalated":
+            update_fields["rejection_reason"] = action.reason
 
         await self.task_service.update_task(
             task_id=task_id,
-            update_fields={"architect_review": review_data},
+            update_fields=update_fields,
         )
 
         # Apply lifecycle transition
