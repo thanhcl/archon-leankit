@@ -1,8 +1,9 @@
 """
 Prompt Builder for LeanKit V3 Task Engine.
 
-Generates high-quality execution prompts for Claude Code sessions
-by combining task metadata, KB context, and retry feedback.
+Generates a single unified execution prompt for Claude Code sessions
+by combining task metadata, KB context, retry feedback, task assessment,
+and self-review instructions.
 
 Usage:
     builder = PromptBuilder()
@@ -15,7 +16,6 @@ from ...config.logfire_config import get_logger
 
 logger = get_logger(__name__)
 
-# Defaults
 MAX_KB_CHUNKS = 5
 MAX_CHUNK_LENGTH = 500
 DEFAULT_BUILD_COMMAND = "pnpm build && pnpm test"
@@ -54,47 +54,24 @@ class PromptBuilder:
         task: dict[str, Any],
         project: dict[str, Any] | None = None,
         build_command: str | None = None,
-        include_self_review: bool = False,
     ) -> str:
-        """
-        Build a complete execution prompt for the given task.
+        """Build a unified execution prompt for the given task.
 
-        Args:
-            task: Full task dict (from DB / API).
-            project: Optional project dict for extra context.
-            build_command: Override build/test command. Falls back to
-                           project config → default.
-            include_self_review: If True, append self-review instructions
-                for CC to evaluate its own changes.
-
-        Returns:
-            Ready-to-use prompt string.
+        Single template for all tasks. CC self-assesses complexity at runtime.
+        Always includes self-review instructions.
         """
-        complexity = task.get("complexity", "simple")
         cmd = build_command or self.default_build_command
-
         kb_context = await self._fetch_kb_context(task)
-
-        if complexity == "complex":
-            prompt = self._render_complex(task, project, kb_context, cmd)
-        else:
-            prompt = self._render_simple(task, project, kb_context, cmd)
-
-        if include_self_review:
-            prompt += "\n" + self._self_review_section()
-
-        return prompt
+        return self._render(task, project, kb_context, cmd)
 
     # ------------------------------------------------------------------
     # KB integration
     # ------------------------------------------------------------------
 
     async def _fetch_kb_context(self, task: dict[str, Any]) -> list[dict[str, Any]]:
-        """Query RAG KB for relevant context chunks."""
         query = self._build_search_query(task)
         if not query:
             return []
-
         try:
             success, result = await self.rag_service.perform_rag_query(
                 query=query,
@@ -111,7 +88,6 @@ class PromptBuilder:
 
     @staticmethod
     def _build_search_query(task: dict[str, Any]) -> str:
-        """Combine title + truncated description into a search query."""
         title = (task.get("title") or "").strip()
         desc = (task.get("description") or "").strip()[:100]
         parts = [p for p in (title, desc) if p]
@@ -124,7 +100,6 @@ class PromptBuilder:
     def _format_kb_chunks(self, chunks: list[dict[str, Any]]) -> str:
         if not chunks:
             return "_No relevant KB context found._"
-
         lines: list[str] = []
         for i, chunk in enumerate(chunks, 1):
             content = (chunk.get("content") or "")[:self.max_chunk_length]
@@ -137,28 +112,10 @@ class PromptBuilder:
         return "\n".join(lines)
 
     @staticmethod
-    def _self_review_section() -> str:
-        """Return the self-review instructions block for CC prompts."""
-        return (
-            "\n## Self-Review (REQUIRED before reporting)\n"
-            "After implementation, review your own changes:\n"
-            "1. Check each acceptance criteria — all must pass\n"
-            "2. Security scan: XSS, injection, auth bypass, key exposure\n"
-            "3. Backward compatibility: existing APIs must not break\n"
-            "4. Performance: no N+1 queries, no large allocations\n"
-            "\n"
-            "Include in your output:\n"
-            "SELF_REVIEW: PASS|NEEDS_ATTENTION\n"
-            "REVIEW_CONFIDENCE: 0.0-1.0\n"
-            'REVIEW_FINDINGS: [{"severity":"critical|warning|suggestion","category":"...","description":"..."}]\n'
-        )
-
-    @staticmethod
     def _format_acceptance_criteria(task: dict[str, Any]) -> str:
         criteria = task.get("acceptance_criteria") or []
         if not criteria:
             return "- [ ] Task completed as described"
-
         lines: list[str] = []
         for item in criteria:
             if isinstance(item, dict):
@@ -170,42 +127,32 @@ class PromptBuilder:
 
     @staticmethod
     def _format_retry_feedback(task: dict[str, Any]) -> str | None:
-        """Return retry section if task has previous attempt feedback."""
         retry_count = task.get("retry_count") or 0
         if retry_count == 0:
             return None
-
         sections: list[str] = []
-
-        # Architect review feedback
         review = task.get("architect_review")
         if isinstance(review, dict):
             feedback = review.get("feedback") or review.get("comments")
             if feedback:
                 sections.append(f"**Architect feedback (attempt {retry_count}):**\n{feedback}")
-
-        # Rejection reason (from review → assigned or architect-review → assigned)
         rejection = task.get("rejection_reason")
         if rejection:
             sections.append(f"**Rejection reason:** {rejection}")
-
-        # Previous execution result summary
         prev_result = task.get("execution_result")
         if isinstance(prev_result, dict):
             summary = prev_result.get("summary") or prev_result.get("error")
             if summary:
                 sections.append(f"**Previous execution result:** {summary}")
-
         if not sections:
             sections.append(f"_Retry attempt {retry_count} — no structured feedback available._")
-
         return "\n\n".join(sections)
 
     # ------------------------------------------------------------------
-    # Simple prompt
+    # Unified template
     # ------------------------------------------------------------------
 
-    def _render_simple(
+    def _render(
         self,
         task: dict[str, Any],
         project: dict[str, Any] | None,
@@ -217,6 +164,7 @@ class PromptBuilder:
         assignee = task.get("assignee", "Agent")
         source_app = task.get("source_app") or (project or {}).get("title") or "unknown"
         description = task.get("description") or "_No description provided._"
+        exec_prompt = task.get("execution_prompt") or ""
 
         parts: list[str] = [
             f"# Task: {title}",
@@ -235,6 +183,12 @@ class PromptBuilder:
             "## Requirements",
             description,
             "",
+        ]
+
+        if exec_prompt:
+            parts += ["## Execution Strategy", exec_prompt, ""]
+
+        parts += [
             "## Acceptance Criteria",
             self._format_acceptance_criteria(task),
             "",
@@ -251,91 +205,22 @@ class PromptBuilder:
             "3. Implement the changes",
             "4. Write tests for new functionality",
             f"5. Run: `{build_command}`",
-            "6. Report result as structured output:",
-            "   RESULT: SUCCESS|FAILURE",
-            "   FILES_CHANGED: {count}",
-            "   TESTS_ADDED: {count}",
-            "   SUMMARY: {description}",
-        ]
-
-        return "\n".join(parts)
-
-    # ------------------------------------------------------------------
-    # Complex prompt (PRP-style)
-    # ------------------------------------------------------------------
-
-    def _render_complex(
-        self,
-        task: dict[str, Any],
-        project: dict[str, Any] | None,
-        kb_chunks: list[dict[str, Any]],
-        build_command: str,
-    ) -> str:
-        title = task.get("title", "Untitled")
-        priority = task.get("priority", "medium")
-        assignee = task.get("assignee", "Agent")
-        source_app = task.get("source_app") or (project or {}).get("title") or "unknown"
-        description = task.get("description") or "_No description provided._"
-        exec_prompt = task.get("execution_prompt") or ""
-
-        parts: list[str] = [
-            f"# PRP: {title}",
-            f"# Priority: {priority} | Assigned: {assignee} | Complexity: complex",
-            f"# Project: {source_app}",
             "",
-            "## 1. Overview",
-            description,
+            "## Self-Review (REQUIRED after implementation)",
+            "Review your own changes before reporting:",
+            "1. Check each acceptance criteria — all must pass",
+            "2. Security scan: XSS, injection, auth bypass, key exposure",
+            "3. Backward compatibility: existing APIs must not break",
+            "4. Performance: no N+1 queries, no large allocations",
             "",
-        ]
-
-        if exec_prompt:
-            parts += ["## 2. Execution Strategy", exec_prompt, ""]
-        else:
-            parts += [
-                "## 2. Execution Strategy",
-                "1. Analyze the codebase to understand current architecture",
-                "2. Plan the implementation approach",
-                "3. Implement changes incrementally with tests",
-                "4. Validate all acceptance criteria",
-                "",
-            ]
-
-        parts += [
-            "## 3. Context (from Knowledge Base)",
-            self._format_kb_chunks(kb_chunks),
-        ]
-
-        retry_section = self._format_retry_feedback(task)
-        if retry_section:
-            parts += ["## 4. Previous Feedback (retry)", retry_section, ""]
-
-        parts += [
-            "## 5. Task Assessment (REQUIRED — output BEFORE implementation)",
-            "Assess the task scope before writing any code:",
-            "TASK_ASSESSMENT: simple|complex",
-            "ESTIMATED_FILES: {number}",
-            "ESTIMATED_RISK: low|medium|high",
-            "ASSESSMENT_REASONING: {one sentence}",
-            "",
-            "## 6. Acceptance Criteria",
-            self._format_acceptance_criteria(task),
-            "",
-            "## 7. Cross-Cutting Concerns",
-            "- Ensure no regressions in existing tests",
-            "- Follow project coding conventions and linting rules",
-            "- Keep changes minimal and focused — avoid scope creep",
-            "- Preserve backwards compatibility unless explicitly told otherwise",
-            "",
-            "## 8. Validation",
-            f"Run: `{build_command}`",
-            "",
-            "Report result as structured output:",
-            "```",
+            "## Report (REQUIRED — structured output)",
+            "SELF_REVIEW: PASS|NEEDS_ATTENTION",
+            "REVIEW_CONFIDENCE: 0.0-1.0",
+            'REVIEW_FINDINGS: [{"severity":"critical|warning|suggestion","category":"...","description":"..."}]',
             "RESULT: SUCCESS|FAILURE",
             "FILES_CHANGED: {count}",
             "TESTS_ADDED: {count}",
             "SUMMARY: {description}",
-            "```",
         ]
 
         return "\n".join(parts)

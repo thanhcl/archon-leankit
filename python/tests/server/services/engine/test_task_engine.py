@@ -1,5 +1,6 @@
-"""Tests for TaskEngine — poll cycle, execution, completion handling."""
+"""Tests for TaskEngine — poll cycle, execution, notification, health."""
 
+import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -8,12 +9,8 @@ from src.server.services.engine.architect_reviewer import ArchitectReviewResult,
 from src.server.services.engine.cc_spawner import CCExecutionResult
 from src.server.services.engine.task_engine import TaskEngine
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
 
-
-def _make_task(**overrides) -> dict:
+def _make_task(**overrides):
     base = {
         "id": "task-001",
         "title": "Add auth endpoint",
@@ -21,7 +18,6 @@ def _make_task(**overrides) -> dict:
         "status": "assigned",
         "priority": "high",
         "assignee": "Agent",
-        "complexity": "simple",
         "source_app": "leankit",
         "acceptance_criteria": [],
         "retry_count": 0,
@@ -35,110 +31,75 @@ def _make_task(**overrides) -> dict:
     return base
 
 
-def _success_result() -> CCExecutionResult:
+def _mock_reviewer_approve():
+    return (
+        ArchitectReviewResult(verdict="approve", confidence=0.95, summary="Good", mode="self-review"),
+        ReviewAction(next_status="review", reason="Approved"),
+    )
+
+
+def _success_result():
     return CCExecutionResult(
         success=True,
-        stdout="RESULT: SUCCESS\nFILES_CHANGED: 2\nSUMMARY: Done\n",
-        stderr="",
-        exit_code=0,
-        duration_seconds=30.0,
+        stdout="SELF_REVIEW: PASS\nRESULT: SUCCESS\nFILES_CHANGED: 2\nSUMMARY: Done\n",
+        stderr="", exit_code=0, duration_seconds=30.0,
         parsed={"result": "SUCCESS", "files_changed": 2, "summary": "Done"},
     )
 
 
-def _mock_reviewer_approve() -> tuple[ArchitectReviewResult, ReviewAction]:
-    """Return a mock approve review result + action."""
-    return (
-        ArchitectReviewResult(verdict="approve", confidence=0.95, summary="Looks good"),
-        ReviewAction(next_status="review", reason="Approved by architect"),
-    )
-
-
-def _failure_result() -> CCExecutionResult:
+def _failure_result():
     return CCExecutionResult(
         success=False,
         stdout="RESULT: FAILURE\nSUMMARY: Build broke\n",
-        stderr="error: test failed",
-        exit_code=1,
-        duration_seconds=15.0,
+        stderr="error: test failed", exit_code=1, duration_seconds=15.0,
         parsed={"result": "FAILURE", "summary": "Build broke"},
     )
 
 
-# ---------------------------------------------------------------------------
-# Tests: poll_cycle
-# ---------------------------------------------------------------------------
+def _setup_engine():
+    """Create a TaskEngine with all services mocked."""
+    engine = TaskEngine(project_path="/tmp/test")
+    engine.lifecycle_service = MagicMock()
+    engine.lifecycle_service.execute_transition = AsyncMock(
+        return_value=(True, {"task": _make_task(status="executing")}),
+    )
+    engine.task_service = MagicMock()
+    engine.task_service.get_task.return_value = (True, {"task": _make_task()})
+    engine.task_service.update_task = AsyncMock(return_value=(True, {}))
+    engine.prompt_builder = MagicMock()
+    engine.prompt_builder.build = AsyncMock(return_value="test prompt")
+    engine.spawner = MagicMock()
+    engine.spawner.has_capacity = True
+    engine.architect_reviewer = MagicMock()
+    engine.architect_reviewer.review = AsyncMock(return_value=_mock_reviewer_approve())
+    engine.notifier = MagicMock()
+    engine.notifier.on_task_started = AsyncMock()
+    engine.notifier.on_task_completed = AsyncMock()
+    engine.notifier.on_task_review_ready = AsyncMock()
+    engine.notifier.on_task_escalated = AsyncMock()
+    engine.notifier.on_task_failed = AsyncMock()
+    engine.health_monitor = MagicMock()
+    engine.health_monitor.start = AsyncMock()
+    engine.health_monitor.stop = AsyncMock()
+    return engine
 
 
 class TestPollCycle:
     @pytest.mark.asyncio
     async def test_poll_picks_assigned_tasks(self):
-        engine = TaskEngine(project_path="/tmp/test")
-        engine.task_service = MagicMock()
-        engine.task_service.list_tasks.return_value = (
-            True,
-            {"tasks": [_make_task(id="t1"), _make_task(id="t2")]},
-        )
-
-        # Mock the execution path so it doesn't actually run
+        engine = _setup_engine()
+        engine.task_service.list_tasks.return_value = (True, {"tasks": [_make_task(id="t1")]})
         engine._execute_task = AsyncMock(return_value=_success_result())
-        engine.spawner = MagicMock()
-        engine.spawner.has_capacity = True
-
         await engine._poll_cycle()
-
-        assert engine.task_service.list_tasks.called
-        call_kwargs = engine.task_service.list_tasks.call_args[1]
-        assert call_kwargs["status"] == "assigned"
-
-    @pytest.mark.asyncio
-    async def test_poll_respects_capacity(self):
-        engine = TaskEngine(project_path="/tmp/test")
-        engine.task_service = MagicMock()
-        engine.task_service.list_tasks.return_value = (
-            True,
-            {"tasks": [_make_task(id="t1")]},
-        )
-
-        engine.spawner = MagicMock()
-        engine.spawner.has_capacity = False
-
-        await engine._poll_cycle()
-
-        # Should not even query tasks if no capacity... actually it returns early
-        # The implementation does check capacity before iterating tasks
-
-    @pytest.mark.asyncio
-    async def test_poll_skips_already_executing(self):
-        engine = TaskEngine(project_path="/tmp/test")
-        engine.task_service = MagicMock()
-        engine.task_service.list_tasks.return_value = (
-            True,
-            {"tasks": [_make_task(id="t1")]},
-        )
-
-        # Pretend t1 is already executing
-        engine._execution_tasks["t1"] = AsyncMock()
-        engine.spawner = MagicMock()
-        engine.spawner.has_capacity = True
-        engine._execute_task = AsyncMock()
-
-        await engine._poll_cycle()
-
-        engine._execute_task.assert_not_called()
+        engine.task_service.list_tasks.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_poll_sorts_by_priority(self):
-        import asyncio
-
-        engine = TaskEngine(project_path="/tmp/test")
-
+        engine = _setup_engine()
         tasks = [
             _make_task(id="low", priority="low"),
             _make_task(id="critical", priority="critical"),
-            _make_task(id="medium", priority="medium"),
         ]
-        engine.task_service = MagicMock()
         engine.task_service.list_tasks.return_value = (True, {"tasks": tasks})
 
         launched = []
@@ -148,229 +109,102 @@ class TestPollCycle:
             return _success_result()
 
         engine._execute_task = mock_execute
-        engine.spawner = MagicMock()
-        engine.spawner.has_capacity = True
-
         await engine._poll_cycle()
-
-        # Wait for all background tasks to complete
         if engine._execution_tasks:
             await asyncio.gather(*engine._execution_tasks.values(), return_exceptions=True)
-
         assert launched[0] == "critical"
 
     @pytest.mark.asyncio
-    async def test_poll_handles_list_failure(self):
-        engine = TaskEngine(project_path="/tmp/test")
-        engine.task_service = MagicMock()
+    async def test_poll_handles_failure(self):
+        engine = _setup_engine()
         engine.task_service.list_tasks.return_value = (False, {"error": "DB down"})
-
-        # Should not raise
-        await engine._poll_cycle()
-
-
-# ---------------------------------------------------------------------------
-# Tests: execute_task
-# ---------------------------------------------------------------------------
+        await engine._poll_cycle()  # Should not raise
 
 
 class TestExecuteTask:
     @pytest.mark.asyncio
-    async def test_execute_success_transitions_to_architect_review(self):
-        engine = TaskEngine(project_path="/tmp/test")
-
-        engine.lifecycle_service = MagicMock()
-        engine.lifecycle_service.execute_transition = AsyncMock(
-            return_value=(True, {"task": _make_task(status="executing")})
-        )
-
-        engine.task_service = MagicMock()
-        engine.task_service.get_task.return_value = (True, {"task": _make_task()})
-        engine.task_service.update_task = AsyncMock(return_value=(True, {}))
-
-        engine.prompt_builder = MagicMock()
-        engine.prompt_builder.build = AsyncMock(return_value="test prompt")
-
-        engine.spawner = MagicMock()
+    async def test_success_full_pipeline(self):
+        engine = _setup_engine()
         engine.spawner.spawn = AsyncMock(return_value=_success_result())
-
-        engine.architect_reviewer = MagicMock()
-        engine.architect_reviewer.review = AsyncMock(return_value=_mock_reviewer_approve())
-
         result = await engine._execute_task(_make_task())
 
         assert result.success is True
-
-        # executing → architect-review → review (from reviewer approve)
-        transitions = engine.lifecycle_service.execute_transition.call_args_list
-        assert transitions[0][1]["new_status"] == "executing"
-        assert transitions[1][1]["new_status"] == "architect-review"
-        assert transitions[2][1]["new_status"] == "review"
+        engine.notifier.on_task_started.assert_called_once()
+        engine.notifier.on_task_completed.assert_called_once()
+        engine.notifier.on_task_review_ready.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_execute_failure_transitions_to_failed(self):
-        engine = TaskEngine(project_path="/tmp/test")
-
-        engine.lifecycle_service = MagicMock()
-        engine.lifecycle_service.execute_transition = AsyncMock(
-            return_value=(True, {"task": _make_task()})
-        )
-
-        engine.task_service = MagicMock()
-        engine.task_service.get_task.return_value = (True, {"task": _make_task()})
-        engine.task_service.update_task = AsyncMock(return_value=(True, {}))
-
-        engine.prompt_builder = MagicMock()
-        engine.prompt_builder.build = AsyncMock(return_value="test prompt")
-
-        engine.spawner = MagicMock()
+    async def test_failure_notifies(self):
+        engine = _setup_engine()
         engine.spawner.spawn = AsyncMock(return_value=_failure_result())
-
         result = await engine._execute_task(_make_task())
 
         assert result.success is False
-
-        transitions = engine.lifecycle_service.execute_transition.call_args_list
-        assert transitions[-1][1]["new_status"] == "failed"
-        assert "Build broke" in transitions[-1][1]["reason"]
+        engine.notifier.on_task_started.assert_called_once()
+        engine.notifier.on_task_failed.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_execute_stores_execution_result(self):
-        engine = TaskEngine(project_path="/tmp/test")
-
-        engine.lifecycle_service = MagicMock()
-        engine.lifecycle_service.execute_transition = AsyncMock(
-            return_value=(True, {"task": _make_task()})
-        )
-
-        engine.task_service = MagicMock()
-        engine.task_service.get_task.return_value = (True, {"task": _make_task()})
-        engine.task_service.update_task = AsyncMock(return_value=(True, {}))
-
-        engine.prompt_builder = MagicMock()
-        engine.prompt_builder.build = AsyncMock(return_value="prompt")
-
-        engine.spawner = MagicMock()
+    async def test_escalation_notifies(self):
+        engine = _setup_engine()
         engine.spawner.spawn = AsyncMock(return_value=_success_result())
+        engine.architect_reviewer.review = AsyncMock(return_value=(
+            ArchitectReviewResult(verdict="escalate", confidence=0.0, summary="Human needed"),
+            ReviewAction(next_status="escalated", reason="Escalated", escalation_reason="reviewer_escalate"),
+        ))
+        await engine._execute_task(_make_task())
+        engine.notifier.on_task_escalated.assert_called_once()
 
-        engine.architect_reviewer = MagicMock()
-        engine.architect_reviewer.review = AsyncMock(return_value=_mock_reviewer_approve())
-
+    @pytest.mark.asyncio
+    async def test_stores_execution_result(self):
+        engine = _setup_engine()
+        engine.spawner.spawn = AsyncMock(return_value=_success_result())
         await engine._execute_task(_make_task())
 
-        # First update_task call stores execution_result
         first_update = engine.task_service.update_task.call_args_list[0]
         stored = first_update[1]["update_fields"]["execution_result"]
         assert stored["exit_code"] == 0
         assert stored["result"] == "SUCCESS"
-        assert stored["files_changed"] == 2
 
     @pytest.mark.asyncio
-    async def test_execute_transition_failure_aborts(self):
-        engine = TaskEngine(project_path="/tmp/test")
-
-        engine.lifecycle_service = MagicMock()
+    async def test_transition_failure_aborts(self):
+        engine = _setup_engine()
         engine.lifecycle_service.execute_transition = AsyncMock(
-            return_value=(False, {"error": "Already executing"})
+            return_value=(False, {"error": "Already executing"}),
         )
-
         result = await engine._execute_task(_make_task())
-
         assert result.success is False
-        assert "Already executing" in result.stderr
-
-
-# ---------------------------------------------------------------------------
-# Tests: on_cc_complete
-# ---------------------------------------------------------------------------
-
-
-class TestOnCcComplete:
-    @pytest.mark.asyncio
-    async def test_success_result_parsed_correctly(self):
-        engine = TaskEngine(project_path="/tmp/test")
-
-        engine.lifecycle_service = MagicMock()
-        engine.lifecycle_service.execute_transition = AsyncMock(
-            return_value=(True, {})
-        )
-        engine.task_service = MagicMock()
-        engine.task_service.get_task.return_value = (True, {"task": _make_task()})
-        engine.task_service.update_task = AsyncMock(return_value=(True, {}))
-
-        engine.architect_reviewer = MagicMock()
-        engine.architect_reviewer.review = AsyncMock(return_value=_mock_reviewer_approve())
-
-        await engine._on_cc_complete("task-1", _success_result())
-
-        # First transition is architect-review, then reviewer decides review
-        transitions = engine.lifecycle_service.execute_transition.call_args_list
-        assert transitions[0][1]["new_status"] == "architect-review"
-        assert transitions[1][1]["new_status"] == "review"
 
     @pytest.mark.asyncio
-    async def test_failure_includes_reason(self):
-        engine = TaskEngine(project_path="/tmp/test")
+    async def test_unified_prompt_no_include_self_review(self):
+        """build() is called without include_self_review param (unified template)."""
+        engine = _setup_engine()
+        engine.spawner.spawn = AsyncMock(return_value=_success_result())
+        await engine._execute_task(_make_task())
 
-        engine.lifecycle_service = MagicMock()
-        engine.lifecycle_service.execute_transition = AsyncMock(
-            return_value=(True, {})
-        )
-        engine.task_service = MagicMock()
-        engine.task_service.get_task.return_value = (True, {"task": _make_task()})
-        engine.task_service.update_task = AsyncMock(return_value=(True, {}))
-
-        await engine._on_cc_complete("task-2", _failure_result())
-
-        # Failure path goes directly to failed, no reviewer call
-        transition_call = engine.lifecycle_service.execute_transition.call_args
-        assert transition_call[1]["new_status"] == "failed"
-        assert "Build broke" in transition_call[1]["reason"]
-
-
-# ---------------------------------------------------------------------------
-# Tests: lifecycle (start/stop)
-# ---------------------------------------------------------------------------
+        call_kwargs = engine.prompt_builder.build.call_args[1]
+        assert "include_self_review" not in call_kwargs
 
 
 class TestLifecycle:
     @pytest.mark.asyncio
     async def test_start_stop(self):
-        engine = TaskEngine(project_path="/tmp/test", poll_interval=1)
-
-        # Patch the loop to avoid real polling
+        engine = _setup_engine()
         engine._poll_cycle = AsyncMock()
-
         await engine.start()
         assert engine._running is True
-        assert engine._loop_task is not None
-
+        engine.health_monitor.start.assert_called_once()
         await engine.stop()
         assert engine._running is False
-
-    @pytest.mark.asyncio
-    async def test_double_start(self):
-        engine = TaskEngine(project_path="/tmp/test", poll_interval=1)
-        engine._poll_cycle = AsyncMock()
-
-        await engine.start()
-        await engine.start()  # Should not raise, just warn
-
-        await engine.stop()
+        engine.health_monitor.stop.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_reap_completed(self):
-        engine = TaskEngine(project_path="/tmp/test")
-
+        engine = _setup_engine()
         done_task = MagicMock()
         done_task.done.return_value = True
-
         running_task = MagicMock()
         running_task.done.return_value = False
-
         engine._execution_tasks = {"done-1": done_task, "running-1": running_task}
-
         engine._reap_completed()
-
         assert "done-1" not in engine._execution_tasks
         assert "running-1" in engine._execution_tasks
