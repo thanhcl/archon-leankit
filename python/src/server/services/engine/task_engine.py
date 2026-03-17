@@ -72,6 +72,7 @@ class TaskEngine:
         self._running = False
         self._loop_task: asyncio.Task[None] | None = None
         self._execution_tasks: dict[str, asyncio.Task[CCExecutionResult]] = {}
+        self._poll_cycle_count: int = 0
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -152,8 +153,14 @@ class TaskEngine:
         if not self.spawner.has_capacity:
             return
 
+        self._poll_cycle_count += 1
+
         if self.project_id is None:
             logger.warning("No project_id set — polling ALL projects (may cause duplicate pickup)")
+
+        # Auto-assign approved tasks every 3 cycles to avoid extra DB queries each poll
+        if self._poll_cycle_count % 3 == 1:
+            await self._assign_approved_tasks()
 
         success, result = self.task_service.list_tasks(
             project_id=self.project_id,
@@ -184,6 +191,28 @@ class TaskEngine:
                 continue
             exec_task = asyncio.create_task(self._execute_task(task))
             self._execution_tasks[task_id] = exec_task
+
+    async def _assign_approved_tasks(self) -> None:
+        """Transition approved tasks to assigned so they get picked up for execution."""
+        success, result = self.task_service.list_tasks(
+            project_id=self.project_id,
+            status="approved",
+            include_closed=False,
+            include_archived=False,
+        )
+
+        if not success or not result.get("tasks"):
+            return
+
+        for task in result["tasks"]:
+            task_id = task["id"]
+            ok, res = await self.lifecycle_service.execute_transition(
+                task_id=task_id, new_status="assigned", changed_by="task-engine",
+            )
+            if ok:
+                logger.info(f"Auto-assigned approved task | task_id={task_id}")
+            else:
+                logger.warning(f"Failed to auto-assign task | task_id={task_id} | error={res.get('error')}")
 
     # ------------------------------------------------------------------
     # Single task execution

@@ -1,3 +1,17 @@
+<!-- AUTO-ENFORCED RULE — DO NOT REMOVE -->
+## MANDATORY: Self-Validation Loop (NEVER skip)
+Before reporting ANY task as complete, you MUST:
+1. BUILD: Run build/compile command — fix until pass
+2. TEST: Run test command — fix until pass  
+3. SELF-REVIEW: Run /code-review or manually check:
+   - All acceptance criteria met?
+   - Security issues? Error handling?
+   - No debug code left?
+4. Only THEN report "Done"
+
+If you skip this loop, your output is REJECTED.
+---
+
 # CLAUDE.md
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.

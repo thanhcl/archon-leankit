@@ -176,7 +176,7 @@ class CCSpawner:
     # Claude Code CLI execution
     # ------------------------------------------------------------------
 
-    def _build_command(self, prompt: str, source_app: str | None = None) -> tuple[str, str]:
+    def _build_command(self, prompt: str) -> tuple[str, str]:
         """Build the CC CLI command and return (command, prompt_for_stdin).
 
         Uses --print mode with stdin prompt delivery.
@@ -187,9 +187,6 @@ class CCSpawner:
             "--output-format", "json",
             "--dangerously-skip-permissions",
         ]
-
-        if source_app:
-            parts.extend(["--source-app", source_app])
 
         return " ".join(parts), prompt
 
@@ -212,7 +209,6 @@ class CCSpawner:
             CCExecutionResult with parsed output.
         """
         effective_timeout = timeout or self.default_timeout
-        source_app = "leankit"
 
         # Determine working directory
         cwd = config.project_path
@@ -228,7 +224,7 @@ class CCSpawner:
                 )
             cwd = wt_path
 
-        command, stdin_prompt = self._build_command(prompt, source_app)
+        command, stdin_prompt = self._build_command(prompt)
 
         logger.info(
             f"Spawning CC session | task_id={task_id} | "

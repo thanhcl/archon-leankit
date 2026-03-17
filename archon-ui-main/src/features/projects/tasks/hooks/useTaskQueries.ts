@@ -175,6 +175,50 @@ export function useUpdateTask(projectId: string) {
   });
 }
 
+// Transition task mutation (lifecycle state changes: approve, reject, etc.)
+export function useTransitionTask(projectId: string) {
+  const queryClient = useQueryClient();
+  const { showToast } = useToast();
+
+  return useMutation<
+    { task: Task; transition: { from: string; to: string } },
+    Error,
+    { taskId: string; newStatus: string; reason?: string },
+    { previousTasks?: Task[] }
+  >({
+    mutationFn: ({ taskId, newStatus, reason }) => taskService.transitionTask(taskId, newStatus, "owner", reason),
+    onMutate: async ({ taskId, newStatus }) => {
+      await queryClient.cancelQueries({ queryKey: taskKeys.byProject(projectId) });
+      const previousTasks = queryClient.getQueryData<Task[]>(taskKeys.byProject(projectId));
+
+      // Optimistic: update status locally
+      queryClient.setQueryData<Task[]>(taskKeys.byProject(projectId), (old) => {
+        if (!old) return old;
+        return old.map((task) => (task.id === taskId ? { ...task, status: newStatus as Task["status"] } : task));
+      });
+
+      return { previousTasks };
+    },
+    onError: (error, variables, context) => {
+      if (context?.previousTasks) {
+        queryClient.setQueryData(taskKeys.byProject(projectId), context.previousTasks);
+      }
+      showToast(`Failed to transition task: ${error.message}`, "error");
+    },
+    onSuccess: (data) => {
+      // Replace with server data
+      queryClient.setQueryData<Task[]>(taskKeys.byProject(projectId), (old) =>
+        old ? old.map((t) => (t.id === data.task.id ? data.task : t)) : old,
+      );
+      showToast(`Task ${data.transition.to === "done" ? "approved" : "sent back"}`, "success");
+    },
+    onSettled: () => {
+      queryClient.invalidateQueries({ queryKey: taskKeys.byProject(projectId) });
+      queryClient.invalidateQueries({ queryKey: taskKeys.counts() });
+    },
+  });
+}
+
 // Delete task mutation
 export function useDeleteTask(projectId: string) {
   const queryClient = useQueryClient();

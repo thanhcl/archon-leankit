@@ -95,7 +95,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "uv run .claude/hooks/send_event.py --source-app archon-leankit --event-type Stop --summarize --add-chat"
+            "command": "uv run .claude/hooks/send_event.py --source-app archon-leankit --event-type Stop --summarize"
           }
         ]
       }

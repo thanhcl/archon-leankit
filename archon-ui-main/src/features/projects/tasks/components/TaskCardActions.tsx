@@ -1,4 +1,4 @@
-import { Clipboard, Edit, Trash2 } from "lucide-react";
+import { Check, Clipboard, Edit, RotateCcw, Trash2 } from "lucide-react";
 import type React from "react";
 import { useToast } from "@/features/shared/hooks/useToast";
 import { cn, glassmorphism } from "../../../ui/primitives/styles";
@@ -7,17 +7,25 @@ import { SimpleTooltip } from "../../../ui/primitives/tooltip";
 interface TaskCardActionsProps {
   taskId: string;
   taskTitle: string;
+  taskStatus: string;
   onEdit: () => void;
   onDelete: () => void;
+  onApprove?: () => void;
+  onReject?: () => void;
   isDeleting?: boolean;
+  isTransitioning?: boolean;
 }
 
 export const TaskCardActions: React.FC<TaskCardActionsProps> = ({
   taskId,
   taskTitle,
+  taskStatus,
   onEdit,
   onDelete,
+  onApprove,
+  onReject,
   isDeleting = false,
+  isTransitioning = false,
 }) => {
   const { showToast } = useToast();
 
@@ -44,8 +52,61 @@ export const TaskCardActions: React.FC<TaskCardActionsProps> = ({
     }
   };
 
+  const showReviewActions = taskStatus === "review" && onApprove && onReject;
+
   return (
     <div className="flex items-center gap-1.5">
+      {/* Approve/Reject buttons — only visible when task is in review */}
+      {showReviewActions && (
+        <>
+          <SimpleTooltip content={isTransitioning ? "Processing..." : "Approve task"}>
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                if (!isTransitioning) onApprove();
+              }}
+              disabled={isTransitioning}
+              className={cn(
+                "w-5 h-5 rounded-full flex items-center justify-center",
+                "transition-all duration-300",
+                "bg-green-100/80 dark:bg-green-500/20",
+                "text-green-600 dark:text-green-400",
+                "hover:bg-green-200 dark:hover:bg-green-500/30",
+                "hover:shadow-[0_0_10px_rgba(34,197,94,0.3)]",
+                isTransitioning && "opacity-50 cursor-not-allowed",
+              )}
+              aria-label={`Approve ${taskTitle}`}
+            >
+              <Check className={cn("w-3 h-3", isTransitioning && "animate-pulse")} />
+            </button>
+          </SimpleTooltip>
+
+          <SimpleTooltip content={isTransitioning ? "Processing..." : "Reject task"}>
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                if (!isTransitioning) onReject();
+              }}
+              disabled={isTransitioning}
+              className={cn(
+                "w-5 h-5 rounded-full flex items-center justify-center",
+                "transition-all duration-300",
+                "bg-amber-100/80 dark:bg-amber-500/20",
+                "text-amber-600 dark:text-amber-400",
+                "hover:bg-amber-200 dark:hover:bg-amber-500/30",
+                "hover:shadow-[0_0_10px_rgba(245,158,11,0.3)]",
+                isTransitioning && "opacity-50 cursor-not-allowed",
+              )}
+              aria-label={`Reject ${taskTitle}`}
+            >
+              <RotateCcw className={cn("w-3 h-3", isTransitioning && "animate-pulse")} />
+            </button>
+          </SimpleTooltip>
+        </>
+      )}
+
       <SimpleTooltip content={isDeleting ? "Deleting..." : "Delete task"}>
         <button
           type="button"

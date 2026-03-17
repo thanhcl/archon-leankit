@@ -168,6 +168,34 @@ export const taskService = {
   },
 
   /**
+   * Execute a lifecycle transition on a task (e.g. review → done, review → assigned)
+   */
+  async transitionTask(
+    taskId: string,
+    newStatus: string,
+    changedBy: string = "owner",
+    reason?: string,
+  ): Promise<{ task: Task; transition: { from: string; to: string } }> {
+    try {
+      const body: Record<string, string> = { new_status: newStatus, changed_by: changedBy };
+      if (reason) body.reason = reason;
+
+      const response = await callAPIWithETag<{ message: string; task: Task; transition: { from: string; to: string } }>(
+        `/api/tasks/${taskId}/transition`,
+        {
+          method: "POST",
+          body: JSON.stringify(body),
+        },
+      );
+
+      return { task: response.task, transition: response.transition };
+    } catch (error) {
+      console.error(`Failed to transition task ${taskId} to ${newStatus}:`, error);
+      throw error;
+    }
+  },
+
+  /**
    * Get task counts for all projects in a single batch request
    * Optimized endpoint to avoid N+1 query problem
    */

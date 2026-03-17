@@ -13,7 +13,8 @@ try:
     source_app = "unknown"
     event_type = "unknown"
     summarize = False
-
+    add_chat = False
+    
     i = 0
     while i < len(args):
         if args[i] == "--source-app" and i + 1 < len(args):
@@ -22,10 +23,10 @@ try:
             event_type = args[i + 1]; i += 2
         elif args[i] == "--summarize":
             summarize = True; i += 1
+        elif args[i] == "--add-chat":
+            add_chat = True; i += 1
         else:
             i += 1
-
-    server_url = os.environ.get("OBSERVABILITY_URL", "http://localhost:4000/api/events")
     
     # Read stdin for hook context (CC passes JSON via stdin)
     hook_data = {}
@@ -55,7 +56,7 @@ try:
     }).encode()
     
     req = urllib.request.Request(
-        server_url,
+        "http://localhost:4000/api/events",
         data=payload,
         headers={"Content-Type": "application/json"}
     )

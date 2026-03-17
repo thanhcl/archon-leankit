@@ -6,7 +6,7 @@ import { isOptimistic } from "@/features/shared/utils/optimistic";
 import { Card } from "../../../ui/primitives";
 import { OptimisticIndicator } from "../../../ui/primitives/OptimisticIndicator";
 import { cn } from "../../../ui/primitives/styles";
-import { useTaskActions } from "../hooks";
+import { useTaskActions, useTransitionTask } from "../hooks";
 import type { Assignee, Task, TaskPriority } from "../types";
 import { getOrderColor, getOrderGlow, ItemTypes } from "../utils/task-styles";
 import { TaskPriorityComponent } from ".";
@@ -41,8 +41,9 @@ export const TaskCard: React.FC<TaskCardProps> = ({
   // Check if task is optimistic
   const optimistic = isOptimistic(task);
 
-  // Use business logic hook with changePriority
+  // Use business logic hooks
   const { changeAssignee, changePriority, isUpdating } = useTaskActions(projectId);
+  const transitionMutation = useTransitionTask(projectId);
 
   // Handlers - now just call hook methods
   const handleEdit = useCallback(() => {
@@ -75,6 +76,17 @@ export const TaskCard: React.FC<TaskCardProps> = ({
     },
     [changeAssignee, task.id],
   );
+
+  const handleApprove = useCallback(() => {
+    transitionMutation.mutate({ taskId: task.id, newStatus: "done" });
+  }, [transitionMutation, task.id]);
+
+  const handleReject = useCallback(() => {
+    const reason = window.prompt("Rejection reason (required):");
+    if (reason?.trim()) {
+      transitionMutation.mutate({ taskId: task.id, newStatus: "assigned", reason: reason.trim() });
+    }
+  }, [transitionMutation, task.id]);
 
   const [{ isDragging }, drag] = useDrag({
     type: ItemTypes.TASK,
@@ -184,9 +196,13 @@ export const TaskCard: React.FC<TaskCardProps> = ({
               <TaskCardActions
                 taskId={task.id}
                 taskTitle={task.title}
+                taskStatus={task.status}
                 onEdit={handleEdit}
                 onDelete={handleDelete}
+                onApprove={handleApprove}
+                onReject={handleReject}
                 isDeleting={false}
+                isTransitioning={transitionMutation.isPending}
               />
             </div>
           </div>
