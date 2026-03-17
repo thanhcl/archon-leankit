@@ -19,7 +19,7 @@ class CreateRuleRequest(BaseModel):
     section: str
     rule_text: str
     project_id: str | None = None
-    priority: int = 50
+    priority: int = 100
     source: str = "manual"
 
 

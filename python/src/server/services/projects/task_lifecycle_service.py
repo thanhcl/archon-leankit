@@ -35,16 +35,16 @@ TERMINAL_STATES = {"done", "cancelled"}
 TRANSITION_RULES: dict[str, set[str]] = {
     "draft": {"proposed", "approved", "cancelled"},
     "proposed": {"approved", "cancelled"},
-    "approved": {"planning", "assigned"},
-    "planning": {"owner-qa", "assigned"},
-    "owner-qa": {"assigned"},
-    "assigned": {"executing"},
-    "executing": {"architect-review", "failed"},
-    "architect-review": {"review", "assigned", "escalated"},
-    "review": {"done", "assigned"},
-    "failed": {"assigned", "escalated"},
+    "approved": {"planning", "assigned", "cancelled"},
+    "planning": {"owner-qa", "assigned", "cancelled"},
+    "owner-qa": {"assigned", "cancelled"},
+    "assigned": {"executing", "cancelled"},
+    "executing": {"architect-review", "failed", "cancelled"},
+    "architect-review": {"review", "assigned", "escalated", "cancelled"},
+    "review": {"done", "assigned", "cancelled"},
+    "failed": {"assigned", "escalated", "cancelled"},
     "escalated": {"assigned", "on-hold", "cancelled"},
-    "on-hold": {"approved"},
+    "on-hold": {"approved", "cancelled"},
     # done and cancelled are terminal — no transitions out
 }
 
@@ -56,9 +56,19 @@ REASON_REQUIRED_TRANSITIONS: set[tuple[str, str]] = {
     ("failed", "escalated"),           # escalation reason
     ("architect-review", "escalated"), # escalation reason
     ("escalated", "on-hold"),          # hold reason
-    ("escalated", "cancelled"),        # cancellation reason
-    ("draft", "cancelled"),            # cancellation reason
-    ("proposed", "cancelled"),         # cancellation reason
+    # Cancellation always requires a reason
+    ("draft", "cancelled"),
+    ("proposed", "cancelled"),
+    ("approved", "cancelled"),
+    ("planning", "cancelled"),
+    ("owner-qa", "cancelled"),
+    ("assigned", "cancelled"),
+    ("executing", "cancelled"),
+    ("architect-review", "cancelled"),
+    ("review", "cancelled"),
+    ("failed", "cancelled"),
+    ("escalated", "cancelled"),
+    ("on-hold", "cancelled"),
 }
 
 

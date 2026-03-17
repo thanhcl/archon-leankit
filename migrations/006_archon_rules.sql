@@ -7,7 +7,7 @@ CREATE TABLE IF NOT EXISTS archon_rules (
     project_id uuid NULL REFERENCES archon_projects(id) ON DELETE CASCADE,
     section text NOT NULL,
     rule_text text NOT NULL,
-    priority integer NOT NULL DEFAULT 50,
+    priority integer NOT NULL DEFAULT 100,
     source text NOT NULL DEFAULT 'manual',
     enabled boolean NOT NULL DEFAULT true,
     created_at timestamptz NOT NULL DEFAULT now(),
@@ -44,5 +44,4 @@ VALUES
 
     (NULL, 'coding-style',
      E'## Coding Style\n- Follow existing patterns in the codebase — consistency over personal preference\n- Keep functions focused: one responsibility, clear inputs/outputs\n- Name variables and functions for clarity, not brevity\n- Remove dead code immediately — no backward compatibility wrappers\n- Only add comments where the logic is not self-evident',
-     30, 'seed')
-ON CONFLICT DO NOTHING;
+     30, 'seed');

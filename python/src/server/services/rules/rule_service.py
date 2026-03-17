@@ -22,6 +22,16 @@ class RuleService:
     def __init__(self, supabase_client=None):
         self.supabase_client = supabase_client or get_supabase_client()
 
+    @staticmethod
+    def validate_section(section: str) -> tuple[bool, str]:
+        """Validate section against VALID_SECTIONS."""
+        if section not in VALID_SECTIONS:
+            return False, (
+                f"Invalid section '{section}'. "
+                f"Must be one of: {', '.join(VALID_SECTIONS)}"
+            )
+        return True, ""
+
     def list_rules(
         self,
         project_id: str | None = None,
@@ -35,6 +45,9 @@ class RuleService:
 
             if enabled_only:
                 query = query.eq("enabled", True)
+
+            if section:
+                query = query.eq("section", section)
 
             if project_id and include_global:
                 # Both global and project-scoped
@@ -76,13 +89,17 @@ class RuleService:
         section: str,
         rule_text: str,
         project_id: str | None = None,
-        priority: int = 50,
+        priority: int = 100,
         source: str = "manual",
     ) -> tuple[bool, dict[str, Any]]:
         """Create a new rule."""
         try:
             if not section or not rule_text:
                 return False, {"error": "section and rule_text are required"}
+
+            is_valid, error_msg = self.validate_section(section)
+            if not is_valid:
+                return False, {"error": error_msg}
 
             now = datetime.now().isoformat()
             rule_data: dict[str, Any] = {
@@ -116,6 +133,11 @@ class RuleService:
     ) -> tuple[bool, dict[str, Any]]:
         """Update a rule by ID."""
         try:
+            if "section" in update_fields:
+                is_valid, error_msg = self.validate_section(update_fields["section"])
+                if not is_valid:
+                    return False, {"error": error_msg}
+
             update_data: dict[str, Any] = {"updated_at": datetime.now().isoformat()}
 
             allowed_fields = ["section", "rule_text", "priority", "source", "enabled", "project_id"]
@@ -156,6 +178,14 @@ class RuleService:
             logger.error(f"Error deleting rule: {e}", exc_info=True)
             return False, {"error": f"Error deleting rule: {str(e)}"}
 
+    def get_global_rules(self, enabled_only: bool = True) -> tuple[bool, dict[str, Any]]:
+        """Get rules where project_id IS NULL (global rules)."""
+        return self.list_rules(project_id=None, enabled_only=enabled_only, include_global=True)
+
+    def get_project_rules(self, project_id: str, enabled_only: bool = True) -> tuple[bool, dict[str, Any]]:
+        """Get rules scoped to a specific project (excludes global rules)."""
+        return self.list_rules(project_id=project_id, enabled_only=enabled_only, include_global=False)
+
     def generate_claude_md(self, project_id: str) -> tuple[bool, dict[str, Any]]:
         """
         Generate assembled CLAUDE.md markdown from global + project-scoped rules.
@@ -177,23 +207,43 @@ class RuleService:
                     "sections": [],
                 }
 
-            # Group by section
-            sections: dict[str, list[dict]] = {}
-            for rule in rules:
-                sec = rule["section"]
-                if sec not in sections:
-                    sections[sec] = []
-                sections[sec].append(rule)
+            # Separate global vs project rules
+            global_rules = [r for r in rules if r.get("project_id") is None]
+            project_rules = [r for r in rules if r.get("project_id") is not None]
+
+            # Group by section within each scope
+            def _group_by_section(rule_list: list[dict]) -> dict[str, list[dict]]:
+                grouped: dict[str, list[dict]] = {}
+                for rule in rule_list:
+                    grouped.setdefault(rule["section"], []).append(rule)
+                return grouped
+
+            global_sections = _group_by_section(global_rules)
+            project_sections = _group_by_section(project_rules)
+
+            # Collect all unique section names in order
+            section_names = list(dict.fromkeys(
+                [r["section"] for r in rules]
+            ))
 
             # Build markdown
             lines = ["# CLAUDE.md", "", "<!-- Auto-generated from archon_rules -->", ""]
 
-            section_names = list(sections.keys())
-            for sec in section_names:
-                section_rules = sections[sec]
-                for rule in section_rules:
-                    lines.append(rule["rule_text"])
-                    lines.append("")
+            if global_rules:
+                lines.append("<!-- Global Rules -->")
+                lines.append("")
+                for sec in section_names:
+                    for rule in global_sections.get(sec, []):
+                        lines.append(rule["rule_text"])
+                        lines.append("")
+
+            if project_rules:
+                lines.append(f"<!-- Project Rules: {project_id} -->")
+                lines.append("")
+                for sec in section_names:
+                    for rule in project_sections.get(sec, []):
+                        lines.append(rule["rule_text"])
+                        lines.append("")
 
             markdown = "\n".join(lines)
 
