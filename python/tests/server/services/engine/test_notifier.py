@@ -14,6 +14,15 @@ from src.server.services.engine.notifier import (
 )
 
 
+def _mock_httpx():
+    """Create a mock httpx.AsyncClient context manager."""
+    mc = AsyncMock()
+    mc.post = AsyncMock()
+    mc.__aenter__ = AsyncMock(return_value=mc)
+    mc.__aexit__ = AsyncMock(return_value=False)
+    return mc
+
+
 @pytest.mark.asyncio
 async def test_emit_records_event():
     notifier = Notifier()
@@ -70,14 +79,14 @@ async def test_on_task_failed():
 async def test_websocket_send_called():
     notifier = Notifier()
     with patch("httpx.AsyncClient") as MC:
-        mc = AsyncMock()
-        mc.post = AsyncMock()
-        mc.__aenter__ = AsyncMock(return_value=mc)
-        mc.__aexit__ = AsyncMock(return_value=False)
+        mc = _mock_httpx()
         MC.return_value = mc
 
         await notifier.emit("test", task_id="t-1")
-        mc.post.assert_called_once()
+        # post called twice: once for websocket, once for observability
+        assert mc.post.call_count >= 1
+        ws_calls = [c for c in mc.post.call_args_list if "/events" in str(c) and "/api/" not in str(c)]
+        assert len(ws_calls) == 1, "WebSocket POST should be called once"
 
 
 @pytest.mark.asyncio
@@ -133,3 +142,93 @@ async def test_channel_failure_non_fatal():
     with patch("httpx.AsyncClient", side_effect=Exception("connection refused")):
         await notifier.emit("test", task_id="t-1")  # Should not raise
     assert len(notifier.event_log) == 1
+
+
+# ── Observability channel tests ──────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_observability_sends_unified_event():
+    """Observability channel sends UnifiedEvent schema to configured URL."""
+    config = NotifierConfig(observability_url="http://obs:4000/api/events")
+    notifier = Notifier(config=config, source_app="my-app")
+
+    with patch("httpx.AsyncClient") as MC:
+        mc = _mock_httpx()
+        MC.return_value = mc
+
+        await notifier.emit(EVENT_TASK_STARTED, task_id="t-1", data={"title": "Auth"})
+
+        # Find the observability call (2s timeout client)
+        calls = mc.post.call_args_list
+        obs_call = None
+        for call in calls:
+            if "obs:4000" in str(call):
+                obs_call = call
+                break
+
+        assert obs_call is not None, "Observability POST not found"
+        payload = obs_call.kwargs.get("json") or obs_call[1].get("json")
+        assert payload["type"] == "task"
+        assert payload["event"] == "task_started"
+        assert payload["source"] == "task-engine"
+        assert payload["sourceApp"] == "my-app"
+        assert payload["taskId"] == "t-1"
+        assert payload["data"]["title"] == "Auth"
+        assert "id" in payload
+        assert "timestamp" in payload
+
+
+@pytest.mark.asyncio
+async def test_observability_url_from_env():
+    """OBSERVABILITY_URL env var configures the URL."""
+    with patch.dict("os.environ", {"OBSERVABILITY_URL": "http://custom:9000/events"}):
+        config = NotifierConfig()
+    assert config.observability_url == "http://custom:9000/events"
+
+
+@pytest.mark.asyncio
+async def test_observability_url_default():
+    """Default observability URL is http://localhost:4000/api/events."""
+    with patch.dict("os.environ", {}, clear=True):
+        config = NotifierConfig()
+    assert config.observability_url == "http://localhost:4000/api/events"
+
+
+@pytest.mark.asyncio
+async def test_observability_failure_non_fatal():
+    """Observability send failure should not raise or block."""
+    notifier = Notifier()
+    with patch.object(notifier, "_send_observability", side_effect=Exception("timeout")):
+        # Patch to actually raise — but emit should still succeed
+        # since _send_observability is called directly, we need to test the internal try/except
+        pass
+
+    # Test the internal error handling
+    with patch("httpx.AsyncClient", side_effect=Exception("connection refused")):
+        await notifier.emit("test", task_id="t-1")  # Should not raise
+    assert len(notifier.event_log) == 1
+
+
+@pytest.mark.asyncio
+async def test_observability_timeout_is_2s():
+    """Observability client uses 2-second timeout."""
+    config = NotifierConfig(observability_url="http://obs:4000/api/events")
+    notifier = Notifier(config=config)
+
+    with patch("httpx.AsyncClient") as MC:
+        mc = _mock_httpx()
+        MC.return_value = mc
+
+        await notifier.emit("test", task_id="t-1")
+
+        # Check that AsyncClient was called with timeout=2 for observability
+        timeout_calls = [c for c in MC.call_args_list if c.kwargs.get("timeout") == 2]
+        assert len(timeout_calls) >= 1, "Observability should use timeout=2"
+
+
+@pytest.mark.asyncio
+async def test_source_app_default():
+    """Notifier defaults source_app to 'unknown'."""
+    notifier = Notifier()
+    assert notifier.source_app == "unknown"

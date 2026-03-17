@@ -61,10 +61,18 @@ def _make_existing_pattern(**overrides):
 
 
 def _mock_client(select_data=None, insert_data=None):
-    """Mock supabase client supporting both learnings and patterns tables."""
+    """Mock supabase client supporting both learnings and patterns tables.
+
+    Returns the same table mock for each table name so assertions
+    can inspect calls made during the test.
+    """
     client = MagicMock()
+    _cache: dict[str, MagicMock] = {}
 
     def make_table(table_name):
+        if table_name in _cache:
+            return _cache[table_name]
+
         table = MagicMock()
 
         # select chain
@@ -92,9 +100,10 @@ def _mock_client(select_data=None, insert_data=None):
         update.execute.return_value = MagicMock(data=[{}])
         table.update.return_value = update
 
+        _cache[table_name] = table
         return table
 
-    client.table.side_effect = lambda name: make_table(name)
+    client.table.side_effect = make_table
     return client
 
 

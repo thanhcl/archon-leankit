@@ -222,6 +222,60 @@ class TestParseSelfReview:
         result = ArchitectReviewer._parse_self_review({"stdout": ""})
         assert result.verdict == "changes-requested"
 
+    def test_cc_json_wrapped_output(self):
+        """CC output wrapped in JSON with 'result' field containing self-review."""
+        cc_output = json.dumps({
+            "type": "result",
+            "result": "Done.\n\nSELF_REVIEW: PASS\nREVIEW_CONFIDENCE: 0.88\n",
+        })
+        result = ArchitectReviewer._parse_self_review({"stdout": cc_output})
+        assert result.verdict == "approve"
+        assert result.confidence == 0.88
+
+    def test_cc_json_with_escaped_newlines(self):
+        """CC JSON where result string uses literal \\n inside JSON."""
+        cc_output = json.dumps({
+            "type": "result",
+            "result": "Implementation complete.\nSELF_REVIEW: PASS\nREVIEW_CONFIDENCE: 0.91\n",
+        })
+        result = ArchitectReviewer._parse_self_review({"stdout": cc_output})
+        assert result.verdict == "approve"
+        assert result.confidence == 0.91
+
+    def test_cc_json_needs_attention(self):
+        cc_output = json.dumps({
+            "type": "result",
+            "result": "SELF_REVIEW: NEEDS_ATTENTION\nREVIEW_CONFIDENCE: 0.55\n",
+        })
+        result = ArchitectReviewer._parse_self_review({"stdout": cc_output})
+        assert result.verdict == "changes-requested"
+        assert result.confidence == 0.55
+
+    def test_markdown_bold_format(self):
+        """CC output uses **SELF_REVIEW:** bold markdown."""
+        result = ArchitectReviewer._parse_self_review({
+            "stdout": "**SELF_REVIEW:** PASS\n**REVIEW_CONFIDENCE:** 0.85\n",
+        })
+        assert result.verdict == "approve"
+        assert result.confidence == 0.85
+
+    def test_cc_json_with_findings(self):
+        findings = [{"severity": "warning", "category": "test", "description": "Missing edge case"}]
+        cc_output = json.dumps({
+            "type": "result",
+            "result": f"SELF_REVIEW: PASS\nREVIEW_CONFIDENCE: 0.8\nREVIEW_FINDINGS: {json.dumps(findings)}\n",
+        })
+        result = ArchitectReviewer._parse_self_review({"stdout": cc_output})
+        assert result.verdict == "approve"
+        assert len(result.findings) == 1
+
+    def test_cc_json_no_self_review_in_result(self):
+        """CC JSON output but result field has no self-review markers."""
+        cc_output = json.dumps({"type": "result", "result": "All done, no issues."})
+        result = ArchitectReviewer._parse_self_review({"stdout": cc_output})
+        assert result.verdict == "changes-requested"
+        assert result.confidence == 0.5
+
 
 # ---------------------------------------------------------------------------
 # Tests: Multi-provider API (mock)

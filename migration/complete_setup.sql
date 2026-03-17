@@ -1024,7 +1024,93 @@ COMMENT ON COLUMN archon_document_versions.document_id IS 'For docs arrays, the 
 COMMENT ON COLUMN archon_document_versions.task_id IS 'DEPRECATED: No longer used for new versions, kept for historical task version data';
 
 -- =====================================================
--- SECTION 7: MIGRATION TRACKING
+-- SECTION 7: LEARNINGS AND CODE PATTERNS
+-- =====================================================
+
+-- Learnings extracted from CC task executions
+CREATE TABLE IF NOT EXISTS archon_learnings (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    project_id UUID REFERENCES archon_projects(id) ON DELETE CASCADE,
+    task_id UUID REFERENCES archon_tasks(id) ON DELETE SET NULL,
+    type TEXT NOT NULL DEFAULT 'knowledge_gap'
+        CHECK (type IN ('error', 'correction', 'best_practice', 'knowledge_gap')),
+    description TEXT NOT NULL,
+    area TEXT
+        CHECK (area IS NULL OR area IN ('frontend', 'backend', 'infra', 'tests', 'config', 'security', 'database')),
+    suggested_rule TEXT,
+    pattern_key TEXT NOT NULL,
+    recurrence_count INTEGER NOT NULL DEFAULT 1,
+    related_tasks JSONB DEFAULT '[]'::jsonb,
+    status TEXT NOT NULL DEFAULT 'pending'
+        CHECK (status IN ('pending', 'promoted', 'dismissed')),
+    promoted_to TEXT,
+    promoted_at TIMESTAMPTZ,
+    last_seen TIMESTAMPTZ DEFAULT NOW(),
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_archon_learnings_project_id ON archon_learnings(project_id);
+CREATE INDEX IF NOT EXISTS idx_archon_learnings_status ON archon_learnings(status);
+CREATE INDEX IF NOT EXISTS idx_archon_learnings_pattern_key ON archon_learnings(pattern_key);
+CREATE INDEX IF NOT EXISTS idx_archon_learnings_type ON archon_learnings(type);
+CREATE INDEX IF NOT EXISTS idx_archon_learnings_last_seen ON archon_learnings(last_seen DESC);
+
+CREATE OR REPLACE TRIGGER update_archon_learnings_updated_at
+    BEFORE UPDATE ON archon_learnings
+    FOR EACH ROW
+    EXECUTE FUNCTION update_updated_at_column();
+
+-- Expert code patterns extracted from completed tasks
+CREATE TABLE IF NOT EXISTS archon_code_patterns (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    project_id UUID REFERENCES archon_projects(id) ON DELETE CASCADE,
+    pattern_name TEXT NOT NULL,
+    pattern_key TEXT NOT NULL,
+    category TEXT NOT NULL
+        CHECK (category IN ('security', 'error-handling', 'testing', 'architecture', 'performance', 'api-design')),
+    language TEXT NOT NULL DEFAULT 'java',
+    code_example TEXT NOT NULL,
+    context TEXT NOT NULL,
+    anti_pattern TEXT,
+    source_task_ids JSONB DEFAULT '[]'::jsonb,
+    source_files JSONB DEFAULT '[]'::jsonb,
+    extracted_from TEXT DEFAULT 'task_completion',
+    usage_count INTEGER NOT NULL DEFAULT 1,
+    confidence NUMERIC(3,2) NOT NULL DEFAULT 0.70
+        CHECK (confidence >= 0 AND confidence <= 1),
+    expert_validated BOOLEAN NOT NULL DEFAULT false,
+    status TEXT NOT NULL DEFAULT 'pending'
+        CHECK (status IN ('pending', 'active', 'promoted', 'deprecated')),
+    promoted_to TEXT,
+    last_used_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_archon_code_patterns_project_id ON archon_code_patterns(project_id);
+CREATE INDEX IF NOT EXISTS idx_archon_code_patterns_pattern_key ON archon_code_patterns(pattern_key);
+CREATE INDEX IF NOT EXISTS idx_archon_code_patterns_category ON archon_code_patterns(category);
+CREATE INDEX IF NOT EXISTS idx_archon_code_patterns_status ON archon_code_patterns(status);
+CREATE INDEX IF NOT EXISTS idx_archon_code_patterns_usage ON archon_code_patterns(usage_count DESC);
+CREATE INDEX IF NOT EXISTS idx_archon_code_patterns_confidence ON archon_code_patterns(confidence DESC);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_archon_code_patterns_key_project
+    ON archon_code_patterns(pattern_key, project_id);
+
+CREATE OR REPLACE TRIGGER update_archon_code_patterns_updated_at
+    BEFORE UPDATE ON archon_code_patterns
+    FOR EACH ROW
+    EXECUTE FUNCTION update_updated_at_column();
+
+COMMENT ON TABLE archon_learnings IS 'Stores learnings from CC task executions with dedup and auto-promotion';
+COMMENT ON TABLE archon_code_patterns IS 'Expert code patterns extracted from tasks with usage tracking and KB promotion';
+COMMENT ON COLUMN archon_code_patterns.pattern_key IS 'Semantic dedup key: category.language.normalized_name';
+COMMENT ON COLUMN archon_code_patterns.confidence IS 'Confidence score 0-1, incremented by 0.05 per usage';
+COMMENT ON COLUMN archon_code_patterns.promoted_to IS 'Target when promoted (e.g., KB)';
+
+-- =====================================================
+-- SECTION 8: MIGRATION TRACKING
 -- =====================================================
 
 -- Create archon_migrations table for tracking applied database migrations
@@ -1062,7 +1148,8 @@ VALUES
   ('0.1.0', '008_add_migration_tracking'),
   ('0.1.0', '009_add_cascade_delete_constraints'),
   ('0.1.0', '010_add_provider_placeholders'),
-  ('0.1.0', '011_add_page_metadata_table')
+  ('0.1.0', '011_add_page_metadata_table'),
+  ('0.1.0', '012_add_learnings_and_code_patterns')
 ON CONFLICT (version, migration_name) DO NOTHING;
 
 -- Enable Row Level Security on migrations table
@@ -1083,7 +1170,7 @@ CREATE POLICY "Allow authenticated users to read archon_migrations" ON archon_mi
     USING (true);
 
 -- =====================================================
--- SECTION 8: PROMPTS TABLE
+-- SECTION 9: PROMPTS TABLE
 -- =====================================================
 
 -- Prompts table for managing agent system prompts
@@ -1105,7 +1192,7 @@ CREATE OR REPLACE TRIGGER update_archon_prompts_updated_at
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
 -- =====================================================
--- SECTION 9: RLS POLICIES FOR PROJECTS MODULE
+-- SECTION 10: RLS POLICIES FOR PROJECTS MODULE
 -- =====================================================
 
 -- Enable Row Level Security (RLS) for all tables
@@ -1114,6 +1201,8 @@ ALTER TABLE archon_tasks ENABLE ROW LEVEL SECURITY;
 ALTER TABLE archon_project_sources ENABLE ROW LEVEL SECURITY;
 ALTER TABLE archon_document_versions ENABLE ROW LEVEL SECURITY;
 ALTER TABLE archon_prompts ENABLE ROW LEVEL SECURITY;
+ALTER TABLE archon_learnings ENABLE ROW LEVEL SECURITY;
+ALTER TABLE archon_code_patterns ENABLE ROW LEVEL SECURITY;
 
 -- Create RLS policies for service role (full access)
 CREATE POLICY "Allow service role full access to archon_projects" ON archon_projects
@@ -1129,6 +1218,12 @@ CREATE POLICY "Allow service role full access to archon_document_versions" ON ar
     FOR ALL USING (auth.role() = 'service_role');
 
 CREATE POLICY "Allow service role full access to archon_prompts" ON archon_prompts
+    FOR ALL USING (auth.role() = 'service_role');
+
+CREATE POLICY "Allow service role full access to archon_learnings" ON archon_learnings
+    FOR ALL USING (auth.role() = 'service_role');
+
+CREATE POLICY "Allow service role full access to archon_code_patterns" ON archon_code_patterns
     FOR ALL USING (auth.role() = 'service_role');
 
 -- Create RLS policies for authenticated users
@@ -1152,8 +1247,16 @@ CREATE POLICY "Allow authenticated users to read archon_prompts" ON archon_promp
     FOR SELECT TO authenticated
     USING (true);
 
+CREATE POLICY "Allow authenticated users to manage archon_learnings" ON archon_learnings
+    FOR ALL TO authenticated
+    USING (true);
+
+CREATE POLICY "Allow authenticated users to manage archon_code_patterns" ON archon_code_patterns
+    FOR ALL TO authenticated
+    USING (true);
+
 -- =====================================================
--- SECTION 10: DEFAULT PROMPTS DATA
+-- SECTION 11: DEFAULT PROMPTS DATA
 -- =====================================================
 
 -- Seed with default prompts for each content type

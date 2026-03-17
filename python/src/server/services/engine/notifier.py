@@ -1,16 +1,18 @@
 """
 Notifier for LeanKit V3 Task Engine.
 
-Pushes task lifecycle events via WebSocket broadcast and optional
-external channels (Telegram, Discord).
+Pushes task lifecycle events via WebSocket broadcast, Observability server,
+and optional external channels (Telegram, Discord).
 
 Usage:
     notifier = Notifier()
     await notifier.emit("task_started", task_id="t-1", data={...})
 """
 
+import os
+import uuid
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 import httpx
@@ -25,11 +27,18 @@ class NotifierConfig:
     """Notification channel configuration."""
 
     websocket_url: str = "ws://localhost:4000"
+    observability_url: str = ""
     telegram_chat_id: str = ""
     telegram_bot_token: str = ""
     telegram_only_critical: bool = False
     discord_webhook_url: str = ""
     discord_only_critical: bool = True
+
+    def __post_init__(self):
+        if not self.observability_url:
+            self.observability_url = os.environ.get(
+                "OBSERVABILITY_URL", "http://localhost:4000/api/events"
+            )
 
 
 @dataclass
@@ -75,8 +84,9 @@ _CRITICAL_EVENTS = frozenset({EVENT_TASK_ESCALATED, EVENT_TASK_FAILED, EVENT_HEA
 class Notifier:
     """Pushes task events to configured channels."""
 
-    def __init__(self, config: NotifierConfig | None = None):
+    def __init__(self, config: NotifierConfig | None = None, source_app: str = "unknown"):
         self.config = config or NotifierConfig()
+        self.source_app = source_app
         self._event_log: list[TaskEvent] = []
 
     # ── Public API ────────────────────────────────────────────────────
@@ -104,6 +114,7 @@ class Notifier:
 
         # Fire to all channels concurrently (best-effort)
         await self._send_websocket(evt)
+        await self._send_observability(evt)
 
         if self.config.telegram_bot_token and self.config.telegram_chat_id:
             if not self.config.telegram_only_critical or is_critical:
@@ -184,6 +195,24 @@ class Notifier:
                 await client.post(f"{url}/events", json=evt.to_dict())
         except Exception as e:
             logger.debug(f"WebSocket send failed (non-fatal): {e}")
+
+    async def _send_observability(self, evt: TaskEvent) -> None:
+        """Send UnifiedEvent to Observability server. Fail-safe, never blocks engine."""
+        try:
+            payload = {
+                "id": str(uuid.uuid4()),
+                "type": "task",
+                "event": evt.event,
+                "source": "task-engine",
+                "sourceApp": self.source_app,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "taskId": evt.task_id,
+                "data": evt.data,
+            }
+            async with httpx.AsyncClient(timeout=2) as client:
+                await client.post(self.config.observability_url, json=payload)
+        except Exception as e:
+            logger.debug(f"Observability send failed (non-fatal): {e}")
 
     async def _send_telegram(self, evt: TaskEvent) -> None:
         """Send event to Telegram chat."""

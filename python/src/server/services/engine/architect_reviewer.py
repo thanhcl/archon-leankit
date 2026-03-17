@@ -34,9 +34,18 @@ _SECURITY_KEYWORDS = frozenset([
 
 # ── Regex for self-review parsing ─────────────────────────────────────────
 
-_SELF_VERDICT_RE = re.compile(r"SELF_REVIEW:\s*(PASS|NEEDS_ATTENTION)", re.IGNORECASE)
-_SELF_CONFIDENCE_RE = re.compile(r"REVIEW_CONFIDENCE:\s*([\d.]+)", re.IGNORECASE)
-_SELF_FINDINGS_RE = re.compile(r"REVIEW_FINDINGS:\s*(\[.*\])", re.IGNORECASE | re.DOTALL)
+_SELF_VERDICT_RE = re.compile(
+    r"\*{0,2}SELF[_-]?REVIEW:?\*{0,2}\s*(PASS|NEEDS_ATTENTION)",
+    re.IGNORECASE,
+)
+_SELF_CONFIDENCE_RE = re.compile(
+    r"\*{0,2}REVIEW[_-]?CONFIDENCE:?\*{0,2}\s*([\d.]+)",
+    re.IGNORECASE,
+)
+_SELF_FINDINGS_RE = re.compile(
+    r"\*{0,2}REVIEW[_-]?FINDINGS:?\*{0,2}\s*(\[.*\])",
+    re.IGNORECASE | re.DOTALL,
+)
 
 # ── Provider defaults ─────────────────────────────────────────────────────
 
@@ -453,11 +462,60 @@ class ArchitectReviewer:
     # ── Self-review parsing ───────────────────────────────────────────────
 
     @staticmethod
+    def _extract_cc_text(stdout: str) -> str:
+        """Extract searchable text from CC stdout.
+
+        CC output may be:
+        - Plain text containing SELF_REVIEW markers directly
+        - JSON like {"type":"result","result":"...SELF_REVIEW: PASS..."}
+        - Multiple JSON lines (one per line)
+
+        Returns the best text to search for self-review markers.
+        If JSON with a 'result'/'text' field is found, returns that
+        (avoids issues with escaped quotes in raw JSON).
+        """
+        if not stdout:
+            return ""
+
+        extracted: list[str] = []
+
+        # Try parsing entire stdout as single JSON object
+        stripped = stdout.strip()
+        if stripped.startswith("{"):
+            try:
+                data = json.loads(stripped)
+                if isinstance(data, dict):
+                    result_text = data.get("result") or data.get("text") or ""
+                    if result_text:
+                        extracted.append(result_text)
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+        # Try parsing each line as JSON (multi-line CC output)
+        if not extracted:
+            for line in stdout.splitlines():
+                line = line.strip()
+                if not line or not line.startswith("{"):
+                    continue
+                try:
+                    data = json.loads(line)
+                    if isinstance(data, dict):
+                        result_text = data.get("result") or data.get("text") or ""
+                        if result_text:
+                            extracted.append(result_text)
+                except (json.JSONDecodeError, TypeError):
+                    continue
+
+        # If we extracted text from JSON, use that; otherwise use raw stdout
+        return "\n".join(extracted) if extracted else stdout
+
+    @staticmethod
     def _parse_self_review(execution_result: dict[str, Any]) -> ArchitectReviewResult:
         """Parse structured self-review from CC stdout."""
         stdout = execution_result.get("stdout") or ""
+        text = ArchitectReviewer._extract_cc_text(stdout)
 
-        m = _SELF_VERDICT_RE.search(stdout)
+        m = _SELF_VERDICT_RE.search(text)
         if not m:
             # No self-review block → treat as needs attention
             return ArchitectReviewResult(
@@ -471,7 +529,7 @@ class ArchitectReviewer:
         verdict = "approve" if verdict_raw == "PASS" else "changes-requested"
 
         confidence = 0.7
-        m_conf = _SELF_CONFIDENCE_RE.search(stdout)
+        m_conf = _SELF_CONFIDENCE_RE.search(text)
         if m_conf:
             try:
                 confidence = max(0.0, min(1.0, float(m_conf.group(1))))
@@ -479,7 +537,7 @@ class ArchitectReviewer:
                 pass
 
         findings: list[dict[str, str]] = []
-        m_find = _SELF_FINDINGS_RE.search(stdout)
+        m_find = _SELF_FINDINGS_RE.search(text)
         if m_find:
             try:
                 findings = json.loads(m_find.group(1))

@@ -114,6 +114,9 @@ async def main() -> None:
         print(f"  - {p['name']} ({p['project_id'][:8]}...) -> {p['path']}")
         print(f"    build: {p['build']}")
 
+    task_timeout = int(os.environ.get("TASK_ENGINE_TIMEOUT", "1800"))
+    print(f"[engine] Task timeout: {task_timeout}s ({task_timeout // 60}m)")
+
     engines: list[tuple[str, TaskEngine]] = []
     for proj in projects:
         project_path = str(Path(proj["path"]).expanduser())
@@ -123,7 +126,7 @@ async def main() -> None:
             build_command=proj["build"],
             poll_interval=30,
             max_parallel=3,
-            default_timeout=600,
+            default_timeout=task_timeout,
             shutdown_grace=60,
         )
         engines.append((proj["name"], engine))

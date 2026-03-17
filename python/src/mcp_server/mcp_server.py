@@ -514,6 +514,23 @@ def register_modules():
         logger.error(f"✗ Failed to register version tools: {e}")
         logger.error(traceback.format_exc())
 
+    # Rule Management Tools
+    try:
+        from src.mcp_server.features.rules import register_rule_tools
+
+        register_rule_tools(mcp)
+        modules_registered += 1
+        logger.info("✓ Rule tools registered")
+    except ImportError as e:
+        logger.warning(f"⚠ Rule tools module not available (optional): {e}")
+    except (SyntaxError, NameError, AttributeError) as e:
+        logger.error(f"✗ Code error in rule tools - MUST FIX: {e}")
+        logger.error(traceback.format_exc())
+        raise
+    except Exception as e:
+        logger.error(f"✗ Failed to register rule tools: {e}")
+        logger.error(traceback.format_exc())
+
     # Feature Management Tools
     try:
         from src.mcp_server.features.feature_tools import register_feature_tools
