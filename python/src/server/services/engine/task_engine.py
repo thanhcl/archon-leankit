@@ -33,6 +33,7 @@ class TaskEngine:
     def __init__(
         self,
         project_path: str,
+        project_id: str | None = None,
         poll_interval: int = 30,
         max_parallel: int = 5,
         default_timeout: int = 600,
@@ -42,6 +43,7 @@ class TaskEngine:
         repository_url: str | None = None,
         review_config: ReviewConfig | None = None,
     ):
+        self.project_id = project_id
         self.project_config = ProjectConfig(
             project_path=project_path,
             build_command=build_command,
@@ -85,7 +87,8 @@ class TaskEngine:
         self._loop_task = asyncio.create_task(self._run_loop())
         await self.health_monitor.start()
         logger.info(
-            f"TaskEngine started | poll_interval={self.poll_interval}s | "
+            f"TaskEngine started | project_id={self.project_id} | "
+            f"poll_interval={self.poll_interval}s | "
             f"max_parallel={self.spawner.max_parallel} | "
             f"isolation={self.project_config.isolation}"
         )
@@ -149,7 +152,11 @@ class TaskEngine:
         if not self.spawner.has_capacity:
             return
 
+        if self.project_id is None:
+            logger.warning("No project_id set — polling ALL projects (may cause duplicate pickup)")
+
         success, result = self.task_service.list_tasks(
+            project_id=self.project_id,
             status="assigned",
             include_closed=False,
             include_archived=False,
