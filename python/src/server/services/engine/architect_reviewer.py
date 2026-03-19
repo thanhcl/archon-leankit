@@ -14,8 +14,10 @@ Usage:
 
 import json
 import re
+import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any
 
 import httpx
@@ -77,7 +79,7 @@ PROVIDER_DEFAULTS: dict[str, dict[str, Any]] = {
 class ReviewConfig:
     """Per-project reviewer configuration."""
 
-    review_mode: str = "self-review"  # "self-review" | "api" — global default
+    review_mode: str = "self-review"  # "self-review" | "api" | "multi-perspective"
     security_override_to_api: bool = True  # CC high-risk + security → force API
 
     provider: str = "anthropic"  # "anthropic" | "openai" | "google"
@@ -87,6 +89,8 @@ class ReviewConfig:
     timeout: int = 60
 
     api_fallback_to_self_review: bool = True
+
+    independent_review_enabled: bool = True  # Toggle independent code review after self-review
 
     confidence_approve_threshold: float = 0.8
     confidence_retry_threshold: float = 0.5
@@ -105,6 +109,71 @@ class ArchitectReviewResult:
     provider: str = ""  # "anthropic" | "openai" | "google" | ""
     raw_response: str = ""
     error: str | None = None
+
+
+@dataclass
+class QualityGateScore:
+    """Compound quality gate score from review results."""
+
+    tests_pass: float  # 0-100, weight 30%
+    self_review: float  # 0-100, weight 20%
+    confidence: float  # 0-100, weight 20%
+    code_review_clean: float  # 0-100, weight 20%
+    acceptance_criteria: float  # 0-100, weight 10%
+    compound_score: float  # weighted average 0-100
+    gate_result: str  # "pass" | "retry" | "escalate"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "tests_pass": self.tests_pass,
+            "self_review": self.self_review,
+            "confidence": self.confidence,
+            "code_review_clean": self.code_review_clean,
+            "acceptance_criteria": self.acceptance_criteria,
+            "compound_score": self.compound_score,
+            "gate_result": self.gate_result,
+        }
+
+
+@dataclass
+class ReviewHistoryEntry:
+    """A single entry in the review history — append-only."""
+
+    review_id: str
+    review_number: int
+    reviewed_at: str
+    mode: str
+    provider: str
+    verdict: str
+    confidence: float
+    quality_gate: dict[str, Any]
+    findings: list[dict[str, str]]
+    feedback: str
+    summary: str
+    retry_count: int
+    error: str | None = None
+    escalation_reason: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        entry: dict[str, Any] = {
+            "review_id": self.review_id,
+            "review_number": self.review_number,
+            "reviewed_at": self.reviewed_at,
+            "mode": self.mode,
+            "provider": self.provider,
+            "verdict": self.verdict,
+            "confidence": self.confidence,
+            "quality_gate": self.quality_gate,
+            "findings": self.findings,
+            "feedback": self.feedback,
+            "summary": self.summary,
+            "retry_count": self.retry_count,
+        }
+        if self.error:
+            entry["error"] = self.error
+        if self.escalation_reason:
+            entry["escalation_reason"] = self.escalation_reason
+        return entry
 
 
 @dataclass
@@ -250,6 +319,115 @@ def _parse_llm_json(raw_text: str) -> ArchitectReviewResult:
         feedback=data.get("feedback", ""),
         summary=data.get("summary", ""),
         raw_response=raw_text[:2000],
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Quality Gate Scoring
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Severity deduction weights for code_review_clean scoring
+_SEVERITY_DEDUCTIONS = {"critical": 40, "warning": 15, "suggestion": 5}
+
+
+def calculate_quality_gate_score(
+    review: ArchitectReviewResult,
+    execution_result: dict[str, Any],
+) -> QualityGateScore:
+    """Calculate compound quality gate score.
+
+    Weights: tests_pass 30%, self_review 20%, confidence 20%,
+             code_review_clean 20%, acceptance_criteria 10%.
+
+    Score >= 80 → pass, 60-79 → retry, < 60 → escalate.
+    """
+    # tests_pass: 100 if exit_code == 0 and not timed_out, else 0
+    exit_code = execution_result.get("exit_code", -1)
+    timed_out = execution_result.get("timed_out", False)
+    tests_pass = 100.0 if exit_code == 0 and not timed_out else 0.0
+
+    # self_review: based on CC's self-review field (explicit field takes precedence)
+    result_str = execution_result.get("result", "").upper()
+    self_review_field = execution_result.get("self_review", "").upper()
+    if self_review_field == "NEEDS_ATTENTION":
+        self_review = 40.0
+    elif self_review_field == "PASS" or result_str == "SUCCESS":
+        self_review = 100.0
+    else:
+        self_review = 50.0  # unknown/missing
+
+    # confidence: direct mapping from review confidence (0-1 → 0-100)
+    confidence = review.confidence * 100.0
+
+    # code_review_clean: start at 100, deduct per finding severity
+    code_review_clean = 100.0
+    for finding in review.findings:
+        severity = finding.get("severity", "suggestion")
+        code_review_clean -= _SEVERITY_DEDUCTIONS.get(severity, 5)
+    code_review_clean = max(0.0, code_review_clean)
+
+    # acceptance_criteria: based on verdict
+    if review.verdict == "approve":
+        acceptance_criteria = 100.0
+    elif review.verdict == "changes-requested":
+        acceptance_criteria = 30.0
+    else:
+        acceptance_criteria = 0.0
+
+    # Compound score with weights
+    compound_score = (
+        tests_pass * 0.30
+        + self_review * 0.20
+        + confidence * 0.20
+        + code_review_clean * 0.20
+        + acceptance_criteria * 0.10
+    )
+
+    # Gate result
+    if compound_score >= 80:
+        gate_result = "pass"
+    elif compound_score >= 60:
+        gate_result = "retry"
+    else:
+        gate_result = "escalate"
+
+    return QualityGateScore(
+        tests_pass=round(tests_pass, 1),
+        self_review=round(self_review, 1),
+        confidence=round(confidence, 1),
+        code_review_clean=round(code_review_clean, 1),
+        acceptance_criteria=round(acceptance_criteria, 1),
+        compound_score=round(compound_score, 1),
+        gate_result=gate_result,
+    )
+
+
+def build_review_history_entry(
+    review: ArchitectReviewResult,
+    action: ReviewAction,
+    quality_gate: QualityGateScore,
+    task: dict[str, Any],
+    existing_history: list[dict[str, Any]] | None = None,
+) -> ReviewHistoryEntry:
+    """Build a review history entry to append to the task's review_history array."""
+    history = existing_history or []
+    review_number = len(history) + 1
+
+    return ReviewHistoryEntry(
+        review_id=str(uuid.uuid4()),
+        review_number=review_number,
+        reviewed_at=datetime.now(timezone.utc).isoformat(),
+        mode=review.mode,
+        provider=review.provider,
+        verdict=review.verdict,
+        confidence=review.confidence,
+        quality_gate=quality_gate.to_dict(),
+        findings=review.findings,
+        feedback=review.feedback,
+        summary=review.summary,
+        retry_count=task.get("retry_count", 0),
+        error=review.error,
+        escalation_reason=action.escalation_reason,
     )
 
 
@@ -413,16 +591,24 @@ class ArchitectReviewer:
         execution_result: dict[str, Any],
         config: ReviewConfig | None = None,
     ) -> tuple[ArchitectReviewResult, ReviewAction]:
-        """Review execution results and decide next action."""
+        """Review execution results and decide next action.
+
+        Supports 3 modes: self-review, api, multi-perspective.
+        Multi-perspective runs 3 parallel reviewers (security, performance, contract)
+        and returns a consensus result. The multi_perspective_detail is stored on the
+        result's raw_response for callers that need per-perspective breakdown.
+        """
         cfg = config or ReviewConfig()
         mode = self._get_mode(task, cfg, execution_result)
 
-        if mode == "self-review":
+        if mode == "multi-perspective":
+            review_result, action = await self._multi_perspective_review(task, execution_result, cfg)
+        elif mode == "self-review":
             review_result = self._parse_self_review(execution_result)
+            action = self._decide_action(task, review_result, cfg)
         else:
             review_result = await self._api_review(task, execution_result, cfg)
-
-        action = self._decide_action(task, review_result, cfg)
+            action = self._decide_action(task, review_result, cfg)
 
         logger.info(
             f"Architect review | task_id={task.get('id')} | "
@@ -445,10 +631,14 @@ class ArchitectReviewer:
         If CC assessed the task as high-risk AND task is security-sensitive,
         override to API mode regardless of global setting.
         Otherwise use the global review_mode.
+        Valid modes: "self-review", "api", "multi-perspective".
         """
         if config.security_override_to_api and execution_result:
             estimated_risk = execution_result.get("estimated_risk", "").lower()
             if estimated_risk == "high" and ArchitectReviewer._is_security_sensitive(task):
+                # For multi-perspective mode, keep it (already includes security perspective)
+                if config.review_mode == "multi-perspective":
+                    return "multi-perspective"
                 return "api"
         return config.review_mode
 
@@ -551,6 +741,50 @@ class ArchitectReviewer:
             summary=f"Self-review: {verdict_raw}",
             mode="self-review",
         )
+
+    # ── Multi-perspective review ─────────────────────────────────────────
+
+    async def _multi_perspective_review(
+        self,
+        task: dict[str, Any],
+        execution_result: dict[str, Any],
+        config: ReviewConfig,
+    ) -> tuple[ArchitectReviewResult, ReviewAction]:
+        """Run 3-perspective parallel review and return consensus."""
+        from .multi_perspective_reviewer import (
+            MultiPerspectiveReviewer,
+            multi_perspective_review_to_dict,
+        )
+
+        try:
+            mp_reviewer = MultiPerspectiveReviewer(
+                provider_factory=lambda cfg: self._build_provider(cfg),
+            )
+            consensus, unified, action = await mp_reviewer.review(
+                task, execution_result, config,
+            )
+
+            # Store per-perspective breakdown in raw_response for callers
+            import json
+            unified.raw_response = json.dumps(multi_perspective_review_to_dict(consensus))
+
+            return unified, action
+
+        except Exception as e:
+            logger.error(f"Multi-perspective review failed: {e}", exc_info=True)
+            if config.api_fallback_to_self_review:
+                logger.warning("Falling back to self-review from multi-perspective")
+                review_result = self._parse_self_review(execution_result)
+                review_result.error = f"Multi-perspective failed ({e}), used self-review fallback"
+                action = self._decide_action(task, review_result, config)
+                return review_result, action
+            review_result = ArchitectReviewResult(
+                verdict="escalate", confidence=0.0,
+                summary=f"Multi-perspective review failed: {e}",
+                error=str(e), mode="multi-perspective",
+            )
+            action = self._decide_action(task, review_result, config)
+            return review_result, action
 
     # ── API review ────────────────────────────────────────────────────────
 

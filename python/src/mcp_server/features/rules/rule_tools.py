@@ -238,6 +238,57 @@ def register_rule_tools(mcp: FastMCP):
             return MCPErrorFormatter.from_exception(e, f"{action} rule")
 
     @mcp.tool()
+    async def optimize_rules(
+        ctx: Context,
+        project_id: str,
+    ) -> str:
+        """
+        Analyze task metrics and suggest CLAUDE.md rule optimizations.
+
+        Examines completed/failed tasks, learnings, and code patterns to
+        produce rule suggestions with confidence scores. Owner must approve
+        suggestions before applying.
+
+        Args:
+            project_id: Project UUID to analyze
+
+        Returns:
+            JSON with suggestions array (each with action, section, rule_text,
+            confidence, reason, evidence) and analysis metrics.
+
+        Example:
+            optimize_rules(project_id="proj-123")
+            # Returns: {success, suggestions: [{action: "add", section: "testing",
+            #   rule_text: "...", confidence: 0.85, reason: "...", evidence: {...}}],
+            #   analysis: {total_tasks, failure_rate, ...}}
+        """
+        try:
+            api_url = get_api_url()
+            timeout = get_default_timeout()
+
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                response = await client.post(
+                    urljoin(api_url, f"/api/rules/optimize/{project_id}")
+                )
+
+                if response.status_code == 200:
+                    result = response.json()
+                    return json.dumps({
+                        "success": True,
+                        "suggestions": result.get("suggestions", []),
+                        "analysis": result.get("analysis", {}),
+                        "project_id": result.get("project_id"),
+                    })
+                else:
+                    return MCPErrorFormatter.from_http_error(response, "optimize rules")
+
+        except httpx.RequestError as e:
+            return MCPErrorFormatter.from_exception(e, "optimize rules")
+        except Exception as e:
+            logger.error(f"Error optimizing rules: {e}", exc_info=True)
+            return MCPErrorFormatter.from_exception(e, "optimize rules")
+
+    @mcp.tool()
     async def generate_claude_md(
         ctx: Context,
         project_id: str,

@@ -17,6 +17,13 @@ export const CreateProjectSchema = z.object({
   technical_sources: z.array(z.string()).optional(),
   business_sources: z.array(z.string()).optional(),
   pinned: z.boolean().optional(),
+  // Virtual Office fields
+  source_app: z.string().optional(),
+  layout_id: z.string().optional(),
+  team_config: z.array(z.record(z.unknown())).optional(),
+  director_config: z.record(z.unknown()).optional(),
+  team_lead_config: z.record(z.unknown()).optional(),
+  office_settings: z.record(z.unknown()).optional(),
 });
 
 export const UpdateProjectSchema = CreateProjectSchema.partial();
@@ -41,6 +48,14 @@ export const ProjectSchema = z.object({
   progress: z.number().min(0).max(100).optional(),
   pinned: z.boolean(),
   updated: z.string().optional(), // Human-readable format
+
+  // Virtual Office fields
+  source_app: z.string().optional(),
+  layout_id: z.string().optional(),
+  team_config: z.array(z.record(z.unknown())).optional(),
+  director_config: z.record(z.unknown()).optional(),
+  team_lead_config: z.record(z.unknown()).optional(),
+  office_settings: z.record(z.unknown()).optional(),
 });
 
 // Validation helper functions

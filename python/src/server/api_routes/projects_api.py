@@ -20,6 +20,15 @@ from pydantic import BaseModel
 # Removed direct logging import - using unified config
 # Set up standard logger for background tasks
 from ..config.logfire_config import get_logger, logfire
+from ..models.api_contracts import (
+    CreateProjectRequest,
+    CreateTaskRequest,
+    TaskListResponse,
+    TransitionTaskRequest,
+    UpdateProjectRequest,
+    UpdateTaskRequest,
+    validate_response_safe,
+)
 from ..utils import get_supabase_client
 from ..utils.etag_utils import check_etag, generate_etag
 
@@ -34,66 +43,13 @@ from ..services.projects import (
     TaskService,
 )
 from ..services.projects.document_service import DocumentService
+from ..services.projects.task_generator_service import generate_tasks_from_description
 from ..services.projects.versioning_service import VersioningService
 
 # Using HTTP polling for real-time updates
 
 router = APIRouter(prefix="/api", tags=["projects"])
 
-
-class CreateProjectRequest(BaseModel):
-    title: str
-    description: str | None = None
-    github_repo: str | None = None
-    docs: list[Any] | None = None
-    features: list[Any] | None = None
-    data: list[Any] | None = None
-    technical_sources: list[str] | None = None  # List of knowledge source IDs
-    business_sources: list[str] | None = None  # List of knowledge source IDs
-    pinned: bool | None = None  # Whether this project should be pinned to top
-    # Virtual Office config
-    source_app: str | None = None
-    layout_id: str | None = None
-    team_config: list[dict[str, Any]] | None = None
-    director_config: dict[str, Any] | None = None
-    team_lead_config: dict[str, Any] | None = None
-    office_settings: dict[str, Any] | None = None
-
-
-class UpdateProjectRequest(BaseModel):
-    title: str | None = None
-    description: str | None = None  # Add description field
-    github_repo: str | None = None
-    docs: list[Any] | None = None
-    features: list[Any] | None = None
-    data: list[Any] | None = None
-    technical_sources: list[str] | None = None  # List of knowledge source IDs
-    business_sources: list[str] | None = None  # List of knowledge source IDs
-    pinned: bool | None = None  # Whether this project is pinned to top
-    # Virtual Office config
-    source_app: str | None = None
-    layout_id: str | None = None
-    team_config: list[dict[str, Any]] | None = None
-    director_config: dict[str, Any] | None = None
-    team_lead_config: dict[str, Any] | None = None
-    office_settings: dict[str, Any] | None = None
-
-
-class CreateTaskRequest(BaseModel):
-    project_id: str
-    title: str
-    description: str | None = None
-    status: str | None = "draft"
-    assignee: str | None = "User"
-    task_order: int | None = 0
-    priority: str | None = "medium"
-    feature: str | None = None
-    owner: str | None = None
-    acceptance_criteria: list[dict[str, Any]] | None = None
-    execution_prompt: str | None = None
-    source_app: str | None = None
-    complexity: str | None = "simple"
-    max_retries: int | None = 3
 
 
 @router.get("/projects")
@@ -630,6 +586,11 @@ async def list_project_tasks(
         if not success:
             raise HTTPException(status_code=500, detail=result)
 
+        # Validate response shape against contract model
+        ok_validate, _ = validate_response_safe(result, TaskListResponse)
+        if not ok_validate:
+            logger.warning("Response shape mismatch in project task list endpoint: validation failed")
+
         tasks = result.get("tasks", [])
 
         # Generate ETag from task data (includes description and updated_at to drive polling invalidation)
@@ -728,6 +689,14 @@ async def create_task(request: CreateTaskRequest):
             complexity=request.complexity or "simple",
             max_retries=request.max_retries or 3,
             status=request.status or "draft",
+            blocked_by=request.blocked_by,
+            created_by=request.created_by or "owner",
+            created_from=request.created_from or "api",
+            task_type=request.task_type or "feature",
+            phase=request.phase,
+            module=request.module,
+            sprint=request.sprint,
+            tags=request.tags,
         )
 
         if not success:
@@ -748,6 +717,32 @@ async def create_task(request: CreateTaskRequest):
         raise HTTPException(status_code=500, detail={"error": str(e)})
 
 
+class GenerateTasksRequest(BaseModel):
+    feature_description: str
+    project_id: str | None = None
+
+
+@router.post("/tasks/generate")
+async def generate_tasks(request: GenerateTasksRequest):
+    """Generate task breakdown from a feature description using LLM."""
+    try:
+        success, result = await generate_tasks_from_description(
+            feature_description=request.feature_description,
+            project_id=request.project_id,
+        )
+
+        if not success:
+            raise HTTPException(status_code=400, detail=result)
+
+        return result
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logfire.error(f"Failed to generate tasks | error={str(e)}")
+        raise HTTPException(status_code=500, detail={"error": str(e)})
+
+
 @router.get("/tasks")
 async def list_tasks(
     status: str | None = None,
@@ -757,11 +752,17 @@ async def list_tasks(
     per_page: int = 10,
     exclude_large_fields: bool = False,
     q: str | None = None,  # Search query parameter
+    task_type: str | None = None,
+    phase: str | None = None,
+    module: str | None = None,
+    sprint: str | None = None,
+    feature: str | None = None,
+    parent_task_id: str | None = None,
 ):
-    """List tasks with optional filters including status, project, and keyword search."""
+    """List tasks with optional filters including status, project, task_type, phase, module, sprint, feature, and keyword search."""
     try:
         logfire.info(
-            f"Listing tasks | status={status} | project_id={project_id} | include_closed={include_closed} | page={page} | per_page={per_page} | q={q}"
+            f"Listing tasks | status={status} | project_id={project_id} | include_closed={include_closed} | page={page} | per_page={per_page} | q={q} | task_type={task_type} | phase={phase} | module={module} | sprint={sprint}"
         )
 
         # Use TaskService to list tasks
@@ -771,11 +772,22 @@ async def list_tasks(
             status=status,
             include_closed=include_closed,
             exclude_large_fields=exclude_large_fields,
-            search_query=q,  # Pass search query to service
+            search_query=q,
+            task_type=task_type,
+            phase=phase,
+            module=module,
+            sprint=sprint,
+            feature=feature,
+            parent_task_id=parent_task_id,
         )
 
         if not success:
             raise HTTPException(status_code=500, detail=result)
+
+        # Validate response shape against contract model
+        ok_validate, _ = validate_response_safe(result, TaskListResponse)
+        if not ok_validate:
+            logger.warning("Response shape mismatch in task list endpoint: validation failed")
 
         tasks = result.get("tasks", [])
 
@@ -858,23 +870,6 @@ async def get_task(task_id: str):
         raise HTTPException(status_code=500, detail={"error": str(e)})
 
 
-class UpdateTaskRequest(BaseModel):
-    title: str | None = None
-    description: str | None = None
-    status: str | None = None
-    assignee: str | None = None
-    task_order: int | None = None
-    priority: str | None = None
-    feature: str | None = None
-    owner: str | None = None
-    acceptance_criteria: list[dict[str, Any]] | None = None
-    execution_result: dict[str, Any] | None = None
-    architect_review: dict[str, Any] | None = None
-    execution_prompt: str | None = None
-    source_app: str | None = None
-    complexity: str | None = None
-    max_retries: int | None = None
-
 
 class CreateDocumentRequest(BaseModel):
     document_type: str
@@ -902,6 +897,29 @@ class CreateVersionRequest(BaseModel):
 
 class RestoreVersionRequest(BaseModel):
     restored_by: str | None = "system"
+
+
+@router.get("/tasks/{task_id}/subtasks")
+async def get_task_subtasks(task_id: str):
+    """Get all direct subtasks of a given task."""
+    try:
+        task_service = TaskService()
+        success, result = task_service.get_subtasks(task_id)
+
+        if not success:
+            raise HTTPException(status_code=500, detail=result)
+
+        logfire.info(
+            f"Subtasks retrieved | parent_task_id={task_id} | count={result.get('count', 0)}"
+        )
+
+        return result
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logfire.error(f"Failed to get subtasks | error={str(e)} | task_id={task_id}")
+        raise HTTPException(status_code=500, detail={"error": str(e)})
 
 
 @router.put("/tasks/{task_id}")
@@ -940,6 +958,18 @@ async def update_task(task_id: str, request: UpdateTaskRequest):
             update_fields["complexity"] = request.complexity
         if request.max_retries is not None:
             update_fields["max_retries"] = request.max_retries
+        if request.blocked_by is not None:
+            update_fields["blocked_by"] = request.blocked_by
+        if request.task_type is not None:
+            update_fields["task_type"] = request.task_type
+        if request.phase is not None:
+            update_fields["phase"] = request.phase
+        if request.module is not None:
+            update_fields["module"] = request.module
+        if request.sprint is not None:
+            update_fields["sprint"] = request.sprint
+        if request.tags is not None:
+            update_fields["tags"] = request.tags
 
         # Use TaskService to update the task
         task_service = TaskService()
@@ -1034,11 +1064,6 @@ async def mcp_update_task_status(task_id: str, status: str):
 
 # ==================== TASK LIFECYCLE ENDPOINTS ====================
 
-
-class TransitionTaskRequest(BaseModel):
-    new_status: str
-    changed_by: str = "api"
-    reason: str | None = None
 
 
 @router.post("/tasks/{task_id}/transition")

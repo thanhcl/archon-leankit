@@ -9,7 +9,15 @@ import { DISABLED_QUERY_KEY, STALE_TIMES } from "../../../shared/config/queryPat
 import { useSmartPolling } from "../../../shared/hooks";
 import { useToast } from "../../../shared/hooks/useToast";
 import { taskService } from "../services";
-import type { CreateTaskRequest, Task, UpdateTaskRequest } from "../types";
+import type {
+  CostStatusResponse,
+  CreateTaskRequest,
+  PredictedVsActual,
+  SprintStatsResponse,
+  Task,
+  TaskEstimate,
+  UpdateTaskRequest,
+} from "../types";
 
 // Query keys factory for tasks - supports dual backend nature
 export const taskKeys = {
@@ -18,6 +26,9 @@ export const taskKeys = {
   detail: (id: string) => [...taskKeys.all, "detail", id] as const, // For /api/tasks/{id}
   byProject: (projectId: string) => ["projects", projectId, "tasks"] as const, // For /api/projects/{id}/tasks
   counts: () => [...taskKeys.all, "counts"] as const, // For /api/projects/task-counts
+  estimates: (projectId: string) => ["projects", projectId, "task-estimates"] as const, // For /api/projects/{id}/task-estimates
+  sprintStats: (projectId: string) => ["projects", projectId, "sprint-stats"] as const,
+  costStatus: (projectId: string) => ["projects", projectId, "cost-status"] as const,
 };
 
 // Fetch tasks for a specific project
@@ -45,6 +56,49 @@ export function useTaskCounts() {
     queryFn: () => taskService.getTaskCountsForAllProjects(),
     refetchInterval: countsRefetchInterval,
     staleTime: STALE_TIMES.frequent,
+  });
+}
+
+// Fetch task estimates for a project
+export function useTaskEstimates(projectId: string | undefined) {
+  return useQuery<{
+    project_id: string;
+    estimates: Record<string, TaskEstimate>;
+    predicted_vs_actual: PredictedVsActual[];
+  }>({
+    queryKey: projectId ? taskKeys.estimates(projectId) : DISABLED_QUERY_KEY,
+    queryFn: async () => {
+      if (!projectId) throw new Error("No project ID");
+      return taskService.getTaskEstimates(projectId);
+    },
+    enabled: !!projectId,
+    staleTime: STALE_TIMES.normal, // 30s - estimates don't change rapidly
+  });
+}
+
+// Fetch sprint stats for a project (cost trend data)
+export function useSprintStats(projectId: string | undefined) {
+  return useQuery<SprintStatsResponse>({
+    queryKey: projectId ? taskKeys.sprintStats(projectId) : DISABLED_QUERY_KEY,
+    queryFn: async () => {
+      if (!projectId) throw new Error("No project ID");
+      return taskService.getSprintStats(projectId);
+    },
+    enabled: !!projectId,
+    staleTime: STALE_TIMES.normal,
+  });
+}
+
+// Fetch cost budget status for a project (budget line overlay)
+export function useCostStatus(projectId: string | undefined) {
+  return useQuery<CostStatusResponse>({
+    queryKey: projectId ? taskKeys.costStatus(projectId) : DISABLED_QUERY_KEY,
+    queryFn: async () => {
+      if (!projectId) throw new Error("No project ID");
+      return taskService.getCostStatus(projectId);
+    },
+    enabled: !!projectId,
+    staleTime: STALE_TIMES.normal,
   });
 }
 

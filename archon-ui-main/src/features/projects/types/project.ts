@@ -62,6 +62,14 @@ export interface Project {
 
   // Creation progress tracking for inline display
   creationProgress?: ProjectCreationProgress;
+
+  // Virtual Office fields
+  source_app?: string;
+  layout_id?: string;
+  team_config?: Record<string, unknown>[];
+  director_config?: Record<string, unknown>;
+  team_lead_config?: Record<string, unknown>;
+  office_settings?: Record<string, unknown>;
 }
 
 // Request types
@@ -75,6 +83,13 @@ export interface CreateProjectRequest {
   data?: ProjectData;
   technical_sources?: string[];
   business_sources?: string[];
+  // Virtual Office fields
+  source_app?: string;
+  layout_id?: string;
+  team_config?: Record<string, unknown>[];
+  director_config?: Record<string, unknown>;
+  team_lead_config?: Record<string, unknown>;
+  office_settings?: Record<string, unknown>;
 }
 
 export interface UpdateProjectRequest {
@@ -88,6 +103,13 @@ export interface UpdateProjectRequest {
   technical_sources?: string[];
   business_sources?: string[];
   pinned?: boolean;
+  // Virtual Office fields
+  source_app?: string;
+  layout_id?: string;
+  team_config?: Record<string, unknown>[];
+  director_config?: Record<string, unknown>;
+  team_lead_config?: Record<string, unknown>;
+  office_settings?: Record<string, unknown>;
 }
 
 // Utility types

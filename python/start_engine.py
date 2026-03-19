@@ -24,9 +24,14 @@ from urllib.request import Request, urlopen
 # Add python dir to path so relative imports in src work
 sys.path.insert(0, os.path.dirname(__file__))
 
+from src.server.services.engine.capacity_tracker import GlobalCapacityTracker
 from src.server.services.engine.task_engine import TaskEngine
 
 ARCHON_API = os.environ.get("ARCHON_API_URL", "http://localhost:8181")
+
+# Parallel execution limits (env vars)
+DEFAULT_MAX_PARALLEL = int(os.environ.get("MAX_PARALLEL", "3"))
+MAX_PARALLEL_GLOBAL = int(os.environ.get("MAX_PARALLEL_GLOBAL", "10"))
 
 
 # ---------------------------------------------------------------------------
@@ -78,12 +83,20 @@ def fetch_projects(max_retries: int = 3, delay: int = 5) -> list[dict]:
                     else:
                         build_command = "echo 'no build command configured'"
 
+                # Per-project max_concurrent from office_settings, fallback to env default
+                max_concurrent = settings.get("max_concurrent", DEFAULT_MAX_PARALLEL)
+                try:
+                    max_concurrent = int(max_concurrent)
+                except (TypeError, ValueError):
+                    max_concurrent = DEFAULT_MAX_PARALLEL
+
                 result.append({
                     "project_id": p["id"],
                     "name": p.get("title", source_app or "unknown"),
                     "source_app": source_app,
                     "path": project_path,
                     "build": build_command,
+                    "max_concurrent": max_concurrent,
                 })
 
             return result
@@ -116,20 +129,26 @@ async def main() -> None:
 
     task_timeout = int(os.environ.get("TASK_ENGINE_TIMEOUT", "1800"))
     print(f"[engine] Task timeout: {task_timeout}s ({task_timeout // 60}m)")
+    print(f"[engine] Global parallel limit: {MAX_PARALLEL_GLOBAL} | Default per-project: {DEFAULT_MAX_PARALLEL}")
+
+    global_tracker = GlobalCapacityTracker(max_global=MAX_PARALLEL_GLOBAL)
 
     engines: list[tuple[str, TaskEngine]] = []
     for proj in projects:
         project_path = str(Path(proj["path"]).expanduser())
+        per_project_limit = proj.get("max_concurrent", DEFAULT_MAX_PARALLEL)
         engine = TaskEngine(
             project_path=project_path,
             project_id=proj["project_id"],
             build_command=proj["build"],
             poll_interval=30,
-            max_parallel=3,
+            max_parallel=per_project_limit,
             default_timeout=task_timeout,
             shutdown_grace=60,
+            global_tracker=global_tracker,
         )
         engines.append((proj["name"], engine))
+        print(f"  - {proj['name']}: max_concurrent={per_project_limit}")
 
     # Graceful shutdown via Ctrl+C / SIGTERM
     shutdown_event = asyncio.Event()

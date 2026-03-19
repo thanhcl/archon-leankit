@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from src.server.services.engine.notifier import (
+    EVENT_AGENT_STATUS,
     EVENT_TASK_COMPLETED,
     EVENT_TASK_ESCALATED,
     EVENT_TASK_FAILED,
@@ -150,25 +151,21 @@ async def test_channel_failure_non_fatal():
 @pytest.mark.asyncio
 async def test_observability_sends_unified_event():
     """Observability channel sends UnifiedEvent schema to configured URL."""
+    import json
+
     config = NotifierConfig(observability_url="http://obs:4000/api/events")
     notifier = Notifier(config=config, source_app="my-app")
 
-    with patch("httpx.AsyncClient") as MC:
-        mc = _mock_httpx()
-        MC.return_value = mc
-
+    with patch("src.server.services.engine.notifier.urllib.request.urlopen") as mock_urlopen:
         await notifier.emit(EVENT_TASK_STARTED, task_id="t-1", data={"title": "Auth"})
 
-        # Find the observability call (2s timeout client)
-        calls = mc.post.call_args_list
-        obs_call = None
-        for call in calls:
-            if "obs:4000" in str(call):
-                obs_call = call
-                break
+        assert mock_urlopen.call_count >= 1
+        req = mock_urlopen.call_args[0][0]
+        assert req.full_url == "http://obs:4000/api/events"
+        assert req.get_method() == "POST"
+        assert req.get_header("Content-type") == "application/json"
 
-        assert obs_call is not None, "Observability POST not found"
-        payload = obs_call.kwargs.get("json") or obs_call[1].get("json")
+        payload = json.loads(req.data.decode("utf-8"))
         assert payload["type"] == "task"
         assert payload["event"] == "task_started"
         assert payload["source"] == "task-engine"
@@ -199,13 +196,13 @@ async def test_observability_url_default():
 async def test_observability_failure_non_fatal():
     """Observability send failure should not raise or block."""
     notifier = Notifier()
-    with patch.object(notifier, "_send_observability", side_effect=Exception("timeout")):
+    with patch.object(notifier, "_send_to_observability", side_effect=Exception("timeout")):
         # Patch to actually raise — but emit should still succeed
         # since _send_observability is called directly, we need to test the internal try/except
         pass
 
     # Test the internal error handling
-    with patch("httpx.AsyncClient", side_effect=Exception("connection refused")):
+    with patch("src.server.services.engine.notifier.urllib.request.urlopen", side_effect=Exception("connection refused")):
         await notifier.emit("test", task_id="t-1")  # Should not raise
     assert len(notifier.event_log) == 1
 
@@ -216,15 +213,11 @@ async def test_observability_timeout_is_2s():
     config = NotifierConfig(observability_url="http://obs:4000/api/events")
     notifier = Notifier(config=config)
 
-    with patch("httpx.AsyncClient") as MC:
-        mc = _mock_httpx()
-        MC.return_value = mc
-
+    with patch("src.server.services.engine.notifier.urllib.request.urlopen") as mock_urlopen:
         await notifier.emit("test", task_id="t-1")
 
-        # Check that AsyncClient was called with timeout=2 for observability
-        timeout_calls = [c for c in MC.call_args_list if c.kwargs.get("timeout") == 2]
-        assert len(timeout_calls) >= 1, "Observability should use timeout=2"
+        assert mock_urlopen.call_count >= 1
+        assert mock_urlopen.call_args.kwargs.get("timeout") == 2
 
 
 @pytest.mark.asyncio
@@ -232,3 +225,57 @@ async def test_source_app_default():
     """Notifier defaults source_app to 'unknown'."""
     notifier = Notifier()
     assert notifier.source_app == "unknown"
+
+
+# ── Agent status event tests ──────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_on_agent_status_emits_event():
+    """on_agent_status emits an agent_status event with stream data."""
+    notifier = Notifier()
+    await notifier.on_agent_status(
+        task_id="t-1",
+        agent_id="agent-abc",
+        stream_event={
+            "event": "tool_use",
+            "tool_name": "Read",
+            "args_summary": "/src/main.py",
+        },
+    )
+
+    assert len(notifier.event_log) == 1
+    evt = notifier.event_log[0]
+    assert evt.event == EVENT_AGENT_STATUS
+    assert evt.task_id == "t-1"
+    assert evt.data["agent_id"] == "agent-abc"
+    assert evt.data["event"] == "tool_use"
+    assert evt.data["tool_name"] == "Read"
+    assert evt.data["args_summary"] == "/src/main.py"
+
+
+@pytest.mark.asyncio
+async def test_on_agent_status_assistant_event():
+    """on_agent_status handles assistant events correctly."""
+    notifier = Notifier()
+    await notifier.on_agent_status(
+        task_id="t-2",
+        agent_id="agent-xyz",
+        stream_event={
+            "event": "assistant",
+            "message": "Working on the implementation",
+        },
+    )
+
+    evt = notifier.event_log[0]
+    assert evt.data["event"] == "assistant"
+    assert evt.data["message"] == "Working on the implementation"
+    assert evt.data["tool_name"] == ""
+
+
+@pytest.mark.asyncio
+async def test_on_agent_status_not_critical():
+    """Agent status events are not critical."""
+    notifier = Notifier()
+    await notifier.on_agent_status("t-1", "agent-1", {"event": "thinking", "message": "hmm"})
+    assert notifier.event_log[0].is_critical is False

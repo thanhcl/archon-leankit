@@ -1,66 +1,72 @@
-import { Tag } from "lucide-react";
+import { useSortable } from "@dnd-kit/sortable";
+import { CSS } from "@dnd-kit/utilities";
+import { Clock, Tag } from "lucide-react";
 import type React from "react";
 import { useCallback } from "react";
-import { useDrag, useDrop } from "react-dnd";
 import { isOptimistic } from "@/features/shared/utils/optimistic";
 import { Card } from "../../../ui/primitives";
 import { OptimisticIndicator } from "../../../ui/primitives/OptimisticIndicator";
 import { cn } from "../../../ui/primitives/styles";
 import { useTaskActions, useTransitionTask } from "../hooks";
-import type { Assignee, Task, TaskPriority } from "../types";
-import { getOrderColor, getOrderGlow, ItemTypes } from "../utils/task-styles";
+import type { Assignee, Task, TaskEstimate, TaskPriority } from "../types";
+import { getOrderColor, getOrderGlow } from "../utils/task-styles";
 import { TaskPriorityComponent } from ".";
 import { TaskAssignee } from "./TaskAssignee";
 import { TaskCardActions } from "./TaskCardActions";
 
+function formatEstimatedTime(seconds: number): string {
+  if (seconds <= 0) return "";
+  if (seconds < 60) return `${Math.round(seconds)}s`;
+  if (seconds < 3600) return `${Math.round(seconds / 60)}m`;
+  const hours = Math.floor(seconds / 3600);
+  const mins = Math.round((seconds % 3600) / 60);
+  return mins > 0 ? `${hours}h ${mins}m` : `${hours}h`;
+}
+
 export interface TaskCardProps {
   task: Task;
-  index: number;
-  projectId: string; // Need this for mutations
-  onTaskReorder: (taskId: string, targetIndex: number, status: Task["status"]) => void;
-  onEdit?: (task: Task) => void; // Optional edit handler
-  onDelete?: (task: Task) => void; // Optional delete handler
+  projectId: string;
+  onEdit?: (task: Task) => void;
+  onDelete?: (task: Task) => void;
   hoveredTaskId?: string | null;
   onTaskHover?: (taskId: string | null) => void;
   selectedTasks?: Set<string>;
   onTaskSelect?: (taskId: string) => void;
+  estimate?: TaskEstimate;
 }
 
 export const TaskCard: React.FC<TaskCardProps> = ({
   task,
-  index,
   projectId,
-  onTaskReorder,
   onEdit,
   onDelete,
   hoveredTaskId,
   onTaskHover,
   selectedTasks,
   onTaskSelect,
+  estimate,
 }) => {
-  // Check if task is optimistic
   const optimistic = isOptimistic(task);
 
-  // Use business logic hooks
   const { changeAssignee, changePriority, isUpdating } = useTaskActions(projectId);
   const transitionMutation = useTransitionTask(projectId);
 
-  // Handlers - now just call hook methods
+  const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
+    id: task.id,
+    data: { status: task.status },
+  });
+
+  const style = {
+    transform: CSS.Transform.toString(transform),
+    transition,
+  };
+
   const handleEdit = useCallback(() => {
-    // Call the onEdit prop if provided, otherwise log
-    if (onEdit) {
-      onEdit(task);
-    } else {
-      // Edit task - no handler provided
-    }
+    if (onEdit) onEdit(task);
   }, [onEdit, task]);
 
   const handleDelete = useCallback(() => {
-    if (onDelete) {
-      onDelete(task);
-    } else {
-      // Delete task - no handler provided
-    }
+    if (onDelete) onDelete(task);
   }, [onDelete, task]);
 
   const handlePriorityChange = useCallback(
@@ -88,34 +94,6 @@ export const TaskCard: React.FC<TaskCardProps> = ({
     }
   }, [transitionMutation, task.id]);
 
-  const [{ isDragging }, drag] = useDrag({
-    type: ItemTypes.TASK,
-    item: { id: task.id, status: task.status, index },
-    collect: (monitor) => ({
-      isDragging: !!monitor.isDragging(),
-    }),
-  });
-
-  const [, drop] = useDrop({
-    accept: ItemTypes.TASK,
-    hover: (draggedItem: { id: string; status: Task["status"]; index: number }, monitor) => {
-      if (!monitor.isOver({ shallow: true })) return;
-      if (draggedItem.id === task.id) return;
-      if (draggedItem.status !== task.status) return;
-
-      const draggedIndex = draggedItem.index;
-      const hoveredIndex = index;
-
-      if (draggedIndex === hoveredIndex) return;
-
-      // Move the task immediately for visual feedback
-      onTaskReorder(draggedItem.id, hoveredIndex, task.status);
-
-      // Update the dragged item's index to prevent re-triggering
-      draggedItem.index = hoveredIndex;
-    },
-  });
-
   const isHighlighted = hoveredTaskId === task.id;
   const isSelected = selectedTasks?.has(task.id) || false;
 
@@ -135,14 +113,16 @@ export const TaskCard: React.FC<TaskCardProps> = ({
   };
 
   return (
-    // biome-ignore lint/a11y/useSemanticElements: Drag-and-drop card with react-dnd - requires div for drag handle
     <div
-      ref={(node) => drag(drop(node))}
+      ref={setNodeRef}
+      style={style}
+      {...attributes}
+      {...listeners}
       role="group"
       className={cn(
-        "w-full min-h-[140px] cursor-move relative group",
+        "w-full min-h-[140px] cursor-grab active:cursor-grabbing relative group touch-none",
         "transition-all duration-200 ease-in-out",
-        isDragging ? "opacity-50 scale-90" : "scale-100 opacity-100",
+        isDragging ? "opacity-40 scale-95" : "scale-100 opacity-100",
       )}
       onMouseEnter={handleMouseEnter}
       onMouseLeave={handleMouseLeave}
@@ -161,7 +141,7 @@ export const TaskCard: React.FC<TaskCardProps> = ({
           optimistic && "opacity-80 ring-1 ring-cyan-400/30",
         )}
       >
-        {/* Priority indicator with beautiful glow */}
+        {/* Priority indicator with glow */}
         <div
           className={cn(
             "absolute left-0 top-0 bottom-0 w-[3px] rounded-l-lg opacity-80 group-hover:w-[4px] group-hover:opacity-100 transition-all duration-300",
@@ -170,7 +150,7 @@ export const TaskCard: React.FC<TaskCardProps> = ({
           )}
         />
 
-        {/* Content container with fixed padding */}
+        {/* Content container */}
         <div className="flex flex-col h-full p-3">
           {/* Header with feature and actions */}
           <div className="flex items-center gap-2 mb-2 pl-1.5">
@@ -188,10 +168,8 @@ export const TaskCard: React.FC<TaskCardProps> = ({
               </div>
             )}
 
-            {/* Optimistic indicator */}
             <OptimisticIndicator isOptimistic={optimistic} className="ml-auto" />
 
-            {/* Action buttons group */}
             <div className={cn("flex items-center gap-1.5", !optimistic && "ml-auto")}>
               <TaskCardActions
                 taskId={task.id}
@@ -215,7 +193,7 @@ export const TaskCard: React.FC<TaskCardProps> = ({
             {task.title}
           </h4>
 
-          {/* Description - visible when task has description */}
+          {/* Description */}
           {task.description && (
             <div className="pl-1.5 pr-3 mb-2 flex-1">
               <p
@@ -227,14 +205,22 @@ export const TaskCard: React.FC<TaskCardProps> = ({
             </div>
           )}
 
-          {/* Spacer when no description */}
           {!task.description && <div className="flex-1"></div>}
 
-          {/* Footer with assignee - glassmorphism styling */}
+          {/* Footer */}
           <div className="flex items-center justify-between mt-auto pt-2 pl-1.5 pr-3">
             <TaskAssignee assignee={task.assignee} onAssigneeChange={handleAssigneeChange} isLoading={isUpdating} />
 
-            {/* Priority display connected to database */}
+            {estimate && estimate.estimate_duration_seconds > 0 && (
+              <div
+                className="flex items-center gap-1 text-xs text-gray-500 dark:text-gray-400"
+                title={`Est. ${formatEstimatedTime(estimate.estimate_duration_seconds)} (${estimate.confidence} confidence, ${estimate.sample_size} samples)`}
+              >
+                <Clock className="w-3 h-3" />
+                <span>{formatEstimatedTime(estimate.estimate_duration_seconds)}</span>
+              </div>
+            )}
+
             <TaskPriorityComponent
               priority={task.priority}
               onPriorityChange={handlePriorityChange}

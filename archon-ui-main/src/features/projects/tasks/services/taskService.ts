@@ -7,7 +7,17 @@ import { callAPIWithETag } from "../../../shared/api/apiClient";
 import { formatZodErrors, ValidationError } from "../../../shared/types/errors";
 
 import { validateCreateTask, validateUpdateTask, validateUpdateTaskStatus } from "../schemas";
-import type { CreateTaskRequest, DatabaseTaskStatus, Task, TaskCounts, UpdateTaskRequest } from "../types";
+import type {
+  CostStatusResponse,
+  CreateTaskRequest,
+  DatabaseTaskStatus,
+  PredictedVsActual,
+  SprintStatsResponse,
+  Task,
+  TaskCounts,
+  TaskEstimate,
+  UpdateTaskRequest,
+} from "../types";
 
 export const taskService = {
   /**
@@ -196,6 +206,22 @@ export const taskService = {
   },
 
   /**
+   * Get task estimates for a project (predicted duration and cost)
+   */
+  async getTaskEstimates(projectId: string): Promise<{
+    project_id: string;
+    estimates: Record<string, TaskEstimate>;
+    predicted_vs_actual: PredictedVsActual[];
+  }> {
+    try {
+      return await callAPIWithETag(`/api/projects/${projectId}/task-estimates`);
+    } catch (error) {
+      console.error(`Failed to get task estimates for project ${projectId}:`, error);
+      throw error;
+    }
+  },
+
+  /**
    * Get task counts for all projects in a single batch request
    * Optimized endpoint to avoid N+1 query problem
    */
@@ -205,6 +231,24 @@ export const taskService = {
       return response || {};
     } catch (error) {
       console.error("Failed to get task counts for all projects:", error);
+      throw error;
+    }
+  },
+
+  async getSprintStats(projectId: string): Promise<SprintStatsResponse> {
+    try {
+      return await callAPIWithETag<SprintStatsResponse>(`/api/projects/${projectId}/sprint-stats?group_by=date`);
+    } catch (error) {
+      console.error(`Failed to get sprint stats for project ${projectId}:`, error);
+      throw error;
+    }
+  },
+
+  async getCostStatus(projectId: string): Promise<CostStatusResponse> {
+    try {
+      return await callAPIWithETag<CostStatusResponse>(`/api/projects/${projectId}/cost-status`);
+    } catch (error) {
+      console.error(`Failed to get cost status for project ${projectId}:`, error);
       throw error;
     }
   },

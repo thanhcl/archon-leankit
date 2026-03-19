@@ -9,6 +9,7 @@ shared between MCP tools and FastAPI endpoints.
 from datetime import datetime
 from typing import Any
 
+from src.server.models.api_contracts import TaskComplexity, TaskPriority, TaskStatus, TaskType
 from src.server.utils import get_supabase_client
 
 from ...config.logfire_config import get_logger
@@ -21,11 +22,7 @@ logger = get_logger(__name__)
 class TaskService:
     """Service class for task operations"""
 
-    VALID_STATUSES = [
-        "draft", "proposed", "approved", "planning", "owner-qa",
-        "assigned", "executing", "architect-review", "review",
-        "done", "failed", "escalated", "on-hold", "cancelled",
-    ]
+    VALID_STATUSES = [s.value for s in TaskStatus]
 
     def __init__(self, supabase_client=None):
         """Initialize with optional supabase client"""
@@ -48,21 +45,32 @@ class TaskService:
 
     def validate_priority(self, priority: str) -> tuple[bool, str]:
         """Validate task priority against allowed enum values"""
-        VALID_PRIORITIES = ["low", "medium", "high", "critical"]
-        if priority not in VALID_PRIORITIES:
+        valid = [p.value for p in TaskPriority]
+        if priority not in valid:
             return (
                 False,
-                f"Invalid priority '{priority}'. Must be one of: {', '.join(VALID_PRIORITIES)}",
+                f"Invalid priority '{priority}'. Must be one of: {', '.join(valid)}",
             )
         return True, ""
 
     def validate_complexity(self, complexity: str) -> tuple[bool, str]:
         """Validate task complexity"""
-        VALID_COMPLEXITIES = ["simple", "complex"]
-        if complexity not in VALID_COMPLEXITIES:
+        valid = [c.value for c in TaskComplexity]
+        if complexity not in valid:
             return (
                 False,
-                f"Invalid complexity '{complexity}'. Must be one of: {', '.join(VALID_COMPLEXITIES)}",
+                f"Invalid complexity '{complexity}'. Must be one of: {', '.join(valid)}",
+            )
+        return True, ""
+
+    VALID_TASK_TYPES = [t.value for t in TaskType]
+
+    def validate_task_type(self, task_type: str) -> tuple[bool, str]:
+        """Validate task type"""
+        if task_type not in self.VALID_TASK_TYPES:
+            return (
+                False,
+                f"Invalid task_type '{task_type}'. Must be one of: {', '.join(self.VALID_TASK_TYPES)}",
             )
         return True, ""
 
@@ -84,6 +92,14 @@ class TaskService:
         complexity: str = "simple",
         max_retries: int = 3,
         status: str = "draft",
+        blocked_by: list[str] | None = None,
+        created_by: str | None = None,
+        created_from: str | None = None,
+        task_type: str = "feature",
+        phase: str | None = None,
+        module: str | None = None,
+        sprint: str | None = None,
+        tags: list[str] | None = None,
     ) -> tuple[bool, dict[str, Any]]:
         """
         Create a new task under a project with automatic reordering.
@@ -116,6 +132,11 @@ class TaskService:
 
             # Validate complexity
             is_valid, error_msg = self.validate_complexity(complexity)
+            if not is_valid:
+                return False, {"error": error_msg}
+
+            # Validate task_type
+            is_valid, error_msg = self.validate_task_type(task_type)
             if not is_valid:
                 return False, {"error": error_msg}
 
@@ -160,6 +181,8 @@ class TaskService:
                 "state_changed_at": now,
                 "created_at": now,
                 "updated_at": now,
+                "task_type": task_type,
+                "tags": tags or [],
             }
 
             if feature:
@@ -172,6 +195,22 @@ class TaskService:
                 task_data["execution_prompt"] = execution_prompt
             if source_app:
                 task_data["source_app"] = source_app
+            if blocked_by is not None:
+                task_data["blocked_by"] = blocked_by
+            if created_by:
+                task_data["created_by"] = created_by
+            if created_from:
+                task_data["created_from"] = created_from
+            if phase:
+                task_data["phase"] = phase
+            if module:
+                task_data["module"] = module
+            if sprint:
+                task_data["sprint"] = sprint
+
+            # Initialize ownership tracking fields
+            task_data["executed_by"] = None
+            task_data["reviewed_by"] = []
 
             response = self.supabase_client.table("archon_tasks").insert(task_data).execute()
 
@@ -191,6 +230,11 @@ class TaskService:
                         "complexity": task.get("complexity", "simple"),
                         "owner": task.get("owner"),
                         "source_app": task.get("source_app"),
+                        "blocked_by": task.get("blocked_by", []),
+                        "created_by": task.get("created_by"),
+                        "created_from": task.get("created_from"),
+                        "executed_by": task.get("executed_by"),
+                        "reviewed_by": task.get("reviewed_by", []),
                         "created_at": task["created_at"],
                     }
                 }
@@ -208,7 +252,13 @@ class TaskService:
         include_closed: bool = False,
         exclude_large_fields: bool = False,
         include_archived: bool = False,
-        search_query: str = None
+        search_query: str = None,
+        task_type: str = None,
+        phase: str = None,
+        module: str = None,
+        sprint: str = None,
+        feature: str = None,
+        parent_task_id: str = None,
     ) -> tuple[bool, dict[str, Any]]:
         """
         List tasks with various filters.
@@ -293,6 +343,34 @@ class TaskService:
             else:
                 filters_applied.append("include all tasks (including archived)")
 
+            # New categorical filters
+            if task_type:
+                is_valid, error_msg = self.validate_task_type(task_type)
+                if not is_valid:
+                    return False, {"error": error_msg}
+                query = query.eq("task_type", task_type)
+                filters_applied.append(f"task_type={task_type}")
+
+            if phase:
+                query = query.eq("phase", phase)
+                filters_applied.append(f"phase={phase}")
+
+            if module:
+                query = query.eq("module", module)
+                filters_applied.append(f"module={module}")
+
+            if sprint:
+                query = query.eq("sprint", sprint)
+                filters_applied.append(f"sprint={sprint}")
+
+            if feature:
+                query = query.eq("feature", feature)
+                filters_applied.append(f"feature={feature}")
+
+            if parent_task_id:
+                query = query.eq("parent_task_id", parent_task_id)
+                filters_applied.append(f"parent_task_id={parent_task_id}")
+
             logger.debug(f"Listing tasks with filters: {', '.join(filters_applied)}")
 
             # Execute query and get raw response
@@ -350,9 +428,20 @@ class TaskService:
                     "retry_count": task.get("retry_count", 0),
                     "max_retries": task.get("max_retries", 3),
                     "state_changed_at": task.get("state_changed_at"),
+                    "blocked_by": task.get("blocked_by", []),
+                    "created_by": task.get("created_by"),
+                    "created_from": task.get("created_from"),
+                    "executed_by": task.get("executed_by"),
+                    "reviewed_by": task.get("reviewed_by", []),
                     "created_at": task["created_at"],
                     "updated_at": task["updated_at"],
                     "archived": task.get("archived", False),
+                    "task_type": task.get("task_type", "feature"),
+                    "phase": task.get("phase"),
+                    "module": task.get("module"),
+                    "sprint": task.get("sprint"),
+                    "tags": task.get("tags", []),
+                    "parent_task_id": task.get("parent_task_id"),
                 }
 
                 if not exclude_large_fields:
@@ -363,6 +452,7 @@ class TaskService:
                     task_data["architect_review"] = task.get("architect_review")
                     task_data["execution_prompt"] = task.get("execution_prompt")
                     task_data["state_history"] = task.get("state_history", [])
+                    task_data["review_history"] = task.get("review_history", [])
                 else:
                     task_data["stats"] = {
                         "sources_count": len(task.get("sources", [])),
@@ -464,16 +554,26 @@ class TaskService:
                     return False, {"error": error_msg}
                 update_data["complexity"] = update_fields["complexity"]
 
+            if "task_type" in update_fields:
+                is_valid, error_msg = self.validate_task_type(update_fields["task_type"])
+                if not is_valid:
+                    return False, {"error": error_msg}
+                update_data["task_type"] = update_fields["task_type"]
+
             # New lifecycle fields (no validation needed, just pass through)
             for field in [
                 "owner", "execution_prompt", "source_app",
                 "rejection_reason", "hold_reason", "max_retries",
+                "phase", "module", "sprint", "tags",
             ]:
                 if field in update_fields:
                     update_data[field] = update_fields[field]
 
             # JSONB fields
-            for field in ["acceptance_criteria", "execution_result", "architect_review"]:
+            for field in [
+                "acceptance_criteria", "execution_result", "architect_review",
+                "blocked_by", "executed_by", "reviewed_by", "review_history",
+            ]:
                 if field in update_fields:
                     update_data[field] = update_fields[field]
 
@@ -542,6 +642,30 @@ class TaskService:
         except Exception as e:
             logger.error(f"Error archiving task: {e}")
             return False, {"error": f"Error archiving task: {str(e)}"}
+
+    def get_subtasks(self, parent_task_id: str) -> tuple[bool, dict[str, Any]]:
+        """
+        Get all direct subtasks of a given parent task.
+
+        Returns:
+            Tuple of (success, result_dict)
+        """
+        try:
+            response = (
+                self.supabase_client.table("archon_tasks")
+                .select("*")
+                .eq("parent_task_id", parent_task_id)
+                .or_("archived.is.null,archived.is.false")
+                .order("task_order", desc=False)
+                .execute()
+            )
+
+            subtasks = response.data or []
+            return True, {"subtasks": subtasks, "count": len(subtasks)}
+
+        except Exception as e:
+            logger.error(f"Error getting subtasks for {parent_task_id}: {e}")
+            return False, {"error": f"Error getting subtasks: {str(e)}"}
 
     def get_all_project_task_counts(self) -> tuple[bool, dict[str, dict[str, int]]]:
         """

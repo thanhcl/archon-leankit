@@ -8,6 +8,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from ..config.logfire_config import get_logger
+from ..services.rules.rule_optimizer_service import RuleOptimizerService
 from ..services.rules.rule_service import RuleService
 
 logger = get_logger(__name__)
@@ -118,4 +119,19 @@ async def delete_rule(rule_id: str):
     ok, result = service.delete_rule(rule_id=rule_id)
     if not ok:
         raise HTTPException(status_code=404, detail=result)
+    return result
+
+
+@router.post("/optimize/{project_id}")
+async def optimize_rules(project_id: str):
+    """Analyze task metrics and suggest rule optimizations for a project.
+
+    Returns suggestions with action (add/modify/remove), section, rule_text,
+    confidence score, reason, and supporting evidence.
+    Owner must approve suggestions before they are applied.
+    """
+    optimizer = RuleOptimizerService()
+    ok, result = await optimizer.optimize_rules(project_id=project_id)
+    if not ok:
+        raise HTTPException(status_code=500, detail=result)
     return result

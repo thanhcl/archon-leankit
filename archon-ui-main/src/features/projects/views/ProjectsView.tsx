@@ -1,6 +1,6 @@
 import { useQueryClient } from "@tanstack/react-query";
 import { motion } from "framer-motion";
-import { Activity, CheckCircle2, FileText, List, ListTodo, Pin } from "lucide-react";
+import { Activity, Book, CheckCircle2, FileText, List, ListTodo, Pin, ScrollText } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import { useStaggeredEntrance } from "../../../hooks/useStaggeredEntrance";
@@ -15,6 +15,8 @@ import { ProjectHeader } from "../components/ProjectHeader";
 import { ProjectList } from "../components/ProjectList";
 import { DocsTab } from "../documents/DocsTab";
 import { projectKeys, useDeleteProject, useProjects, useUpdateProject } from "../hooks/useProjectQueries";
+import { KBTab } from "../kb/KBTab";
+import { RulesTab } from "../rules/RulesTab";
 import { useTaskCounts } from "../tasks/hooks";
 import { TasksTab } from "../tasks/TasksTab";
 import type { Project } from "../types";
@@ -214,6 +216,8 @@ export function ProjectsView({ className = "", "data-id": dataId }: ProjectsView
                   items={[
                     { id: "docs", label: "Docs", icon: <FileText className="w-4 h-4" /> },
                     { id: "tasks", label: "Tasks", icon: <ListTodo className="w-4 h-4" /> },
+                    { id: "rules", label: "Rules", icon: <ScrollText className="w-4 h-4" /> },
+                    { id: "kb", label: "KB", icon: <Book className="w-4 h-4" /> },
                   ]}
                   activeSection={activeTab}
                   onSectionClick={(id) => setActiveTab(id as string)}
@@ -230,6 +234,8 @@ export function ProjectsView({ className = "", "data-id": dataId }: ProjectsView
               <div>
                 {activeTab === "docs" && <DocsTab project={selectedProject} />}
                 {activeTab === "tasks" && <TasksTab projectId={selectedProject.id} />}
+                {activeTab === "rules" && <RulesTab projectId={selectedProject.id} />}
+                {activeTab === "kb" && <KBTab projectId={selectedProject.id} />}
               </div>
             </motion.div>
           )}
@@ -293,6 +299,8 @@ export function ProjectsView({ className = "", "data-id": dataId }: ProjectsView
                       items={[
                         { id: "docs", label: "Docs", icon: <FileText className="w-4 h-4" /> },
                         { id: "tasks", label: "Tasks", icon: <ListTodo className="w-4 h-4" /> },
+                        { id: "rules", label: "Rules", icon: <ScrollText className="w-4 h-4" /> },
+                        { id: "kb", label: "KB", icon: <Book className="w-4 h-4" /> },
                       ]}
                       activeSection={activeTab}
                       onSectionClick={(id) => setActiveTab(id as string)}
@@ -310,6 +318,8 @@ export function ProjectsView({ className = "", "data-id": dataId }: ProjectsView
                 <div>
                   {activeTab === "docs" && <DocsTab project={selectedProject} />}
                   {activeTab === "tasks" && <TasksTab projectId={selectedProject.id} />}
+                  {activeTab === "rules" && <RulesTab projectId={selectedProject.id} />}
+                  {activeTab === "kb" && <KBTab projectId={selectedProject.id} />}
                 </div>
               </>
             )}

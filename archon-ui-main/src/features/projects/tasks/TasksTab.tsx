@@ -2,14 +2,16 @@ import { LayoutGrid, Plus, Table } from "lucide-react";
 import { useCallback, useState } from "react";
 import { DndProvider } from "react-dnd";
 import { HTML5Backend } from "react-dnd-html5-backend";
+import { NotificationBanner } from "../../shared/components/NotificationBanner";
+import { useNotifications } from "../../shared/hooks/useNotifications";
 import { DeleteConfirmModal } from "../../ui/components/DeleteConfirmModal";
 import { Button, Card } from "../../ui/primitives";
 import { cn, glassmorphism } from "../../ui/primitives/styles";
 import { TaskEditModal } from "./components/TaskEditModal";
-import { useDeleteTask, useProjectTasks, useUpdateTask } from "./hooks";
+import { useDeleteTask, useProjectTasks, useTaskEstimates, useUpdateTask } from "./hooks";
 import type { Task } from "./types";
 import { getReorderTaskOrder, ORDER_INCREMENT, validateTaskOrder } from "./utils";
-import { BoardView, TableView } from "./views";
+import { BoardView, SprintDashboard, TableView } from "./views";
 
 interface TasksTabProps {
   projectId: string;
@@ -24,6 +26,10 @@ export const TasksTab = ({ projectId }: TasksTabProps) => {
 
   // Fetch tasks using TanStack Query
   const { data: tasks = [], isLoading: isLoadingTasks } = useProjectTasks(projectId);
+  const { data: estimatesData } = useTaskEstimates(projectId);
+
+  // Browser notifications for tasks reaching "review" status
+  const { showBanner, requestPermission, dismissBanner } = useNotifications(tasks as Task[]);
 
   // Mutations for task operations
   const updateTaskMutation = useUpdateTask(projectId);
@@ -174,11 +180,12 @@ export const TasksTab = ({ projectId }: TasksTabProps) => {
   }
 
   return (
-    <DndProvider backend={HTML5Backend}>
-      <div className="min-h-[70vh] relative">
-        {/* Main content - Table or Board view */}
-        <div className="relative h-[calc(100vh-220px)] overflow-auto">
-          {viewMode === "table" ? (
+    <div className="min-h-[70vh] relative">
+      {showBanner && <NotificationBanner onEnable={requestPermission} onDismiss={dismissBanner} />}
+      {/* Main content - Table or Board view */}
+      <div className="relative h-[calc(100vh-220px)] overflow-auto">
+        {viewMode === "table" ? (
+          <DndProvider backend={HTML5Backend}>
             <TableView
               tasks={tasks as Task[]}
               projectId={projectId}
@@ -188,36 +195,42 @@ export const TasksTab = ({ projectId }: TasksTabProps) => {
               onTaskReorder={handleTaskReorder}
               onTaskUpdate={updateTaskInline}
             />
-          ) : (
-            <BoardView
-              tasks={tasks as Task[]}
-              projectId={projectId}
-              onTaskMove={moveTask}
-              onTaskReorder={handleTaskReorder}
-              onTaskEdit={openEditModal}
-              onTaskDelete={openDeleteModal}
-            />
-          )}
-        </div>
-
-        {/* Fixed View Controls using Radix primitives */}
-        <ViewControls viewMode={viewMode} onViewChange={setViewMode} onAddTask={openCreateModal} />
-
-        {/* Edit/Create Task Modal */}
-        <TaskEditModal isModalOpen={isModalOpen} editingTask={editingTask} projectId={projectId} onClose={closeModal} />
-
-        {/* Delete Task Modal */}
-        <DeleteConfirmModal
-          open={showDeleteModal}
-          itemName={taskToDelete?.title || ""}
-          onConfirm={confirmDeleteTask}
-          onCancel={closeDeleteModal}
-          onOpenChange={setShowDeleteModal}
-          type="task"
-          size="compact"
-        />
+          </DndProvider>
+        ) : (
+          <BoardView
+            tasks={tasks as Task[]}
+            projectId={projectId}
+            onTaskMove={moveTask}
+            onTaskReorder={handleTaskReorder}
+            onTaskEdit={openEditModal}
+            onTaskDelete={openDeleteModal}
+            estimates={estimatesData?.estimates}
+          />
+        )}
       </div>
-    </DndProvider>
+
+      {/* Cost Trend section */}
+      <div className="mt-4 pb-20">
+        <SprintDashboard projectId={projectId} />
+      </div>
+
+      {/* Fixed View Controls using Radix primitives */}
+      <ViewControls viewMode={viewMode} onViewChange={setViewMode} onAddTask={openCreateModal} />
+
+      {/* Edit/Create Task Modal */}
+      <TaskEditModal isModalOpen={isModalOpen} editingTask={editingTask} projectId={projectId} onClose={closeModal} />
+
+      {/* Delete Task Modal */}
+      <DeleteConfirmModal
+        open={showDeleteModal}
+        itemName={taskToDelete?.title || ""}
+        onConfirm={confirmDeleteTask}
+        onCancel={closeDeleteModal}
+        onOpenChange={setShowDeleteModal}
+        type="task"
+        size="compact"
+      />
+    </div>
   );
 };
 

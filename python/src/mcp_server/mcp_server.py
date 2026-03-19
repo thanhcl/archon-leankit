@@ -548,6 +548,23 @@ def register_modules():
         logger.error(f"✗ Failed to register feature tools: {e}")
         logger.error(traceback.format_exc())
 
+    # GitHub Integration Tools
+    try:
+        from src.mcp_server.features.github import register_github_tools
+
+        register_github_tools(mcp)
+        modules_registered += 1
+        logger.info("✓ GitHub tools registered")
+    except ImportError as e:
+        logger.warning(f"⚠ GitHub tools module not available (optional): {e}")
+    except (SyntaxError, NameError, AttributeError) as e:
+        logger.error(f"✗ Code error in GitHub tools - MUST FIX: {e}")
+        logger.error(traceback.format_exc())
+        raise
+    except Exception as e:
+        logger.error(f"✗ Failed to register GitHub tools: {e}")
+        logger.error(traceback.format_exc())
+
     logger.info(f"📦 Total modules registered: {modules_registered}")
 
     if modules_registered == 0:

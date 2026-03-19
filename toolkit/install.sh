@@ -59,6 +59,21 @@ echo "  ✓ PRP templates copied"
 sed "s/__SOURCE_APP__/$SOURCE_APP/g" "$TOOLKIT_DIR/settings.template.json" > "$PROJECT_PATH/.claude/settings.json"
 echo "  ✓ settings.json generated (source-app: $SOURCE_APP)"
 
+# Create .claude symlinks in common subdirectories so CC finds hooks when running from subdirs
+for subdir in python archon-ui-main; do
+  target="$PROJECT_PATH/$subdir"
+  if [ -d "$target" ]; then
+    link="$target/.claude"
+    if [ -L "$link" ]; then
+      rm "$link"
+    elif [ -d "$link" ]; then
+      rm -rf "$link"
+    fi
+    ln -s ../.claude "$link"
+    echo "  ✓ Symlink created: $subdir/.claude -> ../.claude"
+  fi
+done
+
 echo ""
 echo "✅ Toolkit installed successfully!"
 echo ""

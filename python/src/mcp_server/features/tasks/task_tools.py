@@ -92,6 +92,12 @@ def register_task_tools(mcp: FastMCP):
         include_closed: bool = True,
         page: int = 1,
         per_page: int = DEFAULT_PAGE_SIZE,
+        task_type: str | None = None,
+        phase: str | None = None,
+        module: str | None = None,
+        sprint: str | None = None,
+        feature: str | None = None,
+        parent_task_id: str | None = None,
     ) -> str:
         """
         Find and search tasks (consolidated: list + search + get).
@@ -108,6 +114,12 @@ def register_task_tools(mcp: FastMCP):
             include_closed: Include done/cancelled tasks in results
             page: Page number for pagination
             per_page: Items per page (default: 10)
+            task_type: Filter by type: bug, feature, improvement, docs, refactor, test
+            phase: Filter by roadmap phase: phase-1, phase-2, etc.
+            module: Filter by module: engine, virtual-office, archon-api, observability, toolkit
+            sprint: Filter by sprint: S1, S2, S3, etc.
+            feature: Filter by feature/epic grouping
+            parent_task_id: Filter subtasks of a parent task
 
         Returns:
             JSON array of tasks or single task (optimized payloads for lists)
@@ -150,6 +162,18 @@ def register_task_tools(mcp: FastMCP):
 
             if query:
                 params["q"] = query
+            if task_type:
+                params["task_type"] = task_type
+            if phase:
+                params["phase"] = phase
+            if module:
+                params["module"] = module
+            if sprint:
+                params["sprint"] = sprint
+            if feature:
+                params["feature"] = feature
+            if parent_task_id:
+                params["parent_task_id"] = parent_task_id
 
             if filter_by == "project" and filter_value:
                 url = urljoin(api_url, f"/api/projects/{filter_value}/tasks")
@@ -239,6 +263,12 @@ def register_task_tools(mcp: FastMCP):
         source_app: str | None = None,
         complexity: str | None = None,
         max_retries: int | None = None,
+        blocked_by: list[str] | None = None,
+        task_type: str | None = None,
+        phase: str | None = None,
+        module: str | None = None,
+        sprint: str | None = None,
+        tags: list[str] | None = None,
     ) -> str:
         """
         Manage tasks (consolidated: create/update/delete).
@@ -259,13 +289,19 @@ def register_task_tools(mcp: FastMCP):
             status: Lifecycle state (default: "draft" for new tasks)
             assignee: Agent/user executing the task (default: "User")
             task_order: Priority 0-100 (higher = more priority)
-            feature: Feature label for grouping
+            feature: Feature/epic label for grouping
             owner: Task owner (human who owns the outcome)
             acceptance_criteria: JSON array of acceptance criteria
             execution_prompt: Instructions for the executing agent
             source_app: Application that created this task
             complexity: "simple" or "complex" (affects routing after approval)
             max_retries: Maximum retry attempts (default: 3)
+            blocked_by: List of task UUIDs that must be done before this task can execute
+            task_type: Task type: bug, feature, improvement, docs, refactor, test
+            phase: Roadmap phase: phase-1, phase-2, etc.
+            module: Module/area: engine, virtual-office, archon-api, observability, toolkit
+            sprint: Sprint assignment: S1, S2, S3, etc.
+            tags: Controlled labels for categorization
 
         Examples:
           manage_task("create", project_id="p-1", title="Research patterns", complexity="simple")
@@ -313,6 +349,22 @@ def register_task_tools(mcp: FastMCP):
                         create_data["max_retries"] = max_retries
                     if status is not None:
                         create_data["status"] = status
+                    if blocked_by is not None:
+                        create_data["blocked_by"] = blocked_by
+                    if task_type is not None:
+                        create_data["task_type"] = task_type
+                    if phase is not None:
+                        create_data["phase"] = phase
+                    if module is not None:
+                        create_data["module"] = module
+                    if sprint is not None:
+                        create_data["sprint"] = sprint
+                    if tags is not None:
+                        create_data["tags"] = tags
+
+                    # Auto-set ownership tracking for MCP-created tasks
+                    create_data["created_by"] = "owner"
+                    create_data["created_from"] = "mcp"
 
                     response = await client.post(
                         urljoin(api_url, "/api/tasks"),
@@ -368,6 +420,18 @@ def register_task_tools(mcp: FastMCP):
                         update_fields["complexity"] = complexity
                     if max_retries is not None:
                         update_fields["max_retries"] = max_retries
+                    if blocked_by is not None:
+                        update_fields["blocked_by"] = blocked_by
+                    if task_type is not None:
+                        update_fields["task_type"] = task_type
+                    if phase is not None:
+                        update_fields["phase"] = phase
+                    if module is not None:
+                        update_fields["module"] = module
+                    if sprint is not None:
+                        update_fields["sprint"] = sprint
+                    if tags is not None:
+                        update_fields["tags"] = tags
 
                     if not update_fields:
                         return MCPErrorFormatter.format_error(
@@ -431,6 +495,128 @@ def register_task_tools(mcp: FastMCP):
         except Exception as e:
             logger.error(f"Error managing task ({action}): {e}", exc_info=True)
             return MCPErrorFormatter.from_exception(e, f"{action} task")
+
+    @mcp.tool()
+    async def generate_tasks(
+        ctx: Context,
+        feature_description: str,
+        project_id: str | None = None,
+        auto_create: bool = False,
+    ) -> str:
+        """
+        Generate a task breakdown from a feature description using LLM.
+
+        Analyzes the feature description to identify components, layers, and concerns,
+        then produces structured subtasks with acceptance criteria and dependencies.
+
+        Args:
+            feature_description: The feature description text to analyze (min 10 chars).
+                Be detailed — include technical context, target architecture, and constraints.
+            project_id: Project UUID to associate tasks with (optional for preview, required for auto_create).
+            auto_create: If True, automatically create the generated tasks in the project.
+                If False (default), returns the generated tasks for review without creating them.
+
+        Returns:
+            JSON with generated tasks array. Each task includes:
+            - title, description, feature, complexity, priority, task_order
+            - acceptance_criteria: [{description, completed}]
+            - dependencies: [prerequisite task titles]
+
+        Examples:
+            generate_tasks(feature_description="Add user authentication with JWT tokens, \
+login/register endpoints, password hashing, and role-based access control")
+
+            generate_tasks(feature_description="...", project_id="p-1", auto_create=True)
+        """
+        try:
+            api_url = get_api_url()
+            timeout = get_default_timeout()
+
+            # Call the generate endpoint
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                response = await client.post(
+                    urljoin(api_url, "/api/tasks/generate"),
+                    json={
+                        "feature_description": feature_description,
+                        "project_id": project_id,
+                    },
+                )
+
+                if response.status_code != 200:
+                    return MCPErrorFormatter.from_http_error(response, "generate tasks")
+
+                result = response.json()
+                tasks = result.get("tasks", [])
+
+                if not tasks:
+                    return json.dumps({
+                        "success": False,
+                        "error": "No tasks were generated",
+                    })
+
+                # If auto_create, create each task via the API
+                created_tasks = []
+                create_errors = []
+                if auto_create and project_id:
+                    for task in tasks:
+                        create_data: dict[str, Any] = {
+                            "project_id": project_id,
+                            "title": task["title"],
+                            "description": task.get("description", ""),
+                            "feature": task.get("feature"),
+                            "complexity": task.get("complexity", "simple"),
+                            "priority": task.get("priority", "medium"),
+                            "task_order": task.get("task_order", 0),
+                            "acceptance_criteria": task.get("acceptance_criteria"),
+                            "status": "draft",
+                            "assignee": "User",
+                            "source_app": "task-generator",
+                            "sources": [],
+                            "code_examples": [],
+                        }
+
+                        create_response = await client.post(
+                            urljoin(api_url, "/api/tasks"),
+                            json=create_data,
+                        )
+
+                        if create_response.status_code == 200:
+                            created = create_response.json().get("task", {})
+                            created_tasks.append(optimize_task_response(created))
+                        else:
+                            create_errors.append({
+                                "title": task["title"],
+                                "error": create_response.text[:200],
+                            })
+
+                    response_data: dict[str, Any] = {
+                        "success": True,
+                        "created_count": len(created_tasks),
+                        "tasks": created_tasks,
+                        "message": f"Created {len(created_tasks)} tasks in project {project_id}",
+                    }
+                    if create_errors:
+                        response_data["create_errors"] = create_errors
+                    return json.dumps(response_data)
+
+                # Preview mode: return generated tasks without creating
+                return json.dumps({
+                    "success": True,
+                    "generated_count": len(tasks),
+                    "tasks": tasks,
+                    "message": (
+                        f"Generated {len(tasks)} tasks. "
+                        "Set auto_create=True with a project_id to create them."
+                    ),
+                    **({"validation_warnings": result["validation_warnings"]}
+                       if "validation_warnings" in result else {}),
+                })
+
+        except httpx.RequestError as e:
+            return MCPErrorFormatter.from_exception(e, "generate tasks")
+        except Exception as e:
+            logger.error(f"Error generating tasks: {e}", exc_info=True)
+            return MCPErrorFormatter.from_exception(e, "generate tasks")
 
     @mcp.tool()
     async def transition_task(

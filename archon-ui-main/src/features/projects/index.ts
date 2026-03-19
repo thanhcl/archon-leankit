@@ -11,9 +11,9 @@
 // Components
 export * from "./components";
 export * from "./documents";
-
 // Hooks
 export * from "./hooks";
+export * from "./rules";
 
 // Sub-features
 export * from "./tasks";

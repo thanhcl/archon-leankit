@@ -2,7 +2,8 @@
 Claude Code Spawner for LeanKit V3 Task Engine.
 
 Spawns Claude Code CLI sessions in subprocess, optionally
-inside git worktrees for isolation.
+inside git worktrees for isolation. Supports real-time
+streaming of CC JSON output lines via callback.
 
 Usage:
     spawner = CCSpawner()
@@ -14,6 +15,7 @@ import json
 import re
 import subprocess
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -21,6 +23,9 @@ from typing import Any
 from ...config.logfire_config import get_logger
 
 logger = get_logger(__name__)
+
+# Type alias for stream event callback: (task_id, parsed_event) -> None
+StreamCallback = Callable[[str, dict[str, Any]], Any]
 
 
 @dataclass
@@ -44,6 +49,14 @@ class ProjectConfig:
     build_command: str = "pnpm build && pnpm test"
     isolation: str = "shared"  # "shared" | "git-worktree"
     repository_url: str | None = None
+    force_model: str | None = None  # Override model selection (e.g. "claude-opus-4-6")
+
+
+# Model routing constants
+MODEL_OPUS = "claude-opus-4-6"
+MODEL_SONNET = "claude-sonnet-4-6"
+MODEL_HAIKU = "claude-haiku-4-5-20251001"
+MODEL_DEFAULT = MODEL_SONNET
 
 
 # Regex patterns for structured output parsing
@@ -63,6 +76,10 @@ _LEARNINGS_RE = re.compile(r"LEARNINGS:\s*(\[.*?\])", re.IGNORECASE | re.DOTALL)
 
 # Code patterns — captures JSON array
 _CODE_PATTERNS_RE = re.compile(r"CODE_PATTERNS:\s*(\[.*?\])", re.IGNORECASE | re.DOTALL)
+
+# Code review verdict and findings (from independent reviewer CC session)
+_CODE_REVIEW_VERDICT_RE = re.compile(r"CODE_REVIEW_VERDICT:\s*(APPROVE|REQUEST_CHANGES)", re.IGNORECASE)
+_CODE_REVIEW_FINDINGS_RE = re.compile(r"CODE_REVIEW_FINDINGS:\s*(\[.*?\])", re.IGNORECASE | re.DOTALL)
 
 
 class CCSpawner:
@@ -173,10 +190,44 @@ class CCSpawner:
         return True, None
 
     # ------------------------------------------------------------------
+    # Model routing
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def select_model(
+        task: dict[str, Any] | None = None,
+        force_model: str | None = None,
+    ) -> str:
+        """Select the appropriate Claude model based on task complexity and priority.
+
+        Routing rules:
+            1. force_model (project config override) → use as-is
+            2. complexity=complex OR priority=high/critical → Opus
+            3. complexity=simple AND priority=low → Haiku
+            4. Default (medium complexity) → Sonnet
+        """
+        if force_model:
+            return force_model
+
+        if not task:
+            return MODEL_DEFAULT
+
+        complexity = (task.get("complexity") or "medium").lower()
+        priority = (task.get("priority") or "medium").lower()
+
+        if complexity == "complex" or priority in ("high", "critical"):
+            return MODEL_OPUS
+
+        if complexity == "simple" and priority == "low":
+            return MODEL_HAIKU
+
+        return MODEL_DEFAULT
+
+    # ------------------------------------------------------------------
     # Claude Code CLI execution
     # ------------------------------------------------------------------
 
-    def _build_command(self, prompt: str) -> tuple[str, str]:
+    def _build_command(self, prompt: str, model: str | None = None) -> tuple[str, str]:
         """Build the CC CLI command and return (command, prompt_for_stdin).
 
         Uses --print mode with stdin prompt delivery.
@@ -188,6 +239,9 @@ class CCSpawner:
             "--dangerously-skip-permissions",
         ]
 
+        if model:
+            parts.extend(["--model", model])
+
         return " ".join(parts), prompt
 
     async def spawn(
@@ -196,6 +250,8 @@ class CCSpawner:
         prompt: str,
         config: ProjectConfig,
         timeout: int | None = None,
+        task: dict[str, Any] | None = None,
+        on_stream_event: StreamCallback | None = None,
     ) -> CCExecutionResult:
         """Spawn a Claude Code CLI session for a task.
 
@@ -204,9 +260,55 @@ class CCSpawner:
             prompt: Complete execution prompt.
             config: Project configuration.
             timeout: Override default timeout in seconds.
+            task: Task dict for model routing (complexity/priority fields).
+            on_stream_event: Callback fired for each parsed JSON line from CC stdout.
 
         Returns:
             CCExecutionResult with parsed output.
+        """
+        selected_model = self.select_model(task=task, force_model=config.force_model)
+
+        result = await self._spawn_with_model(
+            task_id=task_id,
+            prompt=prompt,
+            config=config,
+            model=selected_model,
+            timeout=timeout,
+            on_stream_event=on_stream_event,
+        )
+
+        # Fallback: if non-Opus model failed, retry with Opus
+        if not result.success and selected_model != MODEL_OPUS:
+            logger.warning(
+                f"Model {selected_model} failed, retrying with {MODEL_OPUS} | task_id={task_id}"
+            )
+            fallback_result = await self._spawn_with_model(
+                task_id=task_id,
+                prompt=prompt,
+                config=config,
+                model=MODEL_OPUS,
+                timeout=timeout,
+                on_stream_event=on_stream_event,
+            )
+            fallback_result.parsed["fallback_from"] = selected_model
+            fallback_result.parsed["fallback_to"] = MODEL_OPUS
+            return fallback_result
+
+        return result
+
+    async def _spawn_with_model(
+        self,
+        task_id: str,
+        prompt: str,
+        config: ProjectConfig,
+        model: str,
+        timeout: int | None = None,
+        on_stream_event: StreamCallback | None = None,
+    ) -> CCExecutionResult:
+        """Execute a CC spawn with a specific model.
+
+        Reads stdout line-by-line for real-time streaming of CC JSON output.
+        Each JSON line is parsed and forwarded via on_stream_event callback.
         """
         effective_timeout = timeout or self.default_timeout
 
@@ -224,10 +326,17 @@ class CCSpawner:
                 )
             cwd = wt_path
 
-        command, stdin_prompt = self._build_command(prompt)
+        command, stdin_prompt = self._build_command(prompt, model=model)
+
+        # Calculate estimated cost savings vs always using Opus
+        cost_note = ""
+        if model == MODEL_SONNET:
+            cost_note = " (cost: ~3x cheaper than Opus)"
+        elif model == MODEL_HAIKU:
+            cost_note = " (cost: ~12x cheaper than Opus)"
 
         logger.info(
-            f"Spawning CC session | task_id={task_id} | "
+            f"Spawning CC session | task_id={task_id} | model={model}{cost_note} | "
             f"timeout={effective_timeout}s | cwd={cwd}"
         )
 
@@ -245,10 +354,27 @@ class CCSpawner:
             self._running[task_id] = process
 
             try:
-                stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                    process.communicate(input=stdin_prompt.encode()),
-                    timeout=effective_timeout,
+                # Write prompt to stdin, then close stdin to signal EOF
+                if process.stdin:
+                    process.stdin.write(stdin_prompt.encode())
+                    await process.stdin.drain()
+                    process.stdin.close()
+
+                # Read stdout line-by-line for real-time streaming
+                stdout_lines: list[str] = []
+                stdout_task = asyncio.create_task(
+                    self._stream_stdout(process, task_id, stdout_lines, on_stream_event)
                 )
+
+                # Read stderr concurrently
+                stderr_task = asyncio.create_task(self._read_stderr(process))
+
+                # Wait for process to complete with timeout
+                await asyncio.wait_for(process.wait(), timeout=effective_timeout)
+                # Ensure stdout/stderr readers finish
+                await stdout_task
+                stderr_text = await stderr_task
+
             except TimeoutError:
                 await self.kill(task_id)
                 duration = time.time() - start_time
@@ -263,15 +389,15 @@ class CCSpawner:
                 )
 
             duration = time.time() - start_time
-            stdout_text = stdout_bytes.decode() if stdout_bytes else ""
-            stderr_text = stderr_bytes.decode() if stderr_bytes else ""
+            stdout_text = "\n".join(stdout_lines)
             exit_code = process.returncode or 0
             success = exit_code == 0
 
             parsed = self.parse_result(stdout_text)
+            parsed["model_used"] = model
 
             logger.info(
-                f"CC session completed | task_id={task_id} | "
+                f"CC session completed | task_id={task_id} | model={model} | "
                 f"exit_code={exit_code} | duration={duration:.1f}s | "
                 f"result={parsed.get('result', 'unknown')}"
             )
@@ -297,6 +423,122 @@ class CCSpawner:
             )
         finally:
             self._running.pop(task_id, None)
+
+    async def _stream_stdout(
+        self,
+        process: asyncio.subprocess.Process,
+        task_id: str,
+        stdout_lines: list[str],
+        on_stream_event: StreamCallback | None,
+    ) -> None:
+        """Read stdout line-by-line, parse JSON lines, and fire stream callbacks."""
+        if not process.stdout:
+            return
+
+        while True:
+            line_bytes = await process.stdout.readline()
+            if not line_bytes:
+                break
+
+            line = line_bytes.decode().rstrip("\n")
+            stdout_lines.append(line)
+
+            if not on_stream_event or not line.strip():
+                continue
+
+            parsed_event = self.parse_stream_line(line)
+            if parsed_event:
+                try:
+                    result = on_stream_event(task_id, parsed_event)
+                    # Support async callbacks
+                    if asyncio.iscoroutine(result):
+                        await result
+                except Exception as e:
+                    logger.debug(f"Stream callback error (non-fatal): {e}")
+
+    @staticmethod
+    async def _read_stderr(process: asyncio.subprocess.Process) -> str:
+        """Read all stderr content."""
+        if not process.stderr:
+            return ""
+        data = await process.stderr.read()
+        return data.decode() if data else ""
+
+    @staticmethod
+    def parse_stream_line(line: str) -> dict[str, Any] | None:
+        """Parse a single JSON line from CC --output-format json stdout.
+
+        Extracts the event type and relevant fields:
+        - type=assistant → message text
+        - type=tool_use → tool name + args summary
+        - type=tool_result → output summary (truncated 200 chars)
+        - type=thinking → thinking text (truncated 300 chars)
+
+        Returns None for unparseable or irrelevant lines.
+        """
+        try:
+            data = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            return None
+
+        if not isinstance(data, dict):
+            return None
+
+        line_type = data.get("type", "")
+
+        if line_type == "assistant":
+            # Extract message content
+            message = ""
+            content = data.get("message", {}).get("content", [])
+            if isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        message = block.get("text", "")
+                        break
+            elif isinstance(content, str):
+                message = content
+            if not message:
+                message = data.get("message", {}).get("text", "")
+            return {"event": "assistant", "message": message[:500]} if message else None
+
+        if line_type == "tool_use":
+            tool_name = data.get("tool", {}).get("name", "") or data.get("name", "")
+            tool_input = data.get("tool", {}).get("input", {}) or data.get("input", {})
+            # Summarize args: file path if present, otherwise first key
+            args_summary = ""
+            if isinstance(tool_input, dict):
+                for key in ("file_path", "path", "command", "pattern", "query"):
+                    if key in tool_input:
+                        args_summary = str(tool_input[key])[:150]
+                        break
+                if not args_summary and tool_input:
+                    first_key = next(iter(tool_input))
+                    args_summary = f"{first_key}={str(tool_input[first_key])[:100]}"
+            return {
+                "event": "tool_use",
+                "tool_name": tool_name,
+                "args_summary": args_summary,
+            } if tool_name else None
+
+        if line_type == "tool_result":
+            output = data.get("content", "") or data.get("output", "")
+            if isinstance(output, list):
+                # Extract text from content blocks
+                texts = [b.get("text", "") for b in output if isinstance(b, dict) and b.get("type") == "text"]
+                output = "\n".join(texts)
+            return {
+                "event": "tool_result",
+                "output_summary": str(output)[:200],
+            }
+
+        if line_type == "thinking":
+            thinking = data.get("thinking", "") or data.get("text", "")
+            return {
+                "event": "thinking",
+                "message": str(thinking)[:300],
+            } if thinking else None
+
+        return None
 
     async def kill(self, task_id: str) -> None:
         """Force-kill a running CC process."""
@@ -386,6 +628,23 @@ class CCSpawner:
                 parsed["code_patterns"] = []
         else:
             parsed["code_patterns"] = []
+
+        # Code review verdict and findings (from reviewer sessions)
+        m = _CODE_REVIEW_VERDICT_RE.search(stdout)
+        if m:
+            parsed["code_review_verdict"] = m.group(1).upper()
+
+        m = _CODE_REVIEW_FINDINGS_RE.search(stdout)
+        if m:
+            try:
+                findings = json.loads(m.group(1))
+                if isinstance(findings, list):
+                    parsed["code_review_findings"] = findings
+            except json.JSONDecodeError:
+                logger.warning("Failed to parse CODE_REVIEW_FINDINGS JSON from CC output")
+                parsed["code_review_findings"] = []
+        elif "code_review_verdict" in parsed:
+            parsed["code_review_findings"] = []
 
         # If no structured block, try to extract a one-line summary from the
         # last non-empty line of stdout.

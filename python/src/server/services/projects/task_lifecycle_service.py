@@ -1,15 +1,16 @@
 """
 Task Lifecycle Service for LeanKit V3 Task Engine.
 
-Manages the 14-state lifecycle for tasks:
+Manages the 15-state lifecycle for tasks:
     draft → proposed → approved → planning → owner-qa → assigned →
-    executing → architect-review → review → done
+    executing → architect-review → code-review → review → done
 
 With branching paths:
-    failed → assigned (retry) | escalated
+    failed → assigned (retry) | escalated | on-hold
     escalated → assigned | on-hold | cancelled
-    on-hold → approved (resume)
+    on-hold → approved | assigned (resume)
     done, cancelled → terminal (no transitions out)
+    on-hold reachable from: approved, assigned, executing, architect-review, code-review, review, failed, escalated
 """
 
 from datetime import datetime
@@ -24,8 +25,8 @@ logger = get_logger(__name__)
 # All valid lifecycle states
 VALID_STATUSES = [
     "draft", "proposed", "approved", "planning", "owner-qa",
-    "assigned", "executing", "architect-review", "review",
-    "done", "failed", "escalated", "on-hold", "cancelled",
+    "assigned", "executing", "architect-review", "code-review",
+    "review", "done", "failed", "escalated", "on-hold", "cancelled",
 ]
 
 # Terminal states: no transitions allowed out of these
@@ -35,26 +36,36 @@ TERMINAL_STATES = {"done", "cancelled"}
 TRANSITION_RULES: dict[str, set[str]] = {
     "draft": {"proposed", "approved", "cancelled"},
     "proposed": {"approved", "cancelled"},
-    "approved": {"planning", "assigned", "cancelled"},
+    "approved": {"planning", "assigned", "on-hold", "cancelled"},
     "planning": {"owner-qa", "assigned", "cancelled"},
     "owner-qa": {"assigned", "cancelled"},
-    "assigned": {"executing", "cancelled"},
-    "executing": {"architect-review", "failed", "cancelled"},
-    "architect-review": {"review", "assigned", "escalated", "cancelled"},
-    "review": {"done", "assigned", "cancelled"},
-    "failed": {"assigned", "escalated", "cancelled"},
+    "assigned": {"executing", "on-hold", "cancelled"},
+    "executing": {"architect-review", "failed", "on-hold", "cancelled"},
+    "architect-review": {"code-review", "assigned", "escalated", "on-hold", "cancelled"},
+    "code-review": {"review", "assigned", "escalated", "on-hold", "cancelled"},
+    "review": {"done", "assigned", "on-hold", "cancelled"},
+    "failed": {"assigned", "escalated", "on-hold", "cancelled"},
     "escalated": {"assigned", "on-hold", "cancelled"},
-    "on-hold": {"approved", "cancelled"},
+    "on-hold": {"approved", "assigned", "cancelled"},
     # done and cancelled are terminal — no transitions out
 }
 
 # Transitions that require a reason field
 REASON_REQUIRED_TRANSITIONS: set[tuple[str, str]] = {
     ("architect-review", "assigned"),  # retry with feedback
+    ("code-review", "assigned"),       # code review requested changes
     ("review", "assigned"),            # owner reject with feedback
     ("executing", "failed"),           # failure reason
     ("failed", "escalated"),           # escalation reason
     ("architect-review", "escalated"), # escalation reason
+    ("code-review", "escalated"),      # code review escalation
+    ("approved", "on-hold"),            # hold reason
+    ("assigned", "on-hold"),            # hold reason
+    ("executing", "on-hold"),           # hold reason
+    ("architect-review", "on-hold"),    # hold reason
+    ("code-review", "on-hold"),         # hold reason
+    ("review", "on-hold"),             # hold reason
+    ("failed", "on-hold"),             # hold reason
     ("escalated", "on-hold"),          # hold reason
     # Cancellation always requires a reason
     ("draft", "cancelled"),
@@ -65,6 +76,7 @@ REASON_REQUIRED_TRANSITIONS: set[tuple[str, str]] = {
     ("assigned", "cancelled"),
     ("executing", "cancelled"),
     ("architect-review", "cancelled"),
+    ("code-review", "cancelled"),
     ("review", "cancelled"),
     ("failed", "cancelled"),
     ("escalated", "cancelled"),
@@ -194,16 +206,18 @@ class TaskLifecycleService:
                 update_data["hold_reason"] = reason
             elif new_status == "cancelled":
                 update_data["rejection_reason"] = reason
-            elif new_status == "assigned" and current_status in ("architect-review", "review"):
+            elif new_status == "assigned" and current_status in ("architect-review", "code-review", "review"):
                 # Retry: increment retry_count and store feedback
                 update_data["retry_count"] = (task.get("retry_count") or 0) + 1
                 update_data["rejection_reason"] = reason
+                if current_status == "code-review":
+                    update_data["review_cycle"] = (task.get("review_cycle") or 0) + 1
             elif new_status == "assigned" and current_status == "failed":
                 # Retry after failure
                 update_data["retry_count"] = (task.get("retry_count") or 0) + 1
             elif new_status == "escalated":
                 update_data["rejection_reason"] = reason
-            elif new_status == "approved" and current_status == "on-hold":
+            elif current_status == "on-hold" and new_status in ("approved", "assigned"):
                 # Resume from hold: clear hold reason
                 update_data["hold_reason"] = None
 

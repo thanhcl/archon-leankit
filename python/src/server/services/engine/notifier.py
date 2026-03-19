@@ -9,7 +9,9 @@ Usage:
     await notifier.emit("task_started", task_id="t-1", data={...})
 """
 
+import json
 import os
+import urllib.request
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -77,8 +79,12 @@ EVENT_HEALTH_ALERT = "health_alert"
 EVENT_LEARNING_PROMOTED = "learning_promoted"
 EVENT_LEARNING_PATTERN = "learning_pattern_detected"
 EVENT_PATTERN_PROMOTED = "code_pattern_promoted"
+EVENT_CODE_REVIEW_CHANGES = "code_review_changes_requested"
+EVENT_BUDGET_WARNING = "budget_warning"
+EVENT_BUDGET_EXCEEDED = "budget_exceeded"
+EVENT_AGENT_STATUS = "agent_status"
 
-_CRITICAL_EVENTS = frozenset({EVENT_TASK_ESCALATED, EVENT_TASK_FAILED, EVENT_HEALTH_ALERT})
+_CRITICAL_EVENTS = frozenset({EVENT_TASK_ESCALATED, EVENT_TASK_FAILED, EVENT_HEALTH_ALERT, EVENT_BUDGET_EXCEEDED})
 
 
 class Notifier:
@@ -114,7 +120,7 @@ class Notifier:
 
         # Fire to all channels concurrently (best-effort)
         await self._send_websocket(evt)
-        await self._send_observability(evt)
+        self._send_to_observability(evt)
 
         if self.config.telegram_bot_token and self.config.telegram_chat_id:
             if not self.config.telegram_only_critical or is_critical:
@@ -184,6 +190,42 @@ class Notifier:
             "usage_count": pattern.get("usage_count"),
         })
 
+    async def on_code_review_changes_requested(self, task_id: str, review: dict[str, Any]) -> None:
+        await self.emit(EVENT_CODE_REVIEW_CHANGES, task_id, {
+            "verdict": review.get("verdict"),
+            "review_cycle": review.get("review_cycle"),
+            "findings_count": len(review.get("findings", [])),
+        })
+
+    async def on_budget_warning(self, project_id: str, details: dict[str, Any]) -> None:
+        await self.emit(EVENT_BUDGET_WARNING, "", {
+            "project_id": project_id,
+            **details,
+        })
+
+    async def on_budget_exceeded(self, project_id: str, reason: str) -> None:
+        await self.emit(EVENT_BUDGET_EXCEEDED, "", {
+            "project_id": project_id,
+            "reason": reason,
+        }, is_critical=True)
+
+    async def on_agent_status(self, task_id: str, agent_id: str, stream_event: dict) -> None:
+        """Forward a real-time CC stream event as an agent_status notification.
+
+        Args:
+            task_id: Task being executed.
+            agent_id: Agent/session identifier.
+            stream_event: Parsed stream event from CCSpawner.parse_stream_line().
+        """
+        await self.emit(EVENT_AGENT_STATUS, task_id, {
+            "agent_id": agent_id,
+            "event": stream_event.get("event", "unknown"),
+            "message": stream_event.get("message", ""),
+            "tool_name": stream_event.get("tool_name", ""),
+            "args_summary": stream_event.get("args_summary", ""),
+            "output_summary": stream_event.get("output_summary", ""),
+        })
+
     # ── Channel implementations ───────────────────────────────────────
 
     async def _send_websocket(self, evt: TaskEvent) -> None:
@@ -196,8 +238,8 @@ class Notifier:
         except Exception as e:
             logger.debug(f"WebSocket send failed (non-fatal): {e}")
 
-    async def _send_observability(self, evt: TaskEvent) -> None:
-        """Send UnifiedEvent to Observability server. Fail-safe, never blocks engine."""
+    def _send_to_observability(self, evt: TaskEvent) -> None:
+        """Send UnifiedEvent to Observability server via urllib. Fail-safe, never blocks engine."""
         try:
             payload = {
                 "id": str(uuid.uuid4()),
@@ -209,8 +251,14 @@ class Notifier:
                 "taskId": evt.task_id,
                 "data": evt.data,
             }
-            async with httpx.AsyncClient(timeout=2) as client:
-                await client.post(self.config.observability_url, json=payload)
+            data = json.dumps(payload).encode("utf-8")
+            req = urllib.request.Request(
+                self.config.observability_url,
+                data=data,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            urllib.request.urlopen(req, timeout=2)
         except Exception as e:
             logger.debug(f"Observability send failed (non-fatal): {e}")
 

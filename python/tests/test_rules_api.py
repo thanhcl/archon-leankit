@@ -177,18 +177,56 @@ class TestRuleService:
         assert "No rules configured" in result["markdown"]
 
 
-# --- API Integration Tests ---
+# --- API Integration Tests (self-contained, no full server import) ---
 
 
 class TestRulesAPIEndpoints:
-    """Integration tests for the Rules API endpoints."""
+    """Integration tests for the Rules API endpoints using a minimal FastAPI app.
 
-    def test_list_rules_endpoint(self, client):
+    Patches _get_service at the module level to avoid importing
+    the full server dependency chain (openai, crawl4ai, etc.).
+    """
+
+    @pytest.fixture
+    def mock_svc_and_client(self):
+        """Create a minimal test client + mock service, bypassing heavy imports."""
+        import importlib.util
+        import sys
+        import types
+
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+
+        # Ensure parent packages exist in sys.modules without triggering __init__
+        for pkg in ["src", "src.server", "src.server.api_routes"]:
+            if pkg not in sys.modules:
+                sys.modules[pkg] = types.ModuleType(pkg)
+
+        # Load rules_api directly from file
+        spec = importlib.util.spec_from_file_location(
+            "src.server.api_routes.rules_api",
+            "src/server/api_routes/rules_api.py",
+        )
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+
+        # Replace _get_service with a mock
+        mock_svc = MagicMock()
+        mod._get_service = lambda: mock_svc
+
+        app = FastAPI()
+        app.include_router(mod.router)
+        client = TestClient(app)
+        yield mock_svc, client
+
+    def test_list_rules_endpoint(self, mock_svc_and_client):
+        mock_svc, client = mock_svc_and_client
+        mock_svc.list_rules.return_value = (True, {"rules": [], "total_count": 0})
         response = client.get("/api/rules")
         assert response.status_code == 200
 
-    def test_create_rule_endpoint(self, client, mock_supabase_client):
-        # Setup mock for insert
+    def test_create_rule_endpoint(self, mock_svc_and_client):
+        mock_svc, client = mock_svc_and_client
         rule_row = {
             "id": "new-rule",
             "section": "testing",
@@ -198,7 +236,7 @@ class TestRulesAPIEndpoints:
             "enabled": True,
             "project_id": None,
         }
-        mock_supabase_client.table.return_value.insert.return_value.execute.return_value.data = [rule_row]
+        mock_svc.create_rule.return_value = (True, {"rule": rule_row})
 
         response = client.post(
             "/api/rules",
@@ -208,54 +246,66 @@ class TestRulesAPIEndpoints:
         data = response.json()
         assert data["rule"]["section"] == "testing"
 
-    def test_get_rule_endpoint_not_found(self, client, mock_supabase_client):
-        mock_supabase_client.table.return_value.select.return_value.eq.return_value.execute.return_value.data = []
+    def test_get_rule_endpoint_not_found(self, mock_svc_and_client):
+        mock_svc, client = mock_svc_and_client
+        mock_svc.get_rule.return_value = (False, {"error": "Rule not-found not found"})
 
         response = client.get("/api/rules/nonexistent-id")
         assert response.status_code == 404
 
-    def test_update_rule_endpoint(self, client, mock_supabase_client):
+    def test_update_rule_endpoint(self, mock_svc_and_client):
+        mock_svc, client = mock_svc_and_client
         updated_row = {"id": "rule-1", "section": "security", "rule_text": "Updated", "enabled": True}
-        mock_supabase_client.table.return_value.update.return_value.eq.return_value.execute.return_value.data = [
-            updated_row
-        ]
+        mock_svc.update_rule.return_value = (True, {"rule": updated_row})
 
         response = client.put("/api/rules/rule-1", json={"rule_text": "Updated"})
         assert response.status_code == 200
 
-    def test_update_rule_no_fields(self, client):
+    def test_update_rule_no_fields(self, mock_svc_and_client):
+        _, client = mock_svc_and_client
         response = client.put("/api/rules/rule-1", json={})
         assert response.status_code == 422
 
-    def test_delete_rule_endpoint(self, client, mock_supabase_client):
-        mock_supabase_client.table.return_value.delete.return_value.eq.return_value.execute.return_value.data = [
-            {"id": "rule-1"}
-        ]
+    def test_delete_rule_endpoint(self, mock_svc_and_client):
+        mock_svc, client = mock_svc_and_client
+        mock_svc.delete_rule.return_value = (True, {"message": "Rule rule-1 deleted"})
 
         response = client.delete("/api/rules/rule-1")
         assert response.status_code == 200
 
-    def test_generate_claude_md_endpoint(self, client, mock_supabase_client):
-        rules = [
+    def test_generate_claude_md_endpoint(self, mock_svc_and_client):
+        mock_svc, client = mock_svc_and_client
+        mock_svc.generate_claude_md.return_value = (
+            True,
             {
-                "id": "r1",
-                "section": "validation",
-                "rule_text": "## Validate\nDo it.",
-                "priority": 1,
-                "enabled": True,
-                "project_id": None,
-            }
-        ]
-        mock_query = MagicMock()
-        mock_query.execute.return_value.data = rules
-        mock_query.eq.return_value = mock_query
-        mock_query.is_.return_value = mock_query
-        mock_query.or_.return_value = mock_query
-        mock_query.order.return_value = mock_query
-        mock_supabase_client.table.return_value.select.return_value = mock_query
+                "markdown": "# CLAUDE.md\n\n<!-- Auto-generated -->\n\n## Validate\nDo it.\n",
+                "rule_count": 1,
+                "sections": ["validation"],
+            },
+        )
 
         response = client.get("/api/rules/generate-claude-md/proj-123")
         assert response.status_code == 200
         data = response.json()
         assert "markdown" in data
         assert "# CLAUDE.md" in data["markdown"]
+
+    def test_create_rule_service_error(self, mock_svc_and_client):
+        mock_svc, client = mock_svc_and_client
+        mock_svc.create_rule.return_value = (False, {"error": "section and rule_text are required"})
+
+        response = client.post("/api/rules", json={"section": "", "rule_text": ""})
+        assert response.status_code == 400
+
+    def test_list_rules_with_filters(self, mock_svc_and_client):
+        mock_svc, client = mock_svc_and_client
+        mock_svc.list_rules.return_value = (True, {"rules": [{"id": "r1"}], "total_count": 1})
+
+        response = client.get("/api/rules?project_id=proj-1&section=security&enabled_only=true")
+        assert response.status_code == 200
+        mock_svc.list_rules.assert_called_once_with(
+            project_id="proj-1",
+            section="security",
+            enabled_only=True,
+            include_global=True,
+        )

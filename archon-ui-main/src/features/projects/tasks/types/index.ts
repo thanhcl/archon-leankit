@@ -10,13 +10,20 @@ export type { UseTaskActionsReturn, UseTaskEditorReturn } from "./hooks";
 export type {
   Assignee,
   CommonAssignee,
+  CostStatusResponse,
   CreateTaskRequest,
   DatabaseTaskStatus,
+  PredictedVsActual,
+  SprintEntry,
+  SprintStatsResponse,
+  SprintStatsSummary,
   Task,
   TaskCodeExample,
   TaskCounts,
+  TaskEstimate,
   TaskPriority,
   TaskSource,
+  TaskTypeName,
   UpdateTaskRequest,
 } from "./task";
 

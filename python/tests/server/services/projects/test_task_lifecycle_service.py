@@ -210,6 +210,127 @@ class TestValidateTransition:
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Tests: on-hold reachable from all active states
+# ---------------------------------------------------------------------------
+
+# States that must allow → on-hold
+ON_HOLD_SOURCE_STATES = [
+    "approved", "assigned", "executing", "architect-review",
+    "review", "failed", "escalated",
+]
+
+
+class TestOnHoldFromAllActiveStates:
+    """Owner must be able to put a task on-hold from any active state."""
+
+    @pytest.mark.parametrize("state", ON_HOLD_SOURCE_STATES)
+    def test_on_hold_is_valid_transition(self, state):
+        allowed = TRANSITION_RULES.get(state, set())
+        assert "on-hold" in allowed, (
+            f"State '{state}' is missing 'on-hold' in TRANSITION_RULES. "
+            f"Current allowed: {sorted(allowed)}"
+        )
+
+    @pytest.mark.parametrize("state", ON_HOLD_SOURCE_STATES)
+    def test_validate_transition_allows_on_hold_with_reason(self, state):
+        service = TaskLifecycleService(supabase_client=MagicMock())
+        is_valid, error = service.validate_transition(state, "on-hold", reason="Waiting on dependency")
+        assert is_valid is True, f"Transition {state} → on-hold should be valid, got: {error}"
+
+    @pytest.mark.parametrize("state", ON_HOLD_SOURCE_STATES)
+    def test_on_hold_requires_reason(self, state):
+        service = TaskLifecycleService(supabase_client=MagicMock())
+        is_valid, error = service.validate_transition(state, "on-hold", reason=None)
+        assert is_valid is False, f"Transition {state} → on-hold without reason should fail"
+        assert "requires a reason" in error
+
+
+class TestOnHoldResume:
+    """on-hold → assigned (resume) must work."""
+
+    def test_on_hold_to_assigned_valid(self):
+        service = TaskLifecycleService(supabase_client=MagicMock())
+        is_valid, error = service.validate_transition("on-hold", "assigned")
+        assert is_valid is True, f"on-hold → assigned should be valid, got: {error}"
+
+    def test_on_hold_to_approved_still_valid(self):
+        service = TaskLifecycleService(supabase_client=MagicMock())
+        is_valid, error = service.validate_transition("on-hold", "approved")
+        assert is_valid is True, f"on-hold → approved should still be valid, got: {error}"
+
+    @pytest.mark.asyncio
+    async def test_execute_on_hold_to_assigned_clears_hold_reason(self):
+        task = _make_task(status="on-hold", hold_reason="Blocked")
+        updated_task = _make_task(status="assigned")
+        client = _mock_client(select_data=[task], update_data=[updated_task])
+        service = TaskLifecycleService(supabase_client=client)
+
+        ok, result = await service.execute_transition(
+            "task-001", "assigned", changed_by="Owner"
+        )
+
+        assert ok is True
+        assert result["transition"]["from"] == "on-hold"
+        assert result["transition"]["to"] == "assigned"
+        update_call = client.table().update.call_args[0][0]
+        assert update_call["hold_reason"] is None
+
+
+class TestExecuteOnHoldFromActiveStates:
+    """Execute transitions to on-hold from various active states."""
+
+    @pytest.mark.asyncio
+    async def test_on_hold_from_executing(self):
+        task = _make_task(status="executing")
+        updated_task = _make_task(status="on-hold")
+        client = _mock_client(select_data=[task], update_data=[updated_task])
+        service = TaskLifecycleService(supabase_client=client)
+
+        ok, result = await service.execute_transition(
+            "task-001", "on-hold", changed_by="Owner", reason="Waiting for API access"
+        )
+
+        assert ok is True
+        assert result["transition"]["from"] == "executing"
+        assert result["transition"]["to"] == "on-hold"
+        update_call = client.table().update.call_args[0][0]
+        assert update_call["hold_reason"] == "Waiting for API access"
+
+    @pytest.mark.asyncio
+    async def test_on_hold_from_review(self):
+        task = _make_task(status="review")
+        updated_task = _make_task(status="on-hold")
+        client = _mock_client(select_data=[task], update_data=[updated_task])
+        service = TaskLifecycleService(supabase_client=client)
+
+        ok, result = await service.execute_transition(
+            "task-001", "on-hold", changed_by="Owner", reason="Reviewer unavailable"
+        )
+
+        assert ok is True
+        assert result["transition"]["to"] == "on-hold"
+
+    @pytest.mark.asyncio
+    async def test_on_hold_from_failed(self):
+        task = _make_task(status="failed")
+        updated_task = _make_task(status="on-hold")
+        client = _mock_client(select_data=[task], update_data=[updated_task])
+        service = TaskLifecycleService(supabase_client=client)
+
+        ok, result = await service.execute_transition(
+            "task-001", "on-hold", changed_by="Owner", reason="Investigating root cause"
+        )
+
+        assert ok is True
+        assert result["transition"]["to"] == "on-hold"
+
+
+# ---------------------------------------------------------------------------
+# Tests: get_valid_next_states
+# ---------------------------------------------------------------------------
+
+
 class TestGetValidNextStates:
     def test_terminal_returns_empty(self):
         service = TaskLifecycleService(supabase_client=MagicMock())

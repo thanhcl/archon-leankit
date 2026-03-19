@@ -482,6 +482,51 @@ class LearningProcessor:
         except Exception as e:
             return False, {"error": str(e)}
 
+    def get_relevant_learnings(
+        self,
+        project_id: str | None,
+        task_keywords: list[str] | None = None,
+        limit: int = 10,
+    ) -> list[dict[str, Any]]:
+        """Fetch relevant learnings for prompt injection.
+
+        Queries pending/promoted learnings for the project, optionally
+        filtered by keyword overlap with the current task title.
+        Returns top learnings ordered by recurrence_count descending.
+        """
+        try:
+            query = (
+                self._client.table(TABLE)
+                .select("*")
+                .in_("status", ["pending", "promoted"])
+            )
+            if project_id:
+                query = query.eq("project_id", project_id)
+            query = query.order("recurrence_count", desc=True).limit(limit * 3)
+            resp = query.execute()
+            results = resp.data or []
+
+            if not results:
+                return []
+
+            # Filter by keyword overlap if task keywords provided
+            if task_keywords:
+                task_words = {w.lower() for w in task_keywords if len(w) > 2}
+                if task_words:
+                    scored = []
+                    for learning in results:
+                        desc_words = set(_normalize(learning.get("description", "")).split())
+                        overlap = len(task_words & desc_words)
+                        scored.append((overlap, learning))
+                    # Sort by overlap desc, then by recurrence_count desc
+                    scored.sort(key=lambda x: (x[0], x[1].get("recurrence_count", 0)), reverse=True)
+                    results = [item for _, item in scored]
+
+            return results[:limit]
+        except Exception as e:
+            logger.error(f"Failed to fetch relevant learnings: {e}")
+            return []
+
     def get_relevant_patterns(
         self, project_id: str | None, limit: int = 5,
     ) -> list[dict[str, Any]]:

@@ -11,7 +11,8 @@ Modules:
 """
 
 from .architect_reviewer import ArchitectReviewer, ArchitectReviewResult, ReviewAction, ReviewConfig
-from .cc_spawner import CCExecutionResult, CCSpawner, ProjectConfig
+from .bug_task_creator import BugTaskCreator
+from .cc_spawner import CCExecutionResult, CCSpawner, MODEL_DEFAULT, MODEL_HAIKU, MODEL_OPUS, MODEL_SONNET, ProjectConfig
 from .health_monitor import EngineMetrics, HealthAlert, HealthMonitor, HealthThresholds
 from .learning_processor import LearningProcessor
 from .notifier import Notifier, NotifierConfig, TaskEvent
@@ -21,8 +22,13 @@ from .task_engine import TaskEngine
 __all__ = [
     "ArchitectReviewer",
     "ArchitectReviewResult",
+    "BugTaskCreator",
     "CCExecutionResult",
     "CCSpawner",
+    "MODEL_DEFAULT",
+    "MODEL_HAIKU",
+    "MODEL_OPUS",
+    "MODEL_SONNET",
     "EngineMetrics",
     "HealthAlert",
     "HealthMonitor",

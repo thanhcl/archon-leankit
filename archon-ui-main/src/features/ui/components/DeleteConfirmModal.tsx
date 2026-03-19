@@ -17,7 +17,7 @@ interface DeleteConfirmModalProps {
   itemName: string;
   onConfirm: () => void;
   onCancel: () => void;
-  type: "project" | "task" | "client" | "document" | "knowledge";
+  type: "project" | "task" | "client" | "document" | "knowledge" | "rule";
   size?: "compact" | "default" | "large";
   open?: boolean;
   onOpenChange?: (open: boolean) => void;
@@ -38,6 +38,7 @@ export const DeleteConfirmModal: React.FC<DeleteConfirmModalProps> = ({
     client: "Delete MCP Client",
     document: "Delete Document",
     knowledge: "Delete Knowledge Item",
+    rule: "Delete Rule",
   };
 
   const MESSAGES: Record<DeleteConfirmModalProps["type"], (_n: string) => string> = {
@@ -47,6 +48,7 @@ export const DeleteConfirmModal: React.FC<DeleteConfirmModalProps> = ({
     document: (_n) => `Are you sure you want to delete this document?`,
     knowledge: (n) =>
       `Are you sure you want to delete "${n}"? All associated documents and code examples will be permanently removed.`,
+    rule: (_n) => `Are you sure you want to delete this rule?`,
   };
 
   // Size-specific styling for icon

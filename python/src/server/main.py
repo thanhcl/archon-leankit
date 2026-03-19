@@ -39,6 +39,8 @@ from .api_routes.version_api import router as version_router
 
 # Import modular API routers
 from .api_routes.settings_api import router as settings_router
+from .api_routes.cost_budget_api import router as cost_budget_router
+from .api_routes.sprint_stats_api import router as sprint_stats_router
 
 # Import Logfire configuration
 from .config.logfire_config import api_logger, setup_logfire
@@ -206,6 +208,8 @@ app.include_router(engine_router)
 app.include_router(learnings_router)
 app.include_router(patterns_router)
 app.include_router(rules_router)
+app.include_router(sprint_stats_router)
+app.include_router(cost_budget_router)
 
 
 # Root endpoint
