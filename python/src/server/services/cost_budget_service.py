@@ -167,6 +167,47 @@ class CostBudgetService:
             "max_cost_per_sprint": DEFAULT_MAX_COST_PER_SPRINT,
         }
 
+    def update_budget_config(self, project_id: str, max_cost_per_day: float, max_cost_per_sprint: float) -> tuple[bool, dict]:
+        """Update budget configuration for a project by writing to project metadata."""
+        try:
+            # Read current metadata to preserve other fields
+            response = (
+                self.supabase_client.table("archon_projects")
+                .select("metadata")
+                .eq("id", project_id)
+                .single()
+                .execute()
+            )
+            if not response.data:
+                return False, {"error": f"Project {project_id} not found"}
+
+            existing_metadata = response.data.get("metadata") or {}
+            if not isinstance(existing_metadata, dict):
+                existing_metadata = {}
+
+            updated_metadata = {
+                **existing_metadata,
+                "cost_budget": {
+                    "max_cost_per_day": max_cost_per_day,
+                    "max_cost_per_sprint": max_cost_per_sprint,
+                },
+            }
+
+            self.supabase_client.table("archon_projects").update(
+                {"metadata": updated_metadata}
+            ).eq("id", project_id).execute()
+
+            config = {"max_cost_per_day": max_cost_per_day, "max_cost_per_sprint": max_cost_per_sprint}
+            logger.info(
+                f"Budget config updated | project_id={project_id} | "
+                f"max_cost_per_day=${max_cost_per_day} | max_cost_per_sprint=${max_cost_per_sprint}"
+            )
+            return True, {"budget_config": config}
+
+        except Exception as e:
+            logger.error(f"Failed to update budget config for project {project_id}: {e}", exc_info=True)
+            return False, {"error": f"Failed to update budget config: {str(e)}"}
+
     def _accumulate_daily_costs(self, tasks: list[dict]) -> dict[str, float]:
         """Group task costs by completion date."""
         daily: dict[str, float] = defaultdict(float)

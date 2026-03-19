@@ -5,8 +5,17 @@ import { Button } from "../../ui/primitives";
 import { NewRuleModal } from "./components/NewRuleModal";
 import { OptimizeDiffModal } from "./components/OptimizeDiffModal";
 import { RuleRow } from "./components/RuleRow";
-import { useCreateRule, useDeleteRule, useOptimizeRules, useProjectRules, useUpdateRule } from "./hooks";
-import type { OptimizeSuggestion, Rule, RuleSection, UpdateRuleRequest } from "./types";
+import {
+  useApproveSuggestion,
+  useCreateRule,
+  useDeleteRule,
+  useOptimizeRules,
+  useProjectRules,
+  useRejectSuggestion,
+  useRuleSuggestions,
+  useUpdateRule,
+} from "./hooks";
+import type { OptimizeSuggestion, Rule, RuleSection, RuleSuggestion, UpdateRuleRequest } from "./types";
 
 interface RulesTabProps {
   projectId: string;
@@ -14,16 +23,20 @@ interface RulesTabProps {
 
 export const RulesTab = ({ projectId }: RulesTabProps) => {
   const { data: rules = [], isLoading } = useProjectRules(projectId);
+  const { data: autoSuggestions = [] } = useRuleSuggestions(projectId);
   const createRuleMutation = useCreateRule(projectId);
   const updateRuleMutation = useUpdateRule(projectId);
   const deleteRuleMutation = useDeleteRule(projectId);
   const optimizeMutation = useOptimizeRules(projectId);
+  const approveSuggestionMutation = useApproveSuggestion(projectId);
+  const rejectSuggestionMutation = useRejectSuggestion(projectId);
 
   const [showNewRuleModal, setShowNewRuleModal] = useState(false);
   const [ruleToDelete, setRuleToDelete] = useState<Rule | null>(null);
   const [showDeleteModal, setShowDeleteModal] = useState(false);
   const [showOptimizeModal, setShowOptimizeModal] = useState(false);
   const [suggestions, setSuggestions] = useState<OptimizeSuggestion[]>([]);
+  const [pendingAutoSuggestions, setPendingAutoSuggestions] = useState<RuleSuggestion[]>([]);
 
   const handleAddRule = async (section: RuleSection, ruleText: string) => {
     await createRuleMutation.mutateAsync({ section, rule_text: ruleText });
@@ -47,8 +60,17 @@ export const RulesTab = ({ projectId }: RulesTabProps) => {
   };
 
   const handleOptimize = async () => {
-    const result = await optimizeMutation.mutateAsync();
+    // Load optimizer suggestions alongside any auto-generated pending suggestions
+    const [result] = await Promise.all([optimizeMutation.mutateAsync()]);
     setSuggestions(result.suggestions);
+    setPendingAutoSuggestions(autoSuggestions);
+    setShowOptimizeModal(true);
+  };
+
+  const handleOpenSuggestions = () => {
+    // Open modal showing only auto-generated pending suggestions (no optimizer run)
+    setSuggestions([]);
+    setPendingAutoSuggestions(autoSuggestions);
     setShowOptimizeModal(true);
   };
 
@@ -59,14 +81,30 @@ export const RulesTab = ({ projectId }: RulesTabProps) => {
       source: "auto-optimize",
     });
     setSuggestions((prev) => prev.filter((s) => s !== suggestion));
-    if (suggestions.length <= 1) {
+    if (suggestions.length <= 1 && pendingAutoSuggestions.length === 0) {
+      setShowOptimizeModal(false);
+    }
+  };
+
+  const handleApproveAutoSuggestion = async (suggestion: RuleSuggestion) => {
+    await approveSuggestionMutation.mutateAsync(suggestion);
+    setPendingAutoSuggestions((prev) => prev.filter((s) => s.id !== suggestion.id));
+    if (suggestions.length === 0 && pendingAutoSuggestions.length <= 1) {
       setShowOptimizeModal(false);
     }
   };
 
   const handleRejectSuggestion = (index: number) => {
     setSuggestions((prev) => prev.filter((_, i) => i !== index));
-    if (suggestions.length <= 1) {
+    if (suggestions.length <= 1 && pendingAutoSuggestions.length === 0) {
+      setShowOptimizeModal(false);
+    }
+  };
+
+  const handleRejectAutoSuggestion = async (suggestionId: string) => {
+    await rejectSuggestionMutation.mutateAsync(suggestionId);
+    setPendingAutoSuggestions((prev) => prev.filter((s) => s.id !== suggestionId));
+    if (suggestions.length === 0 && pendingAutoSuggestions.length <= 1) {
       setShowOptimizeModal(false);
     }
   };
@@ -91,6 +129,17 @@ export const RulesTab = ({ projectId }: RulesTabProps) => {
           </span>
         </div>
         <div className="flex items-center gap-2">
+          {autoSuggestions.length > 0 && (
+            <button
+              type="button"
+              onClick={handleOpenSuggestions}
+              className="relative flex items-center gap-1 px-2 py-1 text-xs rounded-full bg-amber-100 dark:bg-amber-900/30 text-amber-700 dark:text-amber-300 hover:bg-amber-200 dark:hover:bg-amber-900/50 transition-colors"
+              title={`${autoSuggestions.length} auto-generated rule suggestion${autoSuggestions.length !== 1 ? "s" : ""} pending review`}
+            >
+              <Sparkles className="w-3 h-3" />
+              {autoSuggestions.length} suggestion{autoSuggestions.length !== 1 ? "s" : ""}
+            </button>
+          )}
           <Button
             variant="ghost"
             size="sm"
@@ -161,9 +210,12 @@ export const RulesTab = ({ projectId }: RulesTabProps) => {
         open={showOptimizeModal}
         onOpenChange={setShowOptimizeModal}
         suggestions={suggestions}
+        autoSuggestions={pendingAutoSuggestions}
         onApprove={handleApproveSuggestion}
         onReject={handleRejectSuggestion}
-        isApplying={createRuleMutation.isPending}
+        onApproveAuto={handleApproveAutoSuggestion}
+        onRejectAuto={handleRejectAutoSuggestion}
+        isApplying={createRuleMutation.isPending || approveSuggestionMutation.isPending}
       />
     </div>
   );

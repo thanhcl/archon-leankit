@@ -10,12 +10,14 @@ import { useSmartPolling } from "../../../shared/hooks";
 import { useToast } from "../../../shared/hooks/useToast";
 import { taskService } from "../services";
 import type {
+  BudgetConfig,
   CostStatusResponse,
   CreateTaskRequest,
   PredictedVsActual,
   SprintStatsResponse,
   Task,
   TaskEstimate,
+  UpdateBudgetConfigRequest,
   UpdateTaskRequest,
 } from "../types";
 
@@ -29,6 +31,7 @@ export const taskKeys = {
   estimates: (projectId: string) => ["projects", projectId, "task-estimates"] as const, // For /api/projects/{id}/task-estimates
   sprintStats: (projectId: string) => ["projects", projectId, "sprint-stats"] as const,
   costStatus: (projectId: string) => ["projects", projectId, "cost-status"] as const,
+  budgetConfig: (projectId: string) => ["projects", projectId, "budget-config"] as const,
 };
 
 // Fetch tasks for a specific project
@@ -99,6 +102,38 @@ export function useCostStatus(projectId: string | undefined) {
     },
     enabled: !!projectId,
     staleTime: STALE_TIMES.normal,
+  });
+}
+
+// Fetch budget config (limits) for a project
+export function useBudgetConfig(projectId: string | undefined) {
+  return useQuery<BudgetConfig>({
+    queryKey: projectId ? taskKeys.budgetConfig(projectId) : DISABLED_QUERY_KEY,
+    queryFn: async () => {
+      if (!projectId) throw new Error("No project ID");
+      return taskService.getBudgetConfig(projectId);
+    },
+    enabled: !!projectId,
+    staleTime: STALE_TIMES.normal,
+  });
+}
+
+// Update budget config mutation
+export function useUpdateBudgetConfig(projectId: string) {
+  const queryClient = useQueryClient();
+  const { showToast } = useToast();
+
+  return useMutation<{ budget_config: BudgetConfig }, Error, UpdateBudgetConfigRequest>({
+    mutationFn: (config: UpdateBudgetConfigRequest) => taskService.updateBudgetConfig(projectId, config),
+    onSuccess: (data) => {
+      queryClient.setQueryData(taskKeys.budgetConfig(projectId), data.budget_config);
+      // Also invalidate cost-status so the budget_config inside it refreshes
+      queryClient.invalidateQueries({ queryKey: taskKeys.costStatus(projectId) });
+      showToast("Budget limits updated", "success");
+    },
+    onError: (error) => {
+      showToast(`Failed to update budget: ${error.message}`, "error");
+    },
   });
 }
 

@@ -101,12 +101,16 @@ class TaskEngine:
         self._running = True
         self._loop_task = asyncio.create_task(self._run_loop())
         await self.health_monitor.start()
+
+        budget_config = self.cost_budget_service._get_budget_config(self.project_id) if self.project_id else {}
         logger.info(
             f"TaskEngine started | project_id={self.project_id} | "
             f"poll_interval={self.poll_interval}s | "
             f"max_parallel={self.spawner.max_parallel} | "
             f"global_limit={'∞' if not self.global_tracker else self.global_tracker.max_global} | "
-            f"isolation={self.project_config.isolation}"
+            f"isolation={self.project_config.isolation} | "
+            f"budget_daily=${budget_config.get('max_cost_per_day', 'N/A')} | "
+            f"budget_sprint=${budget_config.get('max_cost_per_sprint', 'N/A')}"
         )
 
     def get_status(self) -> dict:

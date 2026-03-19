@@ -61,3 +61,21 @@ export interface OptimizeResult {
   analysis: Record<string, unknown>;
   project_id: string;
 }
+
+export interface RuleSuggestion {
+  id: string;
+  project_id: string;
+  learning_id: string | null;
+  section: string;
+  rule_text: string;
+  confidence: number;
+  reason: string | null;
+  status: "pending" | "approved" | "rejected";
+  created_at: string;
+  updated_at: string;
+}
+
+export interface RuleSuggestionsResponse {
+  suggestions: RuleSuggestion[];
+  count: number;
+}

@@ -2,12 +2,13 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { DISABLED_QUERY_KEY, STALE_TIMES } from "../../../shared/config/queryPatterns";
 import { useToast } from "../../../shared/hooks/useToast";
 import { ruleService } from "../services/ruleService";
-import type { CreateRuleRequest, OptimizeResult, UpdateRuleRequest } from "../types";
+import type { CreateRuleRequest, OptimizeResult, RuleSuggestion, UpdateRuleRequest } from "../types";
 
 export const ruleKeys = {
   all: ["rules"] as const,
   byProject: (projectId: string) => [...ruleKeys.all, "project", projectId] as const,
   detail: (ruleId: string) => [...ruleKeys.all, "detail", ruleId] as const,
+  suggestions: (projectId: string) => [...ruleKeys.all, "suggestions", projectId] as const,
 };
 
 export function useProjectRules(projectId: string | undefined) {
@@ -85,6 +86,55 @@ export function useOptimizeRules(projectId: string) {
     },
     onError: (error: Error) => {
       showToast(`Failed to optimize rules: ${error.message}`, "error");
+    },
+  });
+}
+
+export function useRuleSuggestions(projectId: string | undefined) {
+  return useQuery({
+    queryKey: projectId ? ruleKeys.suggestions(projectId) : DISABLED_QUERY_KEY,
+    queryFn: async () => {
+      if (!projectId) return [];
+      return await ruleService.getSuggestions(projectId);
+    },
+    enabled: !!projectId,
+    staleTime: STALE_TIMES.frequent,
+  });
+}
+
+export function useApproveSuggestion(projectId: string) {
+  const queryClient = useQueryClient();
+  const { showToast } = useToast();
+
+  return useMutation({
+    mutationFn: async (suggestion: RuleSuggestion) => {
+      return await ruleService.approveSuggestion(suggestion.id);
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ruleKeys.byProject(projectId) });
+      queryClient.invalidateQueries({ queryKey: ruleKeys.suggestions(projectId) });
+      showToast("Rule approved and added", "success");
+    },
+    onError: (error: Error) => {
+      showToast(`Failed to approve suggestion: ${error.message}`, "error");
+    },
+  });
+}
+
+export function useRejectSuggestion(projectId: string) {
+  const queryClient = useQueryClient();
+  const { showToast } = useToast();
+
+  return useMutation({
+    mutationFn: async (suggestionId: string) => {
+      return await ruleService.rejectSuggestion(suggestionId);
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ruleKeys.suggestions(projectId) });
+      showToast("Suggestion dismissed", "success");
+    },
+    onError: (error: Error) => {
+      showToast(`Failed to reject suggestion: ${error.message}`, "error");
     },
   });
 }

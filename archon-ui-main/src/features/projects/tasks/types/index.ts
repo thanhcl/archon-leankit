@@ -9,6 +9,7 @@ export type { UseTaskActionsReturn, UseTaskEditorReturn } from "./hooks";
 // Core task types (vertical slice architecture)
 export type {
   Assignee,
+  BudgetConfig,
   CommonAssignee,
   CostStatusResponse,
   CreateTaskRequest,
@@ -24,6 +25,7 @@ export type {
   TaskPriority,
   TaskSource,
   TaskTypeName,
+  UpdateBudgetConfigRequest,
   UpdateTaskRequest,
 } from "./task";
 

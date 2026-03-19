@@ -49,3 +49,4 @@ Adapt when running /create-rules. Remove sections that don't apply.
 6. **SINGLE SOURCE OF TRUTH**: Models are defined in `api_contracts.py`. NEVER duplicate local classes in route files — always import from the contracts module.
 7. **DEDUP CHECK**: Before creating a task, search existing tasks with the same title to avoid duplicates.
 8. **LIBRARY INSTALL TASKS**: Tasks yêu cầu install new npm/pip packages nên làm manual qua CC interactive trước, rồi tạo Engine task cho phần implement. Hoặc pre-install packages trước khi Engine chạy. Engine subprocess có thể bị hang khi install packages do network/permission issues.
+9. **BUDGET LIMITS**: Engine CostBudgetService có daily + sprint budget limits. Default: $100/day, $500/sprint. File: cost_budget_service.py. Khi Engine log "Budget exceeded — pausing project", tăng limits hoặc chờ ngày mới reset.

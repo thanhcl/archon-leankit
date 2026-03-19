@@ -204,6 +204,17 @@ export interface SprintStatsResponse {
   injection_metrics: Record<string, number>;
 }
 
+// Budget configuration (from GET/PUT /api/projects/{id}/budget-config)
+export interface BudgetConfig {
+  max_cost_per_day: number;
+  max_cost_per_sprint: number;
+}
+
+export interface UpdateBudgetConfigRequest {
+  max_cost_per_day: number;
+  max_cost_per_sprint: number;
+}
+
 // Cost budget types (from GET /api/projects/{id}/cost-status)
 export interface CostStatusResponse {
   project_id: string;

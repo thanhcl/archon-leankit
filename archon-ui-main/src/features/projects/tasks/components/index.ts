@@ -5,6 +5,7 @@
  * Removed complex flip animations and over-engineering for better maintainability.
  */
 
+export { BudgetConfigSection } from "./BudgetConfigSection";
 export { CostTrendChart } from "./CostTrendChart";
 export { EditableTableCell } from "./EditableTableCell";
 export { FeatureSelect } from "./FeatureSelect";

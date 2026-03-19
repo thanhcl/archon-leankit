@@ -12,6 +12,7 @@ export { useTaskEditor } from "./useTaskEditor";
 // TanStack Query hooks
 export {
   taskKeys,
+  useBudgetConfig,
   useCostStatus,
   useCreateTask,
   useDeleteTask,
@@ -20,5 +21,6 @@ export {
   useTaskCounts,
   useTaskEstimates,
   useTransitionTask,
+  useUpdateBudgetConfig,
   useUpdateTask,
 } from "./useTaskQueries";

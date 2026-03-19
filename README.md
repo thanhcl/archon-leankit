@@ -515,3 +515,5 @@ docker system prune -f
 Archon Community License (ACL) v1.2 - see [LICENSE](LICENSE) file for details.
 
 **TL;DR**: Archon is free, open, and hackable. Run it, fork it, share it - just don't sell it as-a-service without permission.
+
+# Live streaming verified

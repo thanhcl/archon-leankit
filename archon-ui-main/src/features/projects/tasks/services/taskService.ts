@@ -8,6 +8,7 @@ import { formatZodErrors, ValidationError } from "../../../shared/types/errors";
 
 import { validateCreateTask, validateUpdateTask, validateUpdateTaskStatus } from "../schemas";
 import type {
+  BudgetConfig,
   CostStatusResponse,
   CreateTaskRequest,
   DatabaseTaskStatus,
@@ -16,6 +17,7 @@ import type {
   Task,
   TaskCounts,
   TaskEstimate,
+  UpdateBudgetConfigRequest,
   UpdateTaskRequest,
 } from "../types";
 
@@ -249,6 +251,33 @@ export const taskService = {
       return await callAPIWithETag<CostStatusResponse>(`/api/projects/${projectId}/cost-status`);
     } catch (error) {
       console.error(`Failed to get cost status for project ${projectId}:`, error);
+      throw error;
+    }
+  },
+
+  async getBudgetConfig(projectId: string): Promise<BudgetConfig> {
+    try {
+      return await callAPIWithETag<BudgetConfig>(`/api/projects/${projectId}/budget-config`);
+    } catch (error) {
+      console.error(`Failed to get budget config for project ${projectId}:`, error);
+      throw error;
+    }
+  },
+
+  async updateBudgetConfig(projectId: string, config: UpdateBudgetConfigRequest): Promise<{ budget_config: BudgetConfig }> {
+    try {
+      const response = await fetch(`/api/projects/${projectId}/budget-config`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(config),
+      });
+      if (!response.ok) {
+        const err = await response.json().catch(() => ({}));
+        throw new Error(err?.detail?.error || err?.error || `HTTP ${response.status}`);
+      }
+      return await response.json();
+    } catch (error) {
+      console.error(`Failed to update budget config for project ${projectId}:`, error);
       throw error;
     }
   },

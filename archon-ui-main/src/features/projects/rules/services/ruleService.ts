@@ -1,5 +1,12 @@
 import { callAPIWithETag } from "../../../shared/api/apiClient";
-import type { CreateRuleRequest, OptimizeResult, Rule, UpdateRuleRequest } from "../types";
+import type {
+  CreateRuleRequest,
+  OptimizeResult,
+  Rule,
+  RuleSuggestion,
+  RuleSuggestionsResponse,
+  UpdateRuleRequest,
+} from "../types";
 
 interface RulesResponse {
   rules: Rule[];
@@ -59,5 +66,24 @@ export const ruleService = {
       method: "POST",
     });
     return response;
+  },
+
+  async getSuggestions(projectId: string): Promise<RuleSuggestion[]> {
+    const response = await callAPIWithETag<RuleSuggestionsResponse>(
+      `/api/rules/suggestions/${encodeURIComponent(projectId)}?status=pending`,
+    );
+    return response.suggestions || [];
+  },
+
+  async approveSuggestion(suggestionId: string): Promise<{ rule: Rule; claude_md_written: boolean }> {
+    return await callAPIWithETag(`/api/rules/suggestions/${encodeURIComponent(suggestionId)}/approve`, {
+      method: "POST",
+    });
+  },
+
+  async rejectSuggestion(suggestionId: string): Promise<void> {
+    await callAPIWithETag(`/api/rules/suggestions/${encodeURIComponent(suggestionId)}/reject`, {
+      method: "POST",
+    });
   },
 };

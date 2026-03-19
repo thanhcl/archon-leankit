@@ -197,7 +197,11 @@ class LearningProcessor:
     # ── Auto-promote ──────────────────────────────────────────────────
 
     async def auto_promote(self, learning: dict[str, Any]) -> None:
-        """Auto-promote learning to KB when recurrence threshold met."""
+        """Auto-promote learning to KB when recurrence threshold met.
+
+        If the learning has a suggested_rule, also creates a pending entry in
+        archon_rule_suggestions for the owner to approve/reject in the Rules UI.
+        """
         lid = learning["id"]
 
         if not learning.get("suggested_rule"):
@@ -216,11 +220,60 @@ class LearningProcessor:
 
             logger.info(f"Learning auto-promoted to KB | id={lid} | rule={learning['suggested_rule'][:80]}")
 
+            # Create a pending rule suggestion for owner review
+            await self._create_rule_suggestion(learning)
+
             if self._notifier:
                 await self._notifier.on_learning_promoted(learning)
 
         except Exception as e:
             logger.error(f"Failed to auto-promote learning {lid}: {e}")
+
+    async def _create_rule_suggestion(self, learning: dict[str, Any]) -> None:
+        """Create a pending rule suggestion from a promoted learning."""
+        from ..rules.rule_optimizer_service import RuleOptimizerService
+
+        lid = learning["id"]
+        suggested_rule = learning.get("suggested_rule", "")
+        area = learning.get("area", "")
+        recurrence = learning.get("recurrence_count", 1)
+        section = RuleOptimizerService._area_to_section(area)
+
+        # Check if a pending suggestion for this learning already exists
+        try:
+            existing = (
+                self._client.table("archon_rule_suggestions")
+                .select("id")
+                .eq("learning_id", lid)
+                .eq("status", "pending")
+                .execute()
+            )
+            if existing.data:
+                return  # Already has a pending suggestion
+        except Exception as e:
+            logger.warning(f"Failed to check existing rule suggestion: {e}")
+
+        try:
+            confidence = min(0.95, 0.5 + max(0, recurrence - 1) * 0.1)
+            related_tasks = learning.get("related_tasks") or []
+            reason = (
+                f"Learning recurred {recurrence} times across {len(related_tasks)} tasks: "
+                f"{learning.get('description', '')[:100]}"
+            )
+
+            self._client.table("archon_rule_suggestions").insert({
+                "project_id": learning.get("project_id"),
+                "learning_id": lid,
+                "section": section,
+                "rule_text": suggested_rule,
+                "confidence": round(confidence, 2),
+                "reason": reason,
+                "status": "pending",
+            }).execute()
+
+            logger.info(f"Rule suggestion created | learning_id={lid} | section={section}")
+        except Exception as e:
+            logger.error(f"Failed to create rule suggestion for learning {lid}: {e}")
 
     # ── Code Patterns ────────────────────────────────────────────────
 

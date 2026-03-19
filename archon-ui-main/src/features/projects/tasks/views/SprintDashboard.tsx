@@ -1,3 +1,4 @@
+import { BudgetConfigSection } from "../components/BudgetConfigSection";
 import { CostTrendChart } from "../components/CostTrendChart";
 import { useCostStatus, useSprintStats } from "../hooks";
 
@@ -24,6 +25,7 @@ export function SprintDashboard({ projectId }: SprintDashboardProps) {
   return (
     <div className="space-y-4">
       <CostTrendChart sprintStats={sprintStats} costStatus={costStatus} />
+      <BudgetConfigSection projectId={projectId} />
     </div>
   );
 }

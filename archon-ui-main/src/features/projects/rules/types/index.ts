@@ -4,6 +4,8 @@ export type {
   OptimizeSuggestion,
   Rule,
   RuleSection,
+  RuleSuggestion,
+  RuleSuggestionsResponse,
   UpdateRuleRequest,
 } from "./rule";
 export { RULE_SECTIONS } from "./rule";
