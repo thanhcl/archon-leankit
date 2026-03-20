@@ -19,8 +19,8 @@ from ..config.logfire_config import get_logger
 logger = get_logger(__name__)
 
 # Budget defaults
-DEFAULT_MAX_COST_PER_DAY = 20.0
-DEFAULT_MAX_COST_PER_SPRINT = 100.0
+DEFAULT_MAX_COST_PER_DAY = 100.0
+DEFAULT_MAX_COST_PER_SPRINT = 500.0
 BUDGET_WARNING_THRESHOLD = 0.8  # 80%
 
 
