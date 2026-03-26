@@ -13,6 +13,9 @@ from typing import Any
 from src.server.utils import get_supabase_client
 
 from ...config.logfire_config import get_logger
+from .bootstrap_plan_service import BootstrapPlanService
+from .bootstrap_task_template import create_project_bootstrap_task_pack
+from .engine_policy_service import EnginePolicyService
 
 logger = get_logger(__name__)
 
@@ -69,12 +72,16 @@ class ProjectService:
             # Create project data
             project_data = {
                 "title": title.strip(),
+                "description": kwargs.get("description", "") or "",
                 "docs": [],  # Will add PRD document after creation
-                "features": [],
-                "data": [],
+                "features": kwargs.get("features", []),
+                "data": kwargs.get("data", []),
                 "created_at": datetime.now().isoformat(),
                 "updated_at": datetime.now().isoformat(),
             }
+
+            if "pinned" in kwargs and kwargs["pinned"] is not None:
+                project_data["pinned"] = kwargs["pinned"]
 
             if github_repo and isinstance(github_repo, str) and len(github_repo.strip()) > 0:
                 project_data["github_repo"] = github_repo.strip()
@@ -103,12 +110,58 @@ class ProjectService:
             project_id = project["id"]
             logger.info(f"Project created successfully with ID: {project_id}")
 
+            self._mirror_deprecated_policy_fields({**project_data, **project})
+
+            bootstrap_task = None
+            bootstrap_tasks: list[dict[str, Any]] | None = None
+            bootstrap_plan: dict[str, Any] | None = None
+            if kwargs.get("create_bootstrap_task", True):
+                bootstrap_tasks = create_project_bootstrap_task_pack(
+                    supabase_client=self.supabase_client,
+                    project_id=project_id,
+                    project_title=project["title"],
+                    project_description=project_data.get("description"),
+                    github_repo=project.get("github_repo"),
+                    source_app=project_data.get("source_app"),
+                    bootstrap_template=kwargs.get("bootstrap_template"),
+                    project_type=kwargs.get("project_type"),
+                    bootstrap_policy=kwargs.get("bootstrap_policy"),
+                    bootstrap_architect_provider=kwargs.get("bootstrap_architect_provider"),
+                    bootstrap_architect_model=kwargs.get("bootstrap_architect_model"),
+                )
+                if bootstrap_tasks:
+                    bootstrap_task = bootstrap_tasks[0]
+                ok, plan_result = BootstrapPlanService(self.supabase_client).list_plans(
+                    project_id=project_id,
+                    limit=1,
+                )
+                if ok and plan_result.get("plans"):
+                    bootstrap_plan = plan_result["plans"][0]
+                    kwargs["bootstrap_architect_provider"] = (
+                        bootstrap_plan.get("resolved_provider")
+                        or bootstrap_plan.get("requested_provider")
+                        or kwargs.get("bootstrap_architect_provider")
+                    )
+                    kwargs["bootstrap_architect_model"] = (
+                        bootstrap_plan.get("model")
+                        or kwargs.get("bootstrap_architect_model")
+                    )
+
             return True, {
                 "project": {
                     "id": project_id,
                     "title": project["title"],
+                    "description": project_data.get("description", ""),
                     "github_repo": project.get("github_repo"),
                     "created_at": project["created_at"],
+                    "bootstrap_task": bootstrap_task,
+                    "bootstrap_tasks": bootstrap_tasks,
+                    "bootstrap_plan": bootstrap_plan,
+                    "bootstrap_template": kwargs.get("bootstrap_template"),
+                    "project_type": kwargs.get("project_type"),
+                    "bootstrap_policy": kwargs.get("bootstrap_policy"),
+                    "bootstrap_architect_provider": kwargs.get("bootstrap_architect_provider"),
+                    "bootstrap_architect_model": kwargs.get("bootstrap_architect_model"),
                 }
             }
 
@@ -454,6 +507,7 @@ class ProjectService:
 
             if response.data and len(response.data) > 0:
                 project = response.data[0]
+                self._mirror_deprecated_policy_fields(project)
                 return True, {"project": project, "message": "Project updated successfully"}
             else:
                 # If update didn't return data, fetch the project to ensure it exists and get current state
@@ -465,6 +519,7 @@ class ProjectService:
                 )
                 if get_response.data and len(get_response.data) > 0:
                     project = get_response.data[0]
+                    self._mirror_deprecated_policy_fields(project)
                     return True, {"project": project, "message": "Project updated successfully"}
                 else:
                     return False, {"error": f"Project with ID {project_id} not found"}
@@ -472,3 +527,14 @@ class ProjectService:
         except Exception as e:
             logger.error(f"Error updating project: {e}")
             return False, {"error": f"Error updating project: {str(e)}"}
+
+    def _mirror_deprecated_policy_fields(self, project_row: dict[str, Any]) -> None:
+        """Mirror deprecated project policy metadata into engine_policies."""
+        ok, result = EnginePolicyService(self.supabase_client).sync_project_policy_sources(project_row)
+        if not ok:
+            project_id = project_row.get("id", "unknown")
+            logger.warning(
+                "Failed to mirror deprecated project policy fields into engine_policies "
+                f"| project_id={project_id} | error={result.get('error', 'unknown error')}",
+                exc_info=True,
+            )

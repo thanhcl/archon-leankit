@@ -6,6 +6,7 @@ from fastapi import APIRouter, HTTPException
 
 from ..config.logfire_config import get_logger
 from ..services.engine.learning_processor import LearningProcessor
+from ..utils import get_supabase_client
 
 logger = get_logger(__name__)
 
@@ -64,3 +65,24 @@ async def promote_learning(learning_id: str):
     if not ok:
         raise HTTPException(status_code=500, detail={"error": msg}) from None
     return {"message": msg}
+
+
+@router.get("/promotion-log")
+async def get_promotion_log(project_id: str | None = None, limit: int = 50):
+    """List promotion audit log entries ordered by most recent first."""
+    try:
+        client = get_supabase_client()
+        query = (
+            client.table("archon_promotion_log")
+            .select("*")
+            .order("created_at", desc=True)
+            .limit(limit)
+        )
+        if project_id:
+            query = query.eq("project_id", project_id)
+        resp = query.execute()
+        entries = resp.data or []
+        return {"entries": entries, "count": len(entries)}
+    except Exception as e:
+        logger.error(f"Failed to fetch promotion log: {e}")
+        raise HTTPException(status_code=500, detail={"error": str(e)}) from None

@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 from email.utils import format_datetime
 from typing import Any
 
-from fastapi import APIRouter, Header, HTTPException, Request, Response
+from fastapi import APIRouter, Header, HTTPException, Query, Request, Response
 from fastapi import status as http_status
 from pydantic import BaseModel
 
@@ -21,8 +21,12 @@ from pydantic import BaseModel
 # Set up standard logger for background tasks
 from ..config.logfire_config import get_logger, logfire
 from ..models.api_contracts import (
+    ContinueTaskRequest,
     CreateProjectRequest,
     CreateTaskRequest,
+    OwnerFeedbackRequest,
+    OwnerFeedbackResponse,
+    RePlanTaskRequest,
     TaskListResponse,
     TransitionTaskRequest,
     UpdateProjectRequest,
@@ -165,6 +169,18 @@ async def create_project(request: CreateProjectRequest):
             val = getattr(request, field, None)
             if val is not None:
                 kwargs[field] = val
+        if request.create_bootstrap_task is not None:
+            kwargs["create_bootstrap_task"] = request.create_bootstrap_task
+        if request.bootstrap_template is not None:
+            kwargs["bootstrap_template"] = request.bootstrap_template
+        if request.project_type is not None:
+            kwargs["project_type"] = request.project_type
+        if request.bootstrap_policy is not None:
+            kwargs["bootstrap_policy"] = request.bootstrap_policy
+        if request.bootstrap_architect_provider is not None:
+            kwargs["bootstrap_architect_provider"] = request.bootstrap_architect_provider
+        if request.bootstrap_architect_model is not None:
+            kwargs["bootstrap_architect_model"] = request.bootstrap_architect_model
 
         # Create project directly with AI assistance
         project_service = ProjectCreationService()
@@ -690,6 +706,13 @@ async def create_task(request: CreateTaskRequest):
             max_retries=request.max_retries or 3,
             status=request.status or "draft",
             blocked_by=request.blocked_by,
+            allowed_paths=request.allowed_paths,
+            forbidden_paths=request.forbidden_paths,
+            repo_guidance_packs=(
+                [pack.model_dump() for pack in request.repo_guidance_packs]
+                if request.repo_guidance_packs is not None
+                else None
+            ),
             created_by=request.created_by or "owner",
             created_from=request.created_from or "api",
             task_type=request.task_type or "feature",
@@ -758,11 +781,12 @@ async def list_tasks(
     sprint: str | None = None,
     feature: str | None = None,
     parent_task_id: str | None = None,
+    tags: list[str] | None = Query(default=None),
 ):
-    """List tasks with optional filters including status, project, task_type, phase, module, sprint, feature, and keyword search."""
+    """List tasks with optional filters including status, project, task_type, phase, module, sprint, feature, tags, and keyword search."""
     try:
         logfire.info(
-            f"Listing tasks | status={status} | project_id={project_id} | include_closed={include_closed} | page={page} | per_page={per_page} | q={q} | task_type={task_type} | phase={phase} | module={module} | sprint={sprint}"
+            f"Listing tasks | status={status} | project_id={project_id} | include_closed={include_closed} | page={page} | per_page={per_page} | q={q} | task_type={task_type} | phase={phase} | module={module} | sprint={sprint} | tags={tags}"
         )
 
         # Use TaskService to list tasks
@@ -779,6 +803,7 @@ async def list_tasks(
             sprint=sprint,
             feature=feature,
             parent_task_id=parent_task_id,
+            tags=tags,
         )
 
         if not success:
@@ -843,9 +868,8 @@ async def list_tasks(
 
 @router.get("/tasks/{task_id}")
 async def get_task(task_id: str):
-    """Get a specific task by ID."""
+    """Get a specific task by ID, including linked plan item info when available."""
     try:
-        # Use TaskService to get the task
         task_service = TaskService()
         success, result = task_service.get_task(task_id)
 
@@ -856,6 +880,24 @@ async def get_task(task_id: str):
                 raise HTTPException(status_code=500, detail=result)
 
         task = result["task"]
+
+        # Enrich with linked plan item info when the task has a plan_item_id FK
+        plan_item_id = task.get("plan_item_id")
+        if plan_item_id:
+            try:
+                from ..services.projects.plan_service import PlanService
+                plan_service = PlanService()
+                ok, item_result = plan_service.get_item(plan_item_id)
+                if ok:
+                    item = item_result["item"]
+                    task["linked_plan_item"] = {
+                        "id": item["id"],
+                        "item_key": item.get("item_key"),
+                        "title": item["title"],
+                        "status": item["status"],
+                    }
+            except Exception as enrich_err:
+                logfire.warning(f"Failed to enrich task with plan item | plan_item_id={plan_item_id} | error={enrich_err}")
 
         logfire.info(
             f"Task retrieved successfully | task_id={task_id} | project_id={task.get('project_id')}"
@@ -960,6 +1002,14 @@ async def update_task(task_id: str, request: UpdateTaskRequest):
             update_fields["max_retries"] = request.max_retries
         if request.blocked_by is not None:
             update_fields["blocked_by"] = request.blocked_by
+        if request.allowed_paths is not None:
+            update_fields["allowed_paths"] = request.allowed_paths
+        if request.forbidden_paths is not None:
+            update_fields["forbidden_paths"] = request.forbidden_paths
+        if request.repo_guidance_packs is not None:
+            update_fields["repo_guidance_packs"] = [
+                pack.model_dump() for pack in request.repo_guidance_packs
+            ]
         if request.task_type is not None:
             update_fields["task_type"] = request.task_type
         if request.phase is not None:
@@ -1131,6 +1181,48 @@ async def get_task_history(task_id: str):
         raise HTTPException(status_code=500, detail={"error": str(e)})
 
 
+@router.post("/tasks/{task_id}/feedback", response_model=OwnerFeedbackResponse)
+async def submit_task_feedback(task_id: str, request: OwnerFeedbackRequest):
+    """Submit owner feedback (rating, notes, improvement tags) for a completed task.
+
+    Only tasks with status 'done' accept feedback.
+    Rating must be 1–5; submitting again overwrites the previous feedback.
+    """
+    try:
+        logfire.info(
+            f"Owner feedback submitted | task_id={task_id} | rating={request.owner_rating}"
+        )
+
+        task_service = TaskService()
+        success, result = task_service.submit_feedback(
+            task_id=task_id,
+            owner_rating=request.owner_rating,
+            owner_notes=request.owner_notes,
+            improvement_tags=request.improvement_tags,
+        )
+
+        if not success:
+            error_msg = result.get("error", "Unknown error")
+            if "not found" in error_msg.lower():
+                raise HTTPException(status_code=404, detail=error_msg)
+            else:
+                raise HTTPException(status_code=400, detail=error_msg)
+
+        return OwnerFeedbackResponse(
+            message="Feedback stored successfully",
+            task_id=task_id,
+            owner_rating=result["owner_rating"],
+            owner_notes=result["owner_notes"],
+            improvement_tags=result["improvement_tags"],
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logfire.error(f"Failed to submit feedback | error={str(e)} | task_id={task_id}")
+        raise HTTPException(status_code=500, detail={"error": str(e)})
+
+
 @router.get("/tasks/{task_id}/next-states")
 async def get_task_next_states(task_id: str):
     """Get valid next states for a task based on its current status."""
@@ -1160,6 +1252,98 @@ async def get_task_next_states(task_id: str):
         raise
     except Exception as e:
         logfire.error(f"Failed to get next states | error={str(e)} | task_id={task_id}")
+        raise HTTPException(status_code=500, detail={"error": str(e)})
+
+
+@router.post("/tasks/{task_id}/re-plan")
+async def re_plan_task(task_id: str, request: RePlanTaskRequest):
+    """
+    Reset a task to 'planning' state with optional updated description.
+
+    Preserves task ID, plan_item_id, and state history.
+    Use when a task needs replanning due to changed requirements or failed execution.
+    """
+    try:
+        logfire.info(
+            f"Task re-plan requested | task_id={task_id} | changed_by={request.changed_by}"
+        )
+
+        lifecycle_service = TaskLifecycleService()
+        success, result = await lifecycle_service.re_plan(
+            task_id=task_id,
+            updated_description=request.updated_description,
+            changed_by=request.changed_by,
+            reason=request.reason,
+        )
+
+        if not success:
+            error_msg = result.get("error", "Unknown error")
+            if "not found" in error_msg.lower():
+                raise HTTPException(status_code=404, detail=error_msg)
+            else:
+                raise HTTPException(status_code=400, detail=error_msg)
+
+        logfire.info(
+            f"Task re-planned | task_id={task_id} | "
+            f"{result['transition']['from']} → planning"
+        )
+
+        return {
+            "message": "Task re-planned successfully",
+            "task": result["task"],
+            "transition": result["transition"],
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logfire.error(f"Failed to re-plan task | error={str(e)} | task_id={task_id}")
+        raise HTTPException(status_code=500, detail={"error": str(e)})
+
+
+@router.post("/tasks/{task_id}/continue")
+async def continue_task(task_id: str, request: ContinueTaskRequest):
+    """
+    Resume a paused or blocked task with operator guidance.
+
+    Appends guidance to the task description and transitions to 'assigned'.
+    Preserves task ID, plan_item_id, and state history.
+    Use after clarification to let the engine pick up execution again.
+    """
+    try:
+        logfire.info(
+            f"Task continue requested | task_id={task_id} | changed_by={request.changed_by}"
+        )
+
+        lifecycle_service = TaskLifecycleService()
+        success, result = await lifecycle_service.continue_after_clarification(
+            task_id=task_id,
+            guidance=request.guidance,
+            changed_by=request.changed_by,
+        )
+
+        if not success:
+            error_msg = result.get("error", "Unknown error")
+            if "not found" in error_msg.lower():
+                raise HTTPException(status_code=404, detail=error_msg)
+            else:
+                raise HTTPException(status_code=400, detail=error_msg)
+
+        logfire.info(
+            f"Task continued | task_id={task_id} | "
+            f"{result['transition']['from']} → assigned"
+        )
+
+        return {
+            "message": "Task continued successfully",
+            "task": result["task"],
+            "transition": result["transition"],
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logfire.error(f"Failed to continue task | error={str(e)} | task_id={task_id}")
         raise HTTPException(status_code=500, detail={"error": str(e)})
 
 

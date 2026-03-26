@@ -12,38 +12,51 @@ Modules:
 """
 
 import logging
-import os
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Response
 from fastapi.middleware.cors import CORSMiddleware
 
 from .api_routes.agent_chat_api import router as agent_chat_router
+from .api_routes.agent_definitions_api import router as agent_definitions_router
 from .api_routes.agent_work_orders_proxy import router as agent_work_orders_router
-from .api_routes.engine_api import router as engine_router
-from .api_routes.learnings_api import router as learnings_router
-from .api_routes.patterns_api import router as patterns_router
-from .api_routes.rules_api import router as rules_router
+from .api_routes.approval_requests_api import router as approval_requests_router
+from .api_routes.bootstrap_plans_api import router as bootstrap_plans_router
+from .api_routes.project_templates_api import router as project_templates_router
 from .api_routes.bug_report_api import router as bug_report_router
+from .api_routes.channel_health_api import router as channel_health_router
+from .api_routes.cost_budget_api import router as cost_budget_router
+from .api_routes.engine_api import router as engine_router
+from .api_routes.engine_policies_api import router as engine_policies_router
+from .api_routes.execution_runs_api import router as execution_runs_router
+from .api_routes.external_requests_api import router as external_requests_router
+from .api_routes.implementation_plans_api import router as implementation_plans_router
 from .api_routes.internal_api import router as internal_router
 from .api_routes.knowledge_api import router as knowledge_router
+from .api_routes.learnings_api import router as learnings_router
 from .api_routes.mcp_api import router as mcp_router
 from .api_routes.migration_api import router as migration_router
 from .api_routes.ollama_api import router as ollama_router
+from .api_routes.openclaw_api import router as openclaw_router
 from .api_routes.openrouter_api import router as openrouter_router
 from .api_routes.pages_api import router as pages_router
+from .api_routes.patterns_api import router as patterns_router
 from .api_routes.progress_api import router as progress_router
 from .api_routes.projects_api import router as projects_router
 from .api_routes.providers_api import router as providers_router
-from .api_routes.version_api import router as version_router
+from .api_routes.rules_api import router as rules_router
+from .api_routes.service_health_api import router as service_health_router
 
 # Import modular API routers
 from .api_routes.settings_api import router as settings_router
-from .api_routes.cost_budget_api import router as cost_budget_router
 from .api_routes.sprint_stats_api import router as sprint_stats_router
+from .api_routes.telegram_api import router as telegram_router
+from .api_routes.version_api import router as version_router
 
 # Import Logfire configuration
 from .config.logfire_config import api_logger, setup_logfire
+from .config.startup_validation import validate_backend_entrypoint_port
+from .services.channels.channel_health_monitor import ChannelHealthMonitor
 from .services.crawler_manager import cleanup_crawler, initialize_crawler
 
 # Import utilities and core classes
@@ -71,11 +84,14 @@ uvicorn_logger.setLevel(logging.WARNING)  # Only log warnings and errors, not ev
 # Global flag to track if initialization is complete
 _initialization_complete = False
 
+# Channel health monitor instance (started in lifespan)
+_channel_health_monitor: ChannelHealthMonitor | None = None
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan manager for startup and shutdown tasks."""
-    global _initialization_complete
+    global _initialization_complete, _channel_health_monitor
     _initialization_complete = False
 
     # Startup
@@ -83,9 +99,10 @@ async def lifespan(app: FastAPI):
 
     try:
         # Validate configuration FIRST - check for anon vs service key
-        from .config.config import get_config
+        from .config.config import get_config, warn_optional_vars
 
         get_config()  # This will raise ConfigurationError if anon key detected
+        warn_optional_vars()  # Log warnings for missing optional vars
 
         # Initialize credentials from database FIRST - this is the foundation for everything else
         await initialize_credentials()
@@ -122,11 +139,18 @@ async def lifespan(app: FastAPI):
         # MCP Client functionality removed from architecture
         # Agents now use MCP tools directly
 
+        # Start channel health monitor background loop
+        try:
+            _channel_health_monitor = ChannelHealthMonitor()
+            _channel_health_monitor.start()
+        except Exception as e:
+            api_logger.warning(f"Could not start channel health monitor: {e}")
+
         # Mark initialization as complete
         _initialization_complete = True
         api_logger.info("🎉 Archon backend started successfully!")
 
-    except Exception as e:
+    except Exception:
         api_logger.error("❌ Failed to start backend", exc_info=True)
         raise
 
@@ -139,6 +163,13 @@ async def lifespan(app: FastAPI):
     try:
         # MCP Client cleanup not needed
 
+        # Stop channel health monitor
+        if _channel_health_monitor is not None:
+            try:
+                await _channel_health_monitor.stop()
+            except Exception as e:
+                api_logger.warning("Could not stop channel health monitor: %s", e)
+
         # Cleanup crawling context
         try:
             await cleanup_crawler()
@@ -148,7 +179,7 @@ async def lifespan(app: FastAPI):
 
         api_logger.info("✅ Cleanup completed")
 
-    except Exception as e:
+    except Exception:
         api_logger.error("❌ Error during shutdown", exc_info=True)
 
 
@@ -196,20 +227,32 @@ app.include_router(pages_router)
 app.include_router(ollama_router)
 app.include_router(openrouter_router)
 app.include_router(projects_router)
+app.include_router(bootstrap_plans_router)
+app.include_router(project_templates_router)
+app.include_router(external_requests_router)
+app.include_router(approval_requests_router)
 app.include_router(progress_router)
 app.include_router(agent_chat_router)
 app.include_router(agent_work_orders_router)  # Proxy to independent agent work orders service
 app.include_router(internal_router)
 app.include_router(bug_report_router)
 app.include_router(providers_router)
+app.include_router(openclaw_router)
+app.include_router(telegram_router)
+app.include_router(channel_health_router)
 app.include_router(version_router)
 app.include_router(migration_router)
 app.include_router(engine_router)
+app.include_router(engine_policies_router)
+app.include_router(execution_runs_router)
 app.include_router(learnings_router)
 app.include_router(patterns_router)
 app.include_router(rules_router)
 app.include_router(sprint_stats_router)
 app.include_router(cost_budget_router)
+app.include_router(service_health_router)
+app.include_router(implementation_plans_router)
+app.include_router(agent_definitions_router)
 
 
 # Root endpoint
@@ -358,19 +401,12 @@ def main():
     """Main entry point for running the server."""
     import uvicorn
 
-    # Require ARCHON_SERVER_PORT to be set
-    server_port = os.getenv("ARCHON_SERVER_PORT")
-    if not server_port:
-        raise ValueError(
-            "ARCHON_SERVER_PORT environment variable is required. "
-            "Please set it in your .env file or environment. "
-            "Default value: 8181"
-        )
+    server_port = validate_backend_entrypoint_port()
 
     uvicorn.run(
         "src.server.main:app",
         host="0.0.0.0",
-        port=int(server_port),
+        port=server_port,
         reload=True,
         log_level="info",
     )

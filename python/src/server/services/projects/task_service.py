@@ -74,6 +74,103 @@ class TaskService:
             )
         return True, ""
 
+    def _detect_circular_dependency(
+        self, blocked_by_ids: list[str], new_task_id: str | None = None
+    ) -> tuple[bool, str]:
+        """Detect circular dependencies in the blocked_by graph.
+
+        Traverses the dependency graph starting from blocked_by_ids using BFS.
+        Returns (True, description) if a cycle is detected, (False, "") otherwise.
+
+        For creation (new_task_id=None): checks that the specified blockers do not
+        form a cycle among themselves in the existing graph.
+        For update (new_task_id provided): also checks that the new task's own ID
+        does not appear in the transitive dependency chain (A blocks B blocks A).
+        """
+        if not blocked_by_ids:
+            return False, ""
+
+        # BFS frontier starts at the direct blockers
+        visited: set[str] = set(blocked_by_ids)
+        queue: list[str] = list(blocked_by_ids)
+
+        while queue:
+            current_id = queue.pop(0)
+            try:
+                response = (
+                    self.supabase_client.table("archon_tasks")
+                    .select("id, blocked_by")
+                    .eq("id", current_id)
+                    .execute()
+                )
+            except Exception as e:
+                logger.warning(f"Skipping cycle check for {current_id}: {e}")
+                continue
+
+            if not response.data:
+                continue
+
+            current_blocked_by: list[str] = response.data[0].get("blocked_by") or []
+
+            for dep_id in current_blocked_by:
+                # Cycle: the new task is reachable from one of its own blockers
+                if new_task_id and dep_id == new_task_id:
+                    return (
+                        True,
+                        f"Circular dependency: task {current_id} already depends on {new_task_id}",
+                    )
+                # Cycle: a blocker is reachable from another blocker (pre-existing cycle)
+                if dep_id in set(blocked_by_ids) and dep_id != current_id:
+                    return (
+                        True,
+                        f"Circular dependency: {current_id} depends on {dep_id} "
+                        f"which is also in the blocked_by list",
+                    )
+                if dep_id not in visited:
+                    visited.add(dep_id)
+                    queue.append(dep_id)
+
+        return False, ""
+
+    @staticmethod
+    def _normalize_path_rules(paths: list[str] | None) -> list[str]:
+        """Normalize task editing boundary rules into stable path lists."""
+        if not paths:
+            return []
+
+        normalized: list[str] = []
+        for path in paths:
+            if not isinstance(path, str):
+                continue
+            trimmed = path.strip().replace("\\", "/").lstrip("./")
+            if not trimmed:
+                continue
+            normalized.append(trimmed)
+        return normalized
+
+    @classmethod
+    def _normalize_repo_guidance_packs(cls, packs: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+        """Normalize repo guidance packs into a stable JSON-safe shape."""
+        if not packs:
+            return []
+
+        normalized: list[dict[str, Any]] = []
+        for pack in packs:
+            if not isinstance(pack, dict):
+                continue
+
+            title = str(pack.get("title") or "").strip()
+            guidance = str(pack.get("guidance") or pack.get("text") or "").strip()
+            if not title or not guidance:
+                continue
+
+            normalized.append({
+                "title": title,
+                "guidance": guidance,
+                "path_scope": cls._normalize_path_rules(pack.get("path_scope")),
+            })
+        return normalized
+
     async def create_task(
         self,
         project_id: str,
@@ -93,6 +190,9 @@ class TaskService:
         max_retries: int = 3,
         status: str = "draft",
         blocked_by: list[str] | None = None,
+        allowed_paths: list[str] | None = None,
+        forbidden_paths: list[str] | None = None,
+        repo_guidance_packs: list[dict[str, Any]] | None = None,
         created_by: str | None = None,
         created_from: str | None = None,
         task_type: str = "feature",
@@ -140,6 +240,12 @@ class TaskService:
             if not is_valid:
                 return False, {"error": error_msg}
 
+            # Validate blocked_by: reject cycles before inserting
+            if blocked_by:
+                has_cycle, cycle_msg = self._detect_circular_dependency(blocked_by)
+                if has_cycle:
+                    return False, {"error": f"Invalid blocked_by: {cycle_msg}"}
+
             task_status = status
 
             # REORDERING LOGIC: If inserting at a specific position, increment existing tasks
@@ -164,6 +270,11 @@ class TaskService:
                         }).eq("id", existing_task["id"]).execute()
 
             now = datetime.now().isoformat()
+            normalized_allowed_paths = self._normalize_path_rules(allowed_paths)
+            normalized_forbidden_paths = self._normalize_path_rules(forbidden_paths)
+            normalized_repo_guidance_packs = self._normalize_repo_guidance_packs(
+                repo_guidance_packs
+            )
             task_data: dict[str, Any] = {
                 "project_id": project_id,
                 "title": title,
@@ -183,6 +294,9 @@ class TaskService:
                 "updated_at": now,
                 "task_type": task_type,
                 "tags": tags or [],
+                "allowed_paths": normalized_allowed_paths,
+                "forbidden_paths": normalized_forbidden_paths,
+                "repo_guidance_packs": normalized_repo_guidance_packs,
             }
 
             if feature:
@@ -231,6 +345,9 @@ class TaskService:
                         "owner": task.get("owner"),
                         "source_app": task.get("source_app"),
                         "blocked_by": task.get("blocked_by", []),
+                        "allowed_paths": task.get("allowed_paths", []),
+                        "forbidden_paths": task.get("forbidden_paths", []),
+                        "repo_guidance_packs": task.get("repo_guidance_packs", []),
                         "created_by": task.get("created_by"),
                         "created_from": task.get("created_from"),
                         "executed_by": task.get("executed_by"),
@@ -259,6 +376,7 @@ class TaskService:
         sprint: str = None,
         feature: str = None,
         parent_task_id: str = None,
+        tags: list[str] | None = None,
     ) -> tuple[bool, dict[str, Any]]:
         """
         List tasks with various filters.
@@ -282,6 +400,9 @@ class TaskService:
                     "id, project_id, parent_task_id, title, description, "
                     "status, assignee, task_order, priority, feature, archived, "
                     "archived_at, archived_by, created_at, updated_at, "
+                    "allowed_paths, forbidden_paths, repo_guidance_packs, blocked_by, complexity, owner, source_app, "
+                    "retry_count, max_retries, created_by, created_from, executed_by, reviewed_by, "
+                    "task_type, phase, module, sprint, tags, parent_task_id, "
                     "sources, code_examples"  # Still fetch for counting, but will process differently
                 )
             else:
@@ -371,6 +492,11 @@ class TaskService:
                 query = query.eq("parent_task_id", parent_task_id)
                 filters_applied.append(f"parent_task_id={parent_task_id}")
 
+            if tags:
+                # Filter tasks that contain ALL specified tags (array contains)
+                query = query.contains("tags", tags)
+                filters_applied.append(f"tags={tags}")
+
             logger.debug(f"Listing tasks with filters: {', '.join(filters_applied)}")
 
             # Execute query and get raw response
@@ -429,6 +555,9 @@ class TaskService:
                     "max_retries": task.get("max_retries", 3),
                     "state_changed_at": task.get("state_changed_at"),
                     "blocked_by": task.get("blocked_by", []),
+                    "allowed_paths": task.get("allowed_paths", []),
+                    "forbidden_paths": task.get("forbidden_paths", []),
+                    "repo_guidance_packs": task.get("repo_guidance_packs", []),
                     "created_by": task.get("created_by"),
                     "created_from": task.get("created_from"),
                     "executed_by": task.get("executed_by"),
@@ -502,6 +631,69 @@ class TaskService:
             logger.error(f"Error getting task: {e}")
             return False, {"error": f"Error getting task: {str(e)}"}
 
+    def submit_feedback(
+        self,
+        task_id: str,
+        owner_rating: int,
+        owner_notes: str | None,
+        improvement_tags: list[str],
+    ) -> tuple[bool, dict[str, Any]]:
+        """Store owner feedback on a completed task.
+
+        Only tasks with status 'done' accept feedback.
+        Overwrites any previously stored feedback.
+
+        Returns:
+            Tuple of (success, result_dict)
+        """
+        try:
+            # Fetch existing task to validate it exists and is done
+            task_resp = (
+                self.supabase_client.table("archon_tasks")
+                .select("id, status")
+                .eq("id", task_id)
+                .execute()
+            )
+            if not task_resp.data:
+                return False, {"error": f"Task with ID {task_id} not found"}
+
+            task = task_resp.data[0]
+            if task["status"] != "done":
+                return False, {
+                    "error": (
+                        f"Feedback can only be submitted for tasks with status 'done', "
+                        f"but task {task_id} has status '{task['status']}'"
+                    )
+                }
+
+            update_data: dict[str, Any] = {
+                "owner_rating": owner_rating,
+                "owner_notes": owner_notes,
+                "improvement_tags": improvement_tags or [],
+                "updated_at": datetime.now().isoformat(),
+            }
+
+            response = (
+                self.supabase_client.table("archon_tasks")
+                .update(update_data)
+                .eq("id", task_id)
+                .execute()
+            )
+
+            if not response.data:
+                return False, {"error": f"Failed to store feedback for task {task_id}"}
+
+            updated = response.data[0]
+            return True, {
+                "owner_rating": updated.get("owner_rating", owner_rating),
+                "owner_notes": updated.get("owner_notes", owner_notes),
+                "improvement_tags": updated.get("improvement_tags", improvement_tags or []),
+            }
+
+        except Exception as e:
+            logger.error(f"Error submitting feedback for task {task_id}: {e}")
+            return False, {"error": f"Error submitting feedback: {str(e)}"}
+
     async def update_task(
         self, task_id: str, update_fields: dict[str, Any]
     ) -> tuple[bool, dict[str, Any]]:
@@ -569,13 +761,33 @@ class TaskService:
                 if field in update_fields:
                     update_data[field] = update_fields[field]
 
-            # JSONB fields
+            for field in ["allowed_paths", "forbidden_paths"]:
+                if field in update_fields:
+                    update_data[field] = self._normalize_path_rules(update_fields[field])
+
+            if "repo_guidance_packs" in update_fields:
+                update_data["repo_guidance_packs"] = self._normalize_repo_guidance_packs(
+                    update_fields["repo_guidance_packs"]
+                )
+
+            # JSONB fields (no validation needed)
             for field in [
                 "acceptance_criteria", "execution_result", "architect_review",
-                "blocked_by", "executed_by", "reviewed_by", "review_history",
+                "executed_by", "reviewed_by", "review_history",
             ]:
                 if field in update_fields:
                     update_data[field] = update_fields[field]
+
+            # blocked_by requires cycle and self-reference validation
+            if "blocked_by" in update_fields:
+                new_blocked_by: list[str] = update_fields["blocked_by"] or []
+                if task_id in new_blocked_by:
+                    return False, {"error": f"Invalid blocked_by: task {task_id} cannot block itself"}
+                if new_blocked_by:
+                    has_cycle, cycle_msg = self._detect_circular_dependency(new_blocked_by, new_task_id=task_id)
+                    if has_cycle:
+                        return False, {"error": f"Invalid blocked_by: {cycle_msg}"}
+                update_data["blocked_by"] = new_blocked_by
 
             # Update task
             response = (

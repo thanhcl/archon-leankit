@@ -1,56 +1,17 @@
-"""
-API routes for database migration tracking and management.
-"""
-
-from datetime import datetime
+"""API routes for database migration tracking and management."""
 
 import logfire
 from fastapi import APIRouter, Header, HTTPException, Response
-from pydantic import BaseModel
 
 from ..config.version import ARCHON_VERSION
+from ..models.api_contracts import (
+    MigrationHistoryResponse,
+    MigrationRecord,
+    MigrationStatusResponse,
+    PendingMigration,
+)
 from ..services.migration_service import migration_service
 from ..utils.etag_utils import check_etag, generate_etag
-
-
-# Response models
-class MigrationRecord(BaseModel):
-    """Represents an applied migration."""
-
-    version: str
-    migration_name: str
-    applied_at: datetime
-    checksum: str | None = None
-
-
-class PendingMigration(BaseModel):
-    """Represents a pending migration."""
-
-    version: str
-    name: str
-    sql_content: str
-    file_path: str
-    checksum: str | None = None
-
-
-class MigrationStatusResponse(BaseModel):
-    """Complete migration status response."""
-
-    pending_migrations: list[PendingMigration]
-    applied_migrations: list[MigrationRecord]
-    has_pending: bool
-    bootstrap_required: bool
-    current_version: str
-    pending_count: int
-    applied_count: int
-
-
-class MigrationHistoryResponse(BaseModel):
-    """Migration history response."""
-
-    migrations: list[MigrationRecord]
-    total_count: int
-    current_version: str
 
 
 # Create router

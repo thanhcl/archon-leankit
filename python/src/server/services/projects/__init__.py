@@ -7,6 +7,8 @@ versioning, progress tracking, source linking, and AI-assisted project creation.
 """
 
 from .document_service import DocumentService
+from .engine_policy_service import EnginePolicyService
+from .execution_run_service import ExecutionRunService
 from .project_creation_service import ProjectCreationService
 from .project_service import ProjectService
 from .source_linking_service import SourceLinkingService
@@ -18,8 +20,10 @@ __all__ = [
     "ProjectService",
     "TaskService",
     "TaskLifecycleService",
+    "ExecutionRunService",
     "DocumentService",
     "VersioningService",
     "ProjectCreationService",
     "SourceLinkingService",
+    "EnginePolicyService",
 ]

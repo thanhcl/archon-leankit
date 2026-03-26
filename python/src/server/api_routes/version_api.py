@@ -1,49 +1,18 @@
-"""
-API routes for version checking and update management.
-"""
+"""API routes for version checking and update management."""
 
 from datetime import datetime
-from typing import Any
 
 import logfire
 from fastapi import APIRouter, Header, HTTPException, Response
-from pydantic import BaseModel
 
 from ..config.version import ARCHON_VERSION
+from ..models.api_contracts import (
+    CurrentVersionResponse,
+    VersionCacheClearResponse,
+    VersionCheckResponse,
+)
 from ..services.version_service import version_service
 from ..utils.etag_utils import check_etag, generate_etag
-
-
-# Response models
-class ReleaseAsset(BaseModel):
-    """Represents a downloadable asset from a release."""
-
-    name: str
-    size: int
-    download_count: int
-    browser_download_url: str
-    content_type: str
-
-
-class VersionCheckResponse(BaseModel):
-    """Version check response with update information."""
-
-    current: str
-    latest: str | None
-    update_available: bool
-    release_url: str | None
-    release_notes: str | None
-    published_at: datetime | None
-    check_error: str | None = None
-    assets: list[dict[str, Any]] | None = None
-    author: str | None = None
-
-
-class CurrentVersionResponse(BaseModel):
-    """Simple current version response."""
-
-    version: str
-    timestamp: datetime
 
 
 # Create router
@@ -105,7 +74,7 @@ async def get_current_version():
     return CurrentVersionResponse(version=ARCHON_VERSION, timestamp=datetime.now())
 
 
-@router.post("/clear-cache")
+@router.post("/clear-cache", response_model=VersionCacheClearResponse)
 async def clear_version_cache():
     """
     Clear the version check cache.
@@ -115,7 +84,7 @@ async def clear_version_cache():
     """
     try:
         version_service.clear_cache()
-        return {"message": "Version cache cleared successfully", "success": True}
+        return VersionCacheClearResponse(message="Version cache cleared successfully", success=True)
     except Exception as e:
         logfire.error(f"Error clearing version cache: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to clear cache: {str(e)}") from e

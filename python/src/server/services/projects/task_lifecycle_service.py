@@ -256,6 +256,225 @@ class TaskLifecycleService:
             logger.error(f"Error executing transition for task {task_id}: {e}", exc_info=True)
             return False, {"error": f"Error executing transition: {str(e)}"}
 
+    async def re_plan(
+        self,
+        task_id: str,
+        updated_description: str | None = None,
+        changed_by: str = "system",
+        reason: str | None = None,
+    ) -> tuple[bool, dict[str, Any]]:
+        """
+        Reset a task to 'planning' state, preserving its ID, plan_item_id, and history.
+
+        Intended for operators who need to re-plan a failed/stalled task without
+        losing lineage. The task description may be updated with new context.
+
+        Args:
+            task_id: UUID of the task to re-plan
+            updated_description: Optional new description to replace the current one
+            changed_by: Actor performing the action
+            reason: Optional note about why re-planning is needed
+
+        Returns:
+            Tuple of (success, result_dict)
+        """
+        try:
+            response = (
+                self.supabase_client.table("archon_tasks")
+                .select("*")
+                .eq("id", task_id)
+                .execute()
+            )
+
+            if not response.data:
+                return False, {"error": f"Task {task_id} not found"}
+
+            task = response.data[0]
+            current_status = task["status"]
+
+            if current_status in TERMINAL_STATES:
+                return False, {
+                    "error": f"Cannot re-plan task in terminal state '{current_status}'. "
+                             "Cancel it first or create a new task."
+                }
+
+            history_entry: dict[str, Any] = {
+                "from_status": current_status,
+                "to_status": "planning",
+                "changed_by": changed_by,
+                "changed_at": datetime.now().isoformat(),
+                "action": "re-plan",
+            }
+            if reason:
+                history_entry["reason"] = reason
+
+            existing_history = task.get("state_history") or []
+            if not isinstance(existing_history, list):
+                existing_history = []
+
+            now = datetime.now().isoformat()
+            update_data: dict[str, Any] = {
+                "status": "planning",
+                "state_changed_at": now,
+                "state_changed_by": changed_by,
+                "state_history": existing_history + [history_entry],
+                "updated_at": now,
+                # Clear execution artifacts so the new planning cycle starts fresh
+                "rejection_reason": None,
+                "hold_reason": None,
+            }
+
+            if updated_description is not None:
+                update_data["description"] = updated_description
+
+            update_response = (
+                self.supabase_client.table("archon_tasks")
+                .update(update_data)
+                .eq("id", task_id)
+                .execute()
+            )
+
+            if not update_response.data:
+                return False, {"error": f"Failed to re-plan task {task_id}"}
+
+            updated_task = update_response.data[0]
+
+            logger.info(
+                f"Task re-planned | task_id={task_id} | "
+                f"{current_status} → planning | by={changed_by}"
+            )
+
+            return True, {
+                "task": updated_task,
+                "transition": {
+                    "from": current_status,
+                    "to": "planning",
+                    "changed_by": changed_by,
+                    "action": "re-plan",
+                    "reason": reason,
+                },
+            }
+
+        except Exception as e:
+            logger.error(f"Error re-planning task {task_id}: {e}", exc_info=True)
+            return False, {"error": f"Error re-planning task: {str(e)}"}
+
+    async def continue_after_clarification(
+        self,
+        task_id: str,
+        guidance: str,
+        changed_by: str = "system",
+    ) -> tuple[bool, dict[str, Any]]:
+        """
+        Resume task execution by appending operator guidance and transitioning to 'assigned'.
+
+        For tasks that are paused (on-hold, failed, escalated) or blocked (planning,
+        owner-qa), this action appends the guidance text to the description and moves
+        the task to 'assigned' so the engine can pick it up again.
+
+        Args:
+            task_id: UUID of the task to continue
+            guidance: Clarification or additional instructions from the operator
+            changed_by: Actor performing the action
+
+        Returns:
+            Tuple of (success, result_dict)
+        """
+        try:
+            response = (
+                self.supabase_client.table("archon_tasks")
+                .select("*")
+                .eq("id", task_id)
+                .execute()
+            )
+
+            if not response.data:
+                return False, {"error": f"Task {task_id} not found"}
+
+            task = response.data[0]
+            current_status = task["status"]
+
+            if current_status in TERMINAL_STATES:
+                return False, {
+                    "error": f"Cannot continue task in terminal state '{current_status}'."
+                }
+
+            # Continue is valid from paused/blocked states
+            CONTINUABLE_STATES = {
+                "on-hold", "failed", "escalated", "planning", "owner-qa",
+                "assigned", "draft", "proposed", "approved",
+            }
+            if current_status not in CONTINUABLE_STATES:
+                return False, {
+                    "error": f"Cannot continue task from state '{current_status}'. "
+                             f"Continue is valid from: {', '.join(sorted(CONTINUABLE_STATES))}"
+                }
+
+            history_entry: dict[str, Any] = {
+                "from_status": current_status,
+                "to_status": "assigned",
+                "changed_by": changed_by,
+                "changed_at": datetime.now().isoformat(),
+                "action": "continue",
+                "guidance": guidance,
+            }
+
+            existing_history = task.get("state_history") or []
+            if not isinstance(existing_history, list):
+                existing_history = []
+
+            # Append guidance to existing description so the engine has full context
+            current_description = task.get("description") or ""
+            appended_description = (
+                current_description.rstrip()
+                + f"\n\n---\nOperator guidance ({datetime.now().strftime('%Y-%m-%d %H:%M')} UTC):\n{guidance}"
+            )
+
+            now = datetime.now().isoformat()
+            update_data: dict[str, Any] = {
+                "status": "assigned",
+                "state_changed_at": now,
+                "state_changed_by": changed_by,
+                "state_history": existing_history + [history_entry],
+                "description": appended_description,
+                "updated_at": now,
+                # Clear paused-state metadata
+                "hold_reason": None,
+                "rejection_reason": None,
+            }
+
+            update_response = (
+                self.supabase_client.table("archon_tasks")
+                .update(update_data)
+                .eq("id", task_id)
+                .execute()
+            )
+
+            if not update_response.data:
+                return False, {"error": f"Failed to continue task {task_id}"}
+
+            updated_task = update_response.data[0]
+
+            logger.info(
+                f"Task continued | task_id={task_id} | "
+                f"{current_status} → assigned | by={changed_by}"
+            )
+
+            return True, {
+                "task": updated_task,
+                "transition": {
+                    "from": current_status,
+                    "to": "assigned",
+                    "changed_by": changed_by,
+                    "action": "continue",
+                    "guidance": guidance,
+                },
+            }
+
+        except Exception as e:
+            logger.error(f"Error continuing task {task_id}: {e}", exc_info=True)
+            return False, {"error": f"Error continuing task: {str(e)}"}
+
     def get_state_history(self, task_id: str) -> tuple[bool, dict[str, Any]]:
         """
         Retrieve the full state transition history for a task.
