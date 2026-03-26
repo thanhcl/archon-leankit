@@ -216,7 +216,7 @@ class TestValidateTransition:
 
 # States that must allow → on-hold
 ON_HOLD_SOURCE_STATES = [
-    "approved", "assigned", "executing", "architect-review",
+    "approved", "assigned", "executing", "architect-review", "code-review",
     "review", "failed", "escalated",
 ]
 
@@ -352,3 +352,243 @@ class TestGetValidNextStates:
         service = TaskLifecycleService(supabase_client=MagicMock())
         next_states = service.get_valid_next_states("failed")
         assert "cancelled" in next_states
+
+
+# ---------------------------------------------------------------------------
+# Tests: re_plan
+# ---------------------------------------------------------------------------
+
+
+class TestRePlan:
+    @pytest.mark.asyncio
+    async def test_re_plan_from_failed_resets_to_planning(self):
+        task = _make_task(status="failed", description="original description")
+        updated_task = _make_task(status="planning")
+        client = _mock_client(select_data=[task], update_data=[updated_task])
+        service = TaskLifecycleService(supabase_client=client)
+
+        ok, result = await service.re_plan(
+            "task-001", changed_by="Owner", reason="New approach needed"
+        )
+
+        assert ok is True
+        assert result["transition"]["from"] == "failed"
+        assert result["transition"]["to"] == "planning"
+        assert result["transition"]["action"] == "re-plan"
+        update_call = client.table().update.call_args[0][0]
+        assert update_call["status"] == "planning"
+        assert update_call["rejection_reason"] is None
+        assert update_call["hold_reason"] is None
+
+    @pytest.mark.asyncio
+    async def test_re_plan_updates_description_when_provided(self):
+        task = _make_task(status="on-hold", description="old desc")
+        updated_task = _make_task(status="planning", description="new desc")
+        client = _mock_client(select_data=[task], update_data=[updated_task])
+        service = TaskLifecycleService(supabase_client=client)
+
+        ok, result = await service.re_plan(
+            "task-001", updated_description="new desc", changed_by="Owner"
+        )
+
+        assert ok is True
+        update_call = client.table().update.call_args[0][0]
+        assert update_call["description"] == "new desc"
+
+    @pytest.mark.asyncio
+    async def test_re_plan_preserves_description_when_not_provided(self):
+        task = _make_task(status="escalated", description="keep this")
+        updated_task = _make_task(status="planning")
+        client = _mock_client(select_data=[task], update_data=[updated_task])
+        service = TaskLifecycleService(supabase_client=client)
+
+        ok, result = await service.re_plan("task-001", changed_by="Owner")
+
+        assert ok is True
+        update_call = client.table().update.call_args[0][0]
+        assert "description" not in update_call
+
+    @pytest.mark.asyncio
+    async def test_re_plan_appends_history_entry(self):
+        existing_history = [{"from_status": "draft", "to_status": "assigned"}]
+        task = _make_task(status="failed", state_history=existing_history)
+        updated_task = _make_task(status="planning")
+        client = _mock_client(select_data=[task], update_data=[updated_task])
+        service = TaskLifecycleService(supabase_client=client)
+
+        ok, result = await service.re_plan("task-001", changed_by="Owner")
+
+        assert ok is True
+        update_call = client.table().update.call_args[0][0]
+        history = update_call["state_history"]
+        assert len(history) == 2
+        last_entry = history[-1]
+        assert last_entry["from_status"] == "failed"
+        assert last_entry["to_status"] == "planning"
+        assert last_entry["action"] == "re-plan"
+
+    @pytest.mark.asyncio
+    async def test_re_plan_blocked_from_terminal_done(self):
+        task = _make_task(status="done")
+        client = _mock_client(select_data=[task])
+        service = TaskLifecycleService(supabase_client=client)
+
+        ok, result = await service.re_plan("task-001", changed_by="Owner")
+
+        assert ok is False
+        assert "terminal" in result["error"].lower()
+
+    @pytest.mark.asyncio
+    async def test_re_plan_blocked_from_terminal_cancelled(self):
+        task = _make_task(status="cancelled")
+        client = _mock_client(select_data=[task])
+        service = TaskLifecycleService(supabase_client=client)
+
+        ok, result = await service.re_plan("task-001", changed_by="Owner")
+
+        assert ok is False
+        assert "terminal" in result["error"].lower()
+
+    @pytest.mark.asyncio
+    async def test_re_plan_task_not_found(self):
+        client = _mock_client(select_data=[])
+        service = TaskLifecycleService(supabase_client=client)
+
+        ok, result = await service.re_plan("missing-id", changed_by="Owner")
+
+        assert ok is False
+        assert "not found" in result["error"].lower()
+
+    @pytest.mark.parametrize("state", [
+        "draft", "proposed", "approved", "planning", "owner-qa",
+        "assigned", "on-hold", "failed", "escalated",
+    ])
+    @pytest.mark.asyncio
+    async def test_re_plan_allowed_from_paused_and_active_states(self, state):
+        task = _make_task(status=state)
+        updated_task = _make_task(status="planning")
+        client = _mock_client(select_data=[task], update_data=[updated_task])
+        service = TaskLifecycleService(supabase_client=client)
+
+        ok, result = await service.re_plan("task-001", changed_by="Owner")
+
+        assert ok is True, f"re_plan should succeed from state '{state}'"
+
+
+# ---------------------------------------------------------------------------
+# Tests: continue_after_clarification
+# ---------------------------------------------------------------------------
+
+
+class TestContinueAfterClarification:
+    @pytest.mark.asyncio
+    async def test_continue_from_on_hold_transitions_to_assigned(self):
+        task = _make_task(status="on-hold", description="Original", hold_reason="Blocked")
+        updated_task = _make_task(status="assigned")
+        client = _mock_client(select_data=[task], update_data=[updated_task])
+        service = TaskLifecycleService(supabase_client=client)
+
+        ok, result = await service.continue_after_clarification(
+            "task-001", guidance="Use v2 API instead", changed_by="Owner"
+        )
+
+        assert ok is True
+        assert result["transition"]["from"] == "on-hold"
+        assert result["transition"]["to"] == "assigned"
+        assert result["transition"]["action"] == "continue"
+        update_call = client.table().update.call_args[0][0]
+        assert update_call["status"] == "assigned"
+        assert update_call["hold_reason"] is None
+        assert update_call["rejection_reason"] is None
+
+    @pytest.mark.asyncio
+    async def test_continue_appends_guidance_to_description(self):
+        task = _make_task(status="failed", description="Do the thing.")
+        updated_task = _make_task(status="assigned")
+        client = _mock_client(select_data=[task], update_data=[updated_task])
+        service = TaskLifecycleService(supabase_client=client)
+
+        ok, result = await service.continue_after_clarification(
+            "task-001", guidance="Use library X not Y", changed_by="Owner"
+        )
+
+        assert ok is True
+        update_call = client.table().update.call_args[0][0]
+        assert "Do the thing." in update_call["description"]
+        assert "Use library X not Y" in update_call["description"]
+        assert "Operator guidance" in update_call["description"]
+
+    @pytest.mark.asyncio
+    async def test_continue_appends_history_entry_with_guidance(self):
+        task = _make_task(status="escalated", state_history=[])
+        updated_task = _make_task(status="assigned")
+        client = _mock_client(select_data=[task], update_data=[updated_task])
+        service = TaskLifecycleService(supabase_client=client)
+
+        ok, result = await service.continue_after_clarification(
+            "task-001", guidance="Go ahead", changed_by="Owner"
+        )
+
+        assert ok is True
+        update_call = client.table().update.call_args[0][0]
+        history = update_call["state_history"]
+        assert len(history) == 1
+        entry = history[0]
+        assert entry["action"] == "continue"
+        assert entry["guidance"] == "Go ahead"
+        assert entry["to_status"] == "assigned"
+
+    @pytest.mark.asyncio
+    async def test_continue_blocked_from_executing(self):
+        task = _make_task(status="executing")
+        client = _mock_client(select_data=[task])
+        service = TaskLifecycleService(supabase_client=client)
+
+        ok, result = await service.continue_after_clarification(
+            "task-001", guidance="some guidance", changed_by="Owner"
+        )
+
+        assert ok is False
+        assert "cannot continue" in result["error"].lower()
+
+    @pytest.mark.asyncio
+    async def test_continue_blocked_from_terminal_done(self):
+        task = _make_task(status="done")
+        client = _mock_client(select_data=[task])
+        service = TaskLifecycleService(supabase_client=client)
+
+        ok, result = await service.continue_after_clarification(
+            "task-001", guidance="retry", changed_by="Owner"
+        )
+
+        assert ok is False
+        assert "terminal" in result["error"].lower()
+
+    @pytest.mark.asyncio
+    async def test_continue_task_not_found(self):
+        client = _mock_client(select_data=[])
+        service = TaskLifecycleService(supabase_client=client)
+
+        ok, result = await service.continue_after_clarification(
+            "missing-id", guidance="some guidance", changed_by="Owner"
+        )
+
+        assert ok is False
+        assert "not found" in result["error"].lower()
+
+    @pytest.mark.parametrize("state", [
+        "on-hold", "failed", "escalated", "planning", "owner-qa",
+        "assigned", "draft", "proposed", "approved",
+    ])
+    @pytest.mark.asyncio
+    async def test_continue_allowed_from_continuable_states(self, state):
+        task = _make_task(status=state, description="")
+        updated_task = _make_task(status="assigned")
+        client = _mock_client(select_data=[task], update_data=[updated_task])
+        service = TaskLifecycleService(supabase_client=client)
+
+        ok, result = await service.continue_after_clarification(
+            "task-001", guidance="proceed", changed_by="Owner"
+        )
+
+        assert ok is True, f"continue should succeed from state '{state}'"

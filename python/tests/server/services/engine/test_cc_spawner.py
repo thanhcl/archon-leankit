@@ -121,6 +121,63 @@ class TestParseResult:
         assert parsed["result"] == "SUCCESS"
         assert parsed["files_changed"] == 5
 
+    def test_extracts_llm_metrics_from_json_result_event(self):
+        import json
+        result_event = json.dumps({
+            "type": "result",
+            "is_error": False,
+            "total_cost_usd": 0.0450,
+            "usage": {
+                "input_tokens": 8000,
+                "output_tokens": 4000,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 3000,
+            },
+        })
+        stdout = "RESULT: SUCCESS\nSUMMARY: Done\n" + result_event + "\n"
+        parsed = CCSpawner.parse_result(stdout)
+        assert parsed["llm_cost_usd"] == 0.0450
+        assert parsed["llm_input_tokens"] == 8000
+        assert parsed["llm_output_tokens"] == 4000
+        # total = input + output + cache_creation + cache_read = 8000+4000+0+3000
+        assert parsed["llm_total_tokens"] == 15000
+        assert "llm_thinking_tokens" not in parsed
+
+    def test_extracts_thinking_tokens_when_present(self):
+        import json
+        result_event = json.dumps({
+            "type": "result",
+            "is_error": False,
+            "total_cost_usd": 0.10,
+            "usage": {
+                "input_tokens": 5000,
+                "output_tokens": 2000,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0,
+                "thinking_input_tokens": 1500,
+            },
+        })
+        stdout = "RESULT: SUCCESS\n" + result_event + "\n"
+        parsed = CCSpawner.parse_result(stdout)
+        assert parsed["llm_thinking_tokens"] == 1500
+        assert parsed["llm_total_tokens"] == 7000  # 5000+2000+0+0
+
+    def test_llm_metrics_absent_when_no_result_event(self):
+        stdout = "RESULT: SUCCESS\nSUMMARY: Done\n"
+        parsed = CCSpawner.parse_result(stdout)
+        assert "llm_cost_usd" not in parsed
+        assert "llm_input_tokens" not in parsed
+        assert "llm_total_tokens" not in parsed
+
+    def test_llm_metrics_only_uses_first_result_event(self):
+        import json
+        first = json.dumps({"type": "result", "total_cost_usd": 0.01, "usage": {"input_tokens": 100, "output_tokens": 50}})
+        second = json.dumps({"type": "result", "total_cost_usd": 0.99, "usage": {"input_tokens": 9000, "output_tokens": 9000}})
+        stdout = first + "\n" + second + "\n"
+        parsed = CCSpawner.parse_result(stdout)
+        assert parsed["llm_cost_usd"] == 0.01
+        assert parsed["llm_input_tokens"] == 100
+
 
 # ---------------------------------------------------------------------------
 # Tests: parse_stream_line
@@ -256,6 +313,29 @@ class TestParseStreamLine:
         result = CCSpawner.parse_stream_line(line)
         assert result is not None
         assert "First block" in result["output_summary"]
+
+    def test_result_event_parsed(self):
+        import json
+        line = json.dumps({
+            "type": "result",
+            "is_error": False,
+            "total_cost_usd": 0.0450,
+            "usage": {"input_tokens": 5000, "output_tokens": 2000},
+        })
+        result = CCSpawner.parse_stream_line(line)
+        assert result is not None
+        assert result["event"] == "result"
+        assert result["is_error"] is False
+        assert result["total_cost_usd"] == 0.0450
+        assert result["usage"]["input_tokens"] == 5000
+
+    def test_result_event_error(self):
+        import json
+        line = json.dumps({"type": "result", "is_error": True, "total_cost_usd": None, "usage": None})
+        result = CCSpawner.parse_stream_line(line)
+        assert result is not None
+        assert result["event"] == "result"
+        assert result["is_error"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -542,6 +622,8 @@ class TestWorktree:
 
     @pytest.mark.asyncio
     async def test_spawn_with_worktree_isolation(self):
+        from src.server.services.engine.sandbox_provider import SandboxContext
+
         proc = _mock_process(stdout="RESULT: SUCCESS\n", returncode=0)
 
         spawner = CCSpawner()
@@ -550,7 +632,12 @@ class TestWorktree:
             isolation="git-worktree",
         )
 
-        with patch.object(spawner, "create_worktree", return_value=("/repo/.leankit-worktrees/task-iso", None)), \
+        mock_provider = MagicMock()
+        mock_provider.acquire.return_value = SandboxContext(
+            workspace_path="/repo/.leankit-worktrees/task-iso", provider_name="git-worktree"
+        )
+
+        with patch("src.server.services.engine.cc_spawner.get_provider_for_isolation", return_value=mock_provider), \
              patch("asyncio.create_subprocess_shell", return_value=proc) as mock_shell:
             result = await spawner.spawn("task-iso", "prompt", config)
 
@@ -561,13 +648,18 @@ class TestWorktree:
 
     @pytest.mark.asyncio
     async def test_spawn_worktree_failure(self):
+        from src.server.services.engine.sandbox_provider import SandboxContext
+
         spawner = CCSpawner()
         config = ProjectConfig(
             project_path="/repo",
             isolation="git-worktree",
         )
 
-        with patch.object(spawner, "create_worktree", return_value=(None, "git error")):
+        mock_provider = MagicMock()
+        mock_provider.acquire.side_effect = RuntimeError("git error")
+
+        with patch("src.server.services.engine.cc_spawner.get_provider_for_isolation", return_value=mock_provider):
             result = await spawner.spawn("task-bad", "prompt", config)
 
         assert result.success is False
@@ -755,3 +847,109 @@ class TestFallbackRetry:
         assert mock_shell.call_count == 1
         assert result.success is True
         assert "fallback_from" not in result.parsed
+
+
+# ---------------------------------------------------------------------------
+# Tests: runner env allowlist filtering
+# ---------------------------------------------------------------------------
+
+
+class TestRunnerEnvAllowlist:
+    @pytest.mark.asyncio
+    async def test_allowlisted_token_profile_keys_injected(self):
+        """Vars in the allowlist are injected into the subprocess env."""
+        proc = _mock_process(stdout="RESULT: SUCCESS\n", returncode=0)
+        spawner = CCSpawner()
+        config = ProjectConfig(project_path="/tmp/proj")
+        token_profile = {"max_tokens": 8000}
+
+        captured_env = {}
+
+        async def capture_env(*args, **kwargs):
+            captured_env.update(kwargs.get("env", {}))
+            return proc
+
+        # LEANKIT_RUNNER_MAX_TOKENS is not in the default allowlist, so we use a custom one
+        with patch("asyncio.create_subprocess_shell", side_effect=capture_env), \
+             patch(
+                 "src.server.services.engine.cc_spawner.get_runner_env_allowlist",
+                 return_value=["LEANKIT_RUNNER_MAX_TOKENS"],
+             ):
+            result = await spawner.spawn("task-al1", "prompt", config, token_profile=token_profile)
+
+        assert "LEANKIT_RUNNER_MAX_TOKENS" in captured_env
+        assert captured_env["LEANKIT_RUNNER_MAX_TOKENS"] == "8000"
+        assert result.parsed["injected_env_keys"] == ["LEANKIT_RUNNER_MAX_TOKENS"]
+
+    @pytest.mark.asyncio
+    async def test_non_allowlisted_token_profile_keys_blocked(self):
+        """Vars not in the allowlist are blocked and not injected."""
+        proc = _mock_process(stdout="RESULT: SUCCESS\n", returncode=0)
+        spawner = CCSpawner()
+        config = ProjectConfig(project_path="/tmp/proj")
+        token_profile = {"max_tokens": 8000, "temperature_pct": 50}
+
+        captured_env = {}
+
+        async def capture_env(*args, **kwargs):
+            captured_env.update(kwargs.get("env", {}))
+            return proc
+
+        # Only LEANKIT_RUNNER_MAX_TOKENS is allowed; LEANKIT_RUNNER_TEMPERATURE_PCT is not
+        with patch("asyncio.create_subprocess_shell", side_effect=capture_env), \
+             patch(
+                 "src.server.services.engine.cc_spawner.get_runner_env_allowlist",
+                 return_value=["LEANKIT_RUNNER_MAX_TOKENS"],
+             ):
+            result = await spawner.spawn("task-al2", "prompt", config, token_profile=token_profile)
+
+        assert "LEANKIT_RUNNER_MAX_TOKENS" in captured_env
+        assert "LEANKIT_RUNNER_TEMPERATURE_PCT" not in captured_env
+        assert result.parsed["injected_env_keys"] == ["LEANKIT_RUNNER_MAX_TOKENS"]
+
+    @pytest.mark.asyncio
+    async def test_empty_allowlist_blocks_all_injections(self):
+        """An empty allowlist prevents all token profile vars from being injected."""
+        proc = _mock_process(stdout="RESULT: SUCCESS\n", returncode=0)
+        spawner = CCSpawner()
+        config = ProjectConfig(project_path="/tmp/proj")
+        token_profile = {"max_tokens": 8000, "temperature_pct": 50, "model_hint": "fast"}
+
+        captured_env = {}
+
+        async def capture_env(*args, **kwargs):
+            captured_env.update(kwargs.get("env", {}))
+            return proc
+
+        with patch("asyncio.create_subprocess_shell", side_effect=capture_env), \
+             patch(
+                 "src.server.services.engine.cc_spawner.get_runner_env_allowlist",
+                 return_value=[],
+             ):
+            result = await spawner.spawn("task-al3", "prompt", config, token_profile=token_profile)
+
+        assert "LEANKIT_RUNNER_MAX_TOKENS" not in captured_env
+        assert "LEANKIT_RUNNER_TEMPERATURE_PCT" not in captured_env
+        assert "LEANKIT_RUNNER_MODEL_HINT" not in captured_env
+        assert result.parsed["injected_env_keys"] == []
+
+    @pytest.mark.asyncio
+    async def test_no_token_profile_means_empty_injected_keys(self):
+        """When no token profile is provided, injected_env_keys is empty."""
+        proc = _mock_process(stdout="RESULT: SUCCESS\n", returncode=0)
+        spawner = CCSpawner()
+        config = ProjectConfig(project_path="/tmp/proj")
+
+        with patch("asyncio.create_subprocess_shell", return_value=proc):
+            result = await spawner.spawn("task-al4", "prompt", config, token_profile=None)
+
+        assert result.parsed["injected_env_keys"] == []
+
+    @pytest.mark.asyncio
+    async def test_default_allowlist_contains_expected_vars(self):
+        """Default allowlist includes the spec-required variable names."""
+        from src.server.config.env_aliases import get_runner_env_allowlist
+        allowlist = get_runner_env_allowlist()
+        assert "MAX_THINKING_TOKENS" in allowlist
+        assert "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE" in allowlist
+        assert "CLAUDE_CODE_SUBAGENT_MODEL" in allowlist

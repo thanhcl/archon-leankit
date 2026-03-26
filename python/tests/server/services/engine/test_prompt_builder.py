@@ -38,6 +38,7 @@ def _make_task(**overrides):
         "execution_result": None,
         "rejection_reason": None,
         "execution_prompt": None,
+        "repo_guidance_packs": [],
     }
     base.update(overrides)
     return base
@@ -151,6 +152,39 @@ async def test_execution_prompt_included():
     prompt, _ = await builder.build(task)
     assert "Execution Strategy" in prompt
     assert "adapter pattern" in prompt
+
+
+@pytest.mark.asyncio
+async def test_editing_boundaries_included_in_legacy_prompt():
+    task = _make_task(
+        allowed_paths=["src/server/**"],
+        forbidden_paths=["src/store/**"],
+    )
+    builder = PromptBuilder(rag_service=FakeRAGService(), compress=False)
+    prompt, _ = await builder.build(task)
+    assert "## Editing Boundaries" in prompt
+    assert "`src/server/**`" in prompt
+    assert "`src/store/**`" in prompt
+    assert "stop and report the conflict" in prompt
+
+
+@pytest.mark.asyncio
+async def test_repo_guidance_packs_included_in_legacy_prompt():
+    task = _make_task(
+        repo_guidance_packs=[
+            {
+                "title": "API boundary",
+                "guidance": "Keep route handlers thin and push business logic into services.",
+                "path_scope": ["src/server/api_routes/**", "src/server/services/**"],
+            }
+        ]
+    )
+    builder = PromptBuilder(rag_service=FakeRAGService(), compress=False)
+    prompt, _ = await builder.build(task)
+    assert "## Repository Guidance Packs" in prompt
+    assert "### API boundary" in prompt
+    assert "`src/server/api_routes/**`" in prompt
+    assert "route handlers thin" in prompt
 
 
 @pytest.mark.asyncio
@@ -686,3 +720,86 @@ async def test_retry_critical_findings_included():
     assert "Critical findings" in prompt
     assert "SQL injection" in prompt
     assert "Missing docstring" not in prompt  # Only critical findings included
+
+
+@pytest.mark.asyncio
+async def test_editing_boundaries_included_in_compressed_prompt():
+    task = _make_task(
+        allowed_paths=["src/server/**"],
+        forbidden_paths=["src/store/**"],
+    )
+    builder = PromptBuilder(rag_service=FakeRAGService(), compress=True)
+    prompt, _ = await builder.build(task)
+    assert "## Editing Boundaries" in prompt
+    assert "`src/server/**`" in prompt
+    assert "`src/store/**`" in prompt
+
+
+@pytest.mark.asyncio
+async def test_repo_guidance_packs_included_in_compressed_prompt():
+    task = _make_task(
+        repo_guidance_packs=[
+            {
+                "title": "Engine discipline",
+                "guidance": "Preserve lifecycle audit semantics when refactoring execution services.",
+                "path_scope": ["src/server/services/engine/**"],
+            }
+        ]
+    )
+    builder = PromptBuilder(rag_service=FakeRAGService(), compress=True)
+    prompt, _ = await builder.build(task)
+    assert "## Repository Guidance Packs" in prompt
+    assert "### Engine discipline" in prompt
+    assert "`src/server/services/engine/**`" in prompt
+    assert "lifecycle audit semantics" in prompt
+
+
+# -- Compaction hint tests --
+
+
+def test_compaction_hint_contains_required_fields():
+    """_compaction_hint output mentions all required preserved fields."""
+    hint = PromptBuilder._compaction_hint("execute", "self-review")
+    assert "task_id" in hint
+    assert "acceptance criteria" in hint
+    assert "files modified" in hint
+    assert "test results" in hint
+
+
+def test_compaction_hint_reflects_stage_names():
+    """_compaction_hint includes the previous and next stage names."""
+    hint = PromptBuilder._compaction_hint("execute", "self-review")
+    assert "execute" in hint
+    assert "self-review" in hint
+
+    hint2 = PromptBuilder._compaction_hint("self-review", "code-review")
+    assert "self-review" in hint2
+    assert "code-review" in hint2
+
+
+@pytest.mark.asyncio
+async def test_compaction_hints_in_compressed_prompt():
+    """Compressed prompt includes both stage-transition compaction hints."""
+    builder = PromptBuilder(rag_service=FakeRAGService(), compress=True)
+    prompt, _ = await builder.build(_make_task())
+
+    assert "execute" in prompt and "self-review" in prompt
+    assert "code-review" in prompt
+    assert "task_id" in prompt
+    assert "acceptance criteria" in prompt
+    assert "files modified" in prompt
+    assert "test results" in prompt
+
+
+@pytest.mark.asyncio
+async def test_compaction_hints_in_legacy_prompt():
+    """Legacy prompt includes both stage-transition compaction hints."""
+    builder = PromptBuilder(rag_service=FakeRAGService(), compress=False)
+    prompt, _ = await builder.build(_make_task())
+
+    assert "execute" in prompt and "self-review" in prompt
+    assert "code-review" in prompt
+    assert "task_id" in prompt
+    assert "acceptance criteria" in prompt
+    assert "files modified" in prompt
+    assert "test results" in prompt

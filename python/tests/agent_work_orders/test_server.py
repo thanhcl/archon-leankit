@@ -124,6 +124,30 @@ async def test_health_check_server_connectivity(mock_client_class):
 
 @pytest.mark.unit
 @patch("src.agent_work_orders.server.httpx.AsyncClient")
+@patch.dict(
+    "os.environ",
+    {
+        "LEANKIT_CONTROL_PLANE_URL": "http://platform-server:9191",
+        "ARCHON_SERVER_URL": "http://localhost:8181",
+        "LEANKIT_ENABLE_AGENT_WORK_ORDERS": "true",
+    },
+)
+async def test_health_check_server_prefers_platform_alias(mock_client_class):
+    """Test health check prefers platform control-plane URL alias."""
+    from src.agent_work_orders.server import health_check
+
+    mock_response = Mock(status_code=200)
+    mock_client = AsyncMock()
+    mock_client.get.return_value = mock_response
+    mock_client_class.return_value.__aenter__.return_value = mock_client
+
+    result = await health_check()
+
+    assert result["dependencies"]["archon_server"]["url"] == "http://platform-server:9191"
+
+
+@pytest.mark.unit
+@patch("src.agent_work_orders.server.httpx.AsyncClient")
 @patch.dict("os.environ", {"ARCHON_MCP_URL": "http://localhost:8051", "ENABLE_AGENT_WORK_ORDERS": "true"})
 async def test_health_check_mcp_connectivity(mock_client_class):
     """Test health check validates MCP connectivity"""
@@ -139,6 +163,30 @@ async def test_health_check_mcp_connectivity(mock_client_class):
 
     assert result["dependencies"]["archon_mcp"]["available"] is True
     assert result["dependencies"]["archon_mcp"]["url"] == "http://localhost:8051"
+
+
+@pytest.mark.unit
+@patch("src.agent_work_orders.server.httpx.AsyncClient")
+@patch.dict(
+    "os.environ",
+    {
+        "LEANKIT_CONTROL_PLANE_MCP_URL": "http://platform-mcp:9151",
+        "ARCHON_MCP_URL": "http://localhost:8051",
+        "LEANKIT_ENABLE_AGENT_WORK_ORDERS": "true",
+    },
+)
+async def test_health_check_mcp_prefers_platform_alias(mock_client_class):
+    """Test health check prefers platform MCP URL alias."""
+    from src.agent_work_orders.server import health_check
+
+    mock_response = Mock(status_code=200)
+    mock_client = AsyncMock()
+    mock_client.get.return_value = mock_response
+    mock_client_class.return_value.__aenter__.return_value = mock_client
+
+    result = await health_check()
+
+    assert result["dependencies"]["archon_mcp"]["url"] == "http://platform-mcp:9151"
 
 
 @pytest.mark.unit
@@ -204,3 +252,68 @@ def test_startup_logs_docker_mode(caplog):
 
     # Verify config is set to docker_compose mode
     assert config.SERVICE_DISCOVERY_MODE == "docker_compose"
+
+
+class TestWarnOptionalVarsReferencesRequiredConfig:
+    """Verify startup warnings point operators to REQUIRED_CONFIG.md."""
+
+    def _make_mock_log(self):
+        """Return a mock logger that captures warning calls."""
+        return Mock()
+
+    @patch.dict(
+        "os.environ",
+        {
+            "ENABLE_AGENT_WORK_ORDERS": "true",
+            "ANTHROPIC_API_KEY": "",
+            "CLAUDE_CODE_OAUTH_TOKEN": "",
+            "GITHUB_PAT_TOKEN": "tok",
+        },
+    )
+    @pytest.mark.unit
+    def test_missing_claude_auth_warning_references_required_config(self):
+        """Missing Claude auth warning includes REQUIRED_CONFIG.md reference."""
+        from src.agent_work_orders.server import _warn_optional_vars
+
+        log = self._make_mock_log()
+        _warn_optional_vars(log)
+
+        assert log.warning.called
+        call_args = log.warning.call_args_list
+        details = [str(call) for call in call_args]
+        combined = " ".join(details)
+        assert "REQUIRED_CONFIG.md#agent-work-orders" in combined
+
+    @patch.dict(
+        "os.environ",
+        {
+            "ENABLE_AGENT_WORK_ORDERS": "true",
+            "ANTHROPIC_API_KEY": "sk-test",
+            "GITHUB_PAT_TOKEN": "",
+        },
+    )
+    @pytest.mark.unit
+    def test_missing_github_pat_warning_references_required_config(self):
+        """Missing GITHUB_PAT_TOKEN warning includes REQUIRED_CONFIG.md reference."""
+        from src.agent_work_orders.server import _warn_optional_vars
+
+        log = self._make_mock_log()
+        _warn_optional_vars(log)
+
+        assert log.warning.called
+        call_args = log.warning.call_args_list
+        details = [str(call) for call in call_args]
+        combined = " ".join(details)
+        assert "REQUIRED_CONFIG.md#agent-work-orders" in combined
+
+    @pytest.mark.unit
+    @patch("src.agent_work_orders.server.config")
+    def test_no_warnings_when_feature_disabled(self, mock_config):
+        """No warnings emitted when agent work orders feature is disabled."""
+        from src.agent_work_orders.server import _warn_optional_vars
+
+        mock_config.ENABLED = False
+        log = self._make_mock_log()
+        _warn_optional_vars(log)
+
+        assert not log.warning.called

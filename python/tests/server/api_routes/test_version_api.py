@@ -30,7 +30,15 @@ def mock_version_data():
         "published_at": datetime(2025, 1, 1, 0, 0, 0),
         "check_error": None,
         "author": "coleam00",
-        "assets": [{"name": "archon.zip", "size": 1024000}],
+        "assets": [
+            {
+                "name": "archon.zip",
+                "size": 1024000,
+                "download_count": 42,
+                "browser_download_url": "https://example.com/archon.zip",
+                "content_type": "application/zip",
+            }
+        ],
     }
 
 

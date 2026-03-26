@@ -4,7 +4,11 @@ import pytest
 from pydantic import ValidationError
 
 from src.server.models.api_contracts import (
+    CreateExecutionRunRequest,
     CreateTaskRequest,
+    ExecutionRunResponse,
+    ExecutionRunStage,
+    ExecutionRunStatus,
     ProjectResponse,
     RuleResponse,
     RuleSource,
@@ -24,13 +28,13 @@ from src.server.models.api_contracts import (
 
 
 class TestTaskStatusEnum:
-    def test_all_14_statuses_exist(self):
-        assert len(TaskStatus) == 14
+    def test_all_15_statuses_exist(self):
+        assert len(TaskStatus) == 15
 
     def test_valid_status_values(self):
         expected = {
             "draft", "proposed", "approved", "planning", "owner-qa",
-            "assigned", "executing", "architect-review", "review",
+            "assigned", "executing", "architect-review", "code-review", "review",
             "done", "failed", "escalated", "on-hold", "cancelled",
         }
         assert {s.value for s in TaskStatus} == expected
@@ -38,6 +42,7 @@ class TestTaskStatusEnum:
     def test_enum_string_comparison(self):
         assert TaskStatus.DRAFT == "draft"
         assert TaskStatus.ARCHITECT_REVIEW == "architect-review"
+        assert TaskStatus.CODE_REVIEW == "code-review"
 
 
 class TestTaskPriorityEnum:
@@ -50,6 +55,18 @@ class TestTaskComplexityEnum:
     def test_values(self):
         assert TaskComplexity.SIMPLE == "simple"
         assert TaskComplexity.COMPLEX == "complex"
+
+
+class TestExecutionRunEnums:
+    def test_execution_run_status_values(self):
+        assert {s.value for s in ExecutionRunStatus} == {
+            "queued", "running", "reviewing", "completed", "failed", "cancelled"
+        }
+
+    def test_execution_run_stage_values(self):
+        assert {s.value for s in ExecutionRunStage} == {
+            "execute", "architect-review", "code-review", "retry"
+        }
 
 
 class TestRuleSourceEnum:
@@ -158,6 +175,38 @@ class TestTaskListResponse:
         data = {"tasks": [], "total_count": 0}
         response = TaskListResponse.model_validate(data)
         assert response.tasks == []
+
+
+class TestExecutionRunResponse:
+    def test_valid_execution_run(self):
+        run = ExecutionRunResponse(
+            id="run-001",
+            task_id="task-001",
+            project_id="proj-001",
+            status="queued",
+            stage="execute",
+            started_at="2026-03-20T10:00:00Z",
+        )
+        assert run.status == "queued"
+        assert run.stage == "execute"
+
+    def test_invalid_execution_run_status_rejected(self):
+        with pytest.raises(ValidationError):
+            ExecutionRunResponse(
+                id="run-001",
+                task_id="task-001",
+                project_id="proj-001",
+                status="bad",
+                stage="execute",
+                started_at="2026-03-20T10:00:00Z",
+            )
+
+
+class TestCreateExecutionRunRequest:
+    def test_defaults(self):
+        req = CreateExecutionRunRequest(task_id="task-001", project_id="proj-001")
+        assert req.status == "queued"
+        assert req.stage == "execute"
 
 
 class TestProjectResponse:

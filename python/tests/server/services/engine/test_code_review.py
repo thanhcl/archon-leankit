@@ -13,6 +13,7 @@ from src.server.services.engine.task_engine import TaskEngine
 def _make_task(**overrides):
     base = {
         "id": "task-001",
+        "project_id": "proj-001",
         "title": "Add auth endpoint",
         "description": "Implement login",
         "status": "code-review",
@@ -98,6 +99,9 @@ def _setup_engine():
     engine.task_service = MagicMock()
     engine.task_service.get_task.return_value = (True, {"task": _make_task()})
     engine.task_service.update_task = AsyncMock(return_value=(True, {}))
+    engine.execution_run_service = MagicMock()
+    engine.execution_run_service.create_run = AsyncMock(return_value=(True, {"run": {"id": "run-code-review-001"}}))
+    engine.execution_run_service.update_run = AsyncMock(return_value=(True, {}))
     engine.prompt_builder = MagicMock()
     engine.prompt_builder.build = AsyncMock(return_value=("test prompt", {"learnings": 0, "patterns": 0, "kb_chunks": 0, "tokens": 100}))
     engine.spawner = MagicMock()
@@ -163,6 +167,8 @@ class TestCodeReviewApprove:
         code_review = update_call[1]["update_fields"]["code_review"]
         assert code_review["verdict"] == "APPROVE"
         assert code_review["model"] == MODEL_SONNET
+        engine.execution_run_service.create_run.assert_awaited_once()
+        engine.execution_run_service.update_run.assert_awaited_once()
 
 
 class TestCodeReviewRequestChanges:

@@ -863,3 +863,206 @@ class TestGetRelevantLearnings:
             task_keywords=["a", "to", "fix"],  # only "fix" should be used
         )
         assert len(result) == 1
+
+
+# ---------------------------------------------------------------------------
+# Tests: execution_run_id tracking
+# ---------------------------------------------------------------------------
+
+
+class TestExecutionRunTracking:
+    @pytest.mark.asyncio
+    async def test_store_includes_run_id(self):
+        client = _mock_client()
+        processor = LearningProcessor(supabase_client=client)
+
+        await processor.store(_make_task(), _make_learning(), execution_run_id="run-001")
+
+        insert_call = client.table().insert.call_args[0][0]
+        assert insert_call["source_run_ids"] == ["run-001"]
+
+    @pytest.mark.asyncio
+    async def test_store_empty_run_ids_without_run(self):
+        client = _mock_client()
+        processor = LearningProcessor(supabase_client=client)
+
+        await processor.store(_make_task(), _make_learning(), execution_run_id=None)
+
+        insert_call = client.table().insert.call_args[0][0]
+        assert insert_call["source_run_ids"] == []
+
+    @pytest.mark.asyncio
+    async def test_increment_recurrence_appends_run_id(self):
+        client = _mock_client()
+        processor = LearningProcessor(supabase_client=client)
+        existing = _make_existing_learning(recurrence_count=1, source_run_ids=["run-old"])
+
+        await processor.increment_recurrence(existing, "task-new", execution_run_id="run-002")
+
+        update_call = client.table().update.call_args[0][0]
+        assert "run-old" in update_call["source_run_ids"]
+        assert "run-002" in update_call["source_run_ids"]
+
+    @pytest.mark.asyncio
+    async def test_increment_recurrence_dedupes_run_ids(self):
+        client = _mock_client()
+        processor = LearningProcessor(supabase_client=client)
+        existing = _make_existing_learning(recurrence_count=1, source_run_ids=["run-001"])
+
+        await processor.increment_recurrence(existing, "task-new", execution_run_id="run-001")
+
+        update_call = client.table().update.call_args[0][0]
+        assert update_call["source_run_ids"].count("run-001") == 1
+
+    @pytest.mark.asyncio
+    async def test_process_passes_run_id_to_store(self):
+        client = _mock_client(select_data=[])  # no similar
+        processor = LearningProcessor(supabase_client=client)
+
+        await processor.process(
+            _make_task(), [_make_learning()], execution_run_id="run-abc"
+        )
+
+        insert_call = client.table().insert.call_args[0][0]
+        assert insert_call["source_run_ids"] == ["run-abc"]
+
+    @pytest.mark.asyncio
+    async def test_process_passes_run_id_to_increment(self):
+        existing = _make_existing_learning(recurrence_count=1, source_run_ids=[])
+        client = _mock_client(select_data=[existing])
+        processor = LearningProcessor(supabase_client=client)
+
+        await processor.process(
+            _make_task(),
+            [_make_learning(description="Missing null check on user input caused crash")],
+            execution_run_id="run-xyz",
+        )
+
+        update_call = client.table().update.call_args_list[0][0][0]
+        assert "run-xyz" in update_call["source_run_ids"]
+
+
+# ---------------------------------------------------------------------------
+# Tests: promotion log
+# ---------------------------------------------------------------------------
+
+
+class TestPromotionLog:
+    def _mock_full_client(self, select_data=None):
+        """Mock that routes both TABLE and PROMOTION_LOG_TABLE separately."""
+        client = MagicMock()
+
+        def make_table_mock(s_data):
+            table = MagicMock()
+            select = MagicMock()
+            select.eq.return_value = select
+            select.in_.return_value = select
+            select.order.return_value = select
+            select.limit.return_value = select
+            execute_result = MagicMock()
+            execute_result.data = s_data or []
+            select.execute.return_value = execute_result
+            table.select.return_value = select
+
+            insert_result = MagicMock()
+            insert_result.data = [{"id": "log-new"}]
+            insert_mock = MagicMock()
+            insert_mock.execute.return_value = insert_result
+            table.insert.return_value = insert_mock
+
+            update = MagicMock()
+            update.eq.return_value = update
+            update.execute.return_value = MagicMock(data=[{}])
+            table.update.return_value = update
+
+            return table
+
+        learnings_table = make_table_mock(select_data)
+        suggestions_table = make_table_mock([])
+        log_table = make_table_mock([])
+
+        def router(name):
+            if name == "archon_promotion_log":
+                return log_table
+            if name == "archon_rule_suggestions":
+                return suggestions_table
+            return learnings_table
+
+        client.table.side_effect = router
+        return client, log_table
+
+    @pytest.mark.asyncio
+    async def test_auto_promote_writes_log(self):
+        client, log_table = self._mock_full_client()
+        processor = LearningProcessor(supabase_client=client)
+
+        learning = _make_existing_learning(
+            recurrence_count=3,
+            suggested_rule="Always validate inputs",
+            source_run_ids=["run-1", "run-2"],
+            related_tasks=["task-a", "task-b"],
+        )
+        await processor.auto_promote(learning)
+
+        log_table.insert.assert_called_once()
+        log_call = log_table.insert.call_args[0][0]
+        assert log_call["learning_id"] == "learn-001"
+        assert log_call["promotion_type"] == "auto"
+        assert log_call["promoted_to"] == "KB"
+        assert log_call["recurrence_count"] == 3
+        assert log_call["source_run_ids"] == ["run-1", "run-2"]
+        assert log_call["source_task_ids"] == ["task-a", "task-b"]
+        assert 0 < log_call["confidence"] <= 0.95
+
+    @pytest.mark.asyncio
+    async def test_log_promotion_handles_db_error(self):
+        """Promotion log failure should not break the promote flow."""
+        client, log_table = self._mock_full_client()
+        log_table.insert.side_effect = Exception("DB error")
+        processor = LearningProcessor(supabase_client=client)
+
+        learning = _make_existing_learning(
+            recurrence_count=3, suggested_rule="Always validate inputs"
+        )
+        # Should not raise
+        await processor.auto_promote(learning)
+
+    @pytest.mark.asyncio
+    async def test_manual_promote_writes_log(self):
+        learning_row = _make_existing_learning(
+            recurrence_count=2, source_run_ids=["run-x"]
+        )
+        client, log_table = self._mock_full_client(select_data=[learning_row])
+        processor = LearningProcessor(supabase_client=client)
+
+        ok, msg = await processor.manual_promote("learn-001")
+
+        assert ok is True
+        log_table.insert.assert_called_once()
+        log_call = log_table.insert.call_args[0][0]
+        assert log_call["promotion_type"] == "manual"
+        assert log_call["promoted_to"] == "KB_manual"
+
+    @pytest.mark.asyncio
+    async def test_log_confidence_formula(self):
+        """Confidence = min(0.95, 0.5 + (recurrence-1) * 0.1)."""
+        client, log_table = self._mock_full_client()
+        processor = LearningProcessor(supabase_client=client)
+
+        # recurrence=1 → 0.5 + 0*0.1 = 0.5
+        await processor._log_promotion(
+            _make_existing_learning(recurrence_count=1),
+            promotion_type="auto", promoted_to="KB",
+        )
+        call = log_table.insert.call_args[0][0]
+        assert call["confidence"] == 0.5
+
+        log_table.insert.reset_mock()
+
+        # recurrence=6 → 0.5 + 5*0.1 = 1.0 → capped at 0.95
+        await processor._log_promotion(
+            _make_existing_learning(recurrence_count=6),
+            promotion_type="auto", promoted_to="KB",
+        )
+        call = log_table.insert.call_args[0][0]
+        assert call["confidence"] == 0.95
