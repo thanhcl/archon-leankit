@@ -23,6 +23,11 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
+from ..server.config.startup_validation import (
+    validate_agents_control_plane_port,
+    validate_agents_entrypoint_port,
+)
+
 # Import our PydanticAI agents
 from .document_agent import DocumentAgent
 from .rag_agent import RagAgent
@@ -65,17 +70,12 @@ async def fetch_credentials_from_server():
     """Fetch credentials from the server's internal API."""
     max_retries = 30  # Try for up to 5 minutes (30 * 10 seconds)
     retry_delay = 10  # seconds
+    server_port = validate_agents_control_plane_port()
 
     for attempt in range(max_retries):
         try:
             async with httpx.AsyncClient() as client:
                 # Call the server's internal credentials endpoint
-                server_port = os.getenv("ARCHON_SERVER_PORT")
-                if not server_port:
-                    raise ValueError(
-                        "ARCHON_SERVER_PORT environment variable is required. "
-                        "Please set it in your .env file or environment."
-                    )
                 response = await client.get(
                     f"http://archon-server:{server_port}/internal/credentials/agents", timeout=10.0
                 )
@@ -104,7 +104,7 @@ async def fetch_credentials_from_server():
                 await asyncio.sleep(retry_delay)
             else:
                 logger.error(f"Failed to fetch credentials after {max_retries} attempts")
-                raise Exception("Could not fetch credentials from server")
+                raise RuntimeError("Could not fetch credentials from server") from e
 
 
 # Lifespan context manager
@@ -116,9 +116,9 @@ async def lifespan(app: FastAPI):
     # Fetch credentials from server first
     try:
         await fetch_credentials_from_server()
-    except Exception as e:
-        logger.error(f"Failed to fetch credentials: {e}")
-        # Continue with defaults if we can't get credentials
+    except Exception:
+        logger.error("Failed to fetch credentials during startup", exc_info=True)
+        raise
 
     # Initialize agents with fetched credentials
     app.state.agents = {}
@@ -285,14 +285,7 @@ async def stream_agent(agent_type: str, request: AgentRequest):
 
 # Main entry point
 if __name__ == "__main__":
-    agents_port = os.getenv("ARCHON_AGENTS_PORT")
-    if not agents_port:
-        raise ValueError(
-            "ARCHON_AGENTS_PORT environment variable is required. "
-            "Please set it in your .env file or environment. "
-            "Default value: 8052"
-        )
-    port = int(agents_port)
+    port = validate_agents_entrypoint_port()
 
     uvicorn.run(
         "server:app",

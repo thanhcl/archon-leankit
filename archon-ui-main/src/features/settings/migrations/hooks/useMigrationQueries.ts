@@ -5,8 +5,12 @@
 import { useQuery } from "@tanstack/react-query";
 import { STALE_TIMES } from "@/features/shared/config/queryPatterns";
 import { useSmartPolling } from "@/features/shared/hooks/useSmartPolling";
+import type {
+  MigrationHistoryResponse,
+  MigrationStatusResponse,
+  PendingMigration,
+} from "@/types/api-contracts.generated";
 import { migrationService } from "../services/migrationService";
-import type { MigrationHistoryResponse, MigrationStatusResponse, PendingMigration } from "../types";
 
 // Query key factory
 export const migrationKeys = {

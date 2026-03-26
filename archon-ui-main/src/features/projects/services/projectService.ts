@@ -5,6 +5,7 @@
 
 import { callAPIWithETag } from "../../shared/api/apiClient";
 import { formatZodErrors, ValidationError } from "../../shared/types/errors";
+import type { ProjectListResponse } from "../../../types/api-contracts.generated";
 import { validateCreateProject, validateUpdateProject } from "../schemas";
 import { formatRelativeTime } from "../shared/api";
 import type { CreateProjectRequest, Project, ProjectFeatures, UpdateProjectRequest } from "../types";
@@ -16,10 +17,10 @@ export const projectService = {
   async listProjects(): Promise<Project[]> {
     try {
       // Fetching projects from API
-      const response = await callAPIWithETag<{ projects: Project[] }>("/api/projects");
+      const response = await callAPIWithETag<ProjectListResponse>("/api/projects");
       // API response received
 
-      const projects = response.projects || [];
+      const projects = (response.projects || []) as Project[];
       // Processing projects array
 
       // Process raw pinned values

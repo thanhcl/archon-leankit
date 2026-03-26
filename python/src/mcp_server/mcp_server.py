@@ -55,6 +55,8 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Import Logfire configuration
+from src.server.config.env_aliases import get_control_plane_mcp_port
+from src.server.config.required_config import missing_env_message
 from src.server.config.logfire_config import mcp_logger, setup_logfire
 
 # Import service client for HTTP calls
@@ -71,12 +73,15 @@ _shared_context = None
 server_host = "0.0.0.0"  # Listen on all interfaces
 
 # Require ARCHON_MCP_PORT to be set
-mcp_port = os.getenv("ARCHON_MCP_PORT")
+mcp_port = get_control_plane_mcp_port()
 if not mcp_port:
     raise ValueError(
-        "ARCHON_MCP_PORT environment variable is required. "
-        "Please set it in your .env file or environment. "
-        "Default value: 8051"
+        missing_env_message(
+            "archon-mcp-server",
+            ("LEANKIT_CONTROL_PLANE_MCP_PORT", "ARCHON_MCP_PORT"),
+            detail="Preferred platform alias: LEANKIT_CONTROL_PLANE_MCP_PORT.",
+            anchor="archon-mcp-server",
+        )
     )
 server_port = int(mcp_port)
 

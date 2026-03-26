@@ -5,7 +5,9 @@
  * Priority represents semantic importance and is stored directly in the database.
  */
 
-export type TaskPriority = "critical" | "high" | "medium" | "low";
+import type { TaskPriority } from "../../../../types/api-contracts.generated";
+
+export type { TaskPriority };
 
 export interface TaskPriorityOption {
   value: TaskPriority; // Direct priority values from database enum

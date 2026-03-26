@@ -1,0 +1,253 @@
+# Production environment — hardened, no source mounts, restart:always, resource limits
+# Usage:
+#   cp deploy/production/.env.example .env
+#   docker compose -f deploy/production/docker-compose.yml pull   # if using registry images
+#   docker compose -f deploy/production/docker-compose.yml up --build -d
+#
+# Differences from staging:
+#   - restart: always (survives host reboots)
+#   - Tighter resource limits
+#   - No dev-tool env vars exposed
+#   - Supabase-backed state storage enforced
+
+services:
+  archon-server:
+    build:
+      context: ../../python
+      dockerfile: Dockerfile.server
+      args:
+        BUILDKIT_INLINE_CACHE: 1
+        ARCHON_SERVER_PORT: ${ARCHON_SERVER_PORT:-8181}
+    image: archon-server:production
+    container_name: archon-server
+    restart: always
+    ports:
+      - "${ARCHON_SERVER_PORT:-8181}:${ARCHON_SERVER_PORT:-8181}"
+    environment:
+      - SUPABASE_URL=${SUPABASE_URL}
+      - SUPABASE_SERVICE_KEY=${SUPABASE_SERVICE_KEY}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - LOGFIRE_TOKEN=${LOGFIRE_TOKEN:-}
+      - SERVICE_DISCOVERY_MODE=docker_compose
+      - LOG_LEVEL=${LOG_LEVEL:-WARNING}
+      - ARCHON_SERVER_PORT=${ARCHON_SERVER_PORT:-8181}
+      - ARCHON_MCP_PORT=${ARCHON_MCP_PORT:-8051}
+      - ARCHON_AGENTS_PORT=${ARCHON_AGENTS_PORT:-8052}
+      - AGENT_WORK_ORDERS_PORT=${AGENT_WORK_ORDERS_PORT:-8053}
+      - AGENTS_ENABLED=${AGENTS_ENABLED:-true}
+      - ARCHON_HOST=${HOST}
+      - ENABLE_AGENT_WORK_ORDERS=${ENABLE_AGENT_WORK_ORDERS:-true}
+      - ENABLE_DOCKER_SOCKET_MONITORING=false
+      - MCP_HEALTH_CHECK_TIMEOUT=${MCP_HEALTH_CHECK_TIMEOUT:-10}
+      - LEANKIT_OBSERVABILITY_INGEST_URL=${LEANKIT_OBSERVABILITY_INGEST_URL:-}
+      - LEANKIT_OBSERVABILITY_REPLAY_URL=${LEANKIT_OBSERVABILITY_REPLAY_URL:-}
+      - LEANKIT_TELEGRAM_BOT_TOKEN=${LEANKIT_TELEGRAM_BOT_TOKEN:-}
+      - LEANKIT_TELEGRAM_CHAT_ID=${LEANKIT_TELEGRAM_CHAT_ID:-}
+      - LEANKIT_TELEGRAM_WEBHOOK_SECRET=${LEANKIT_TELEGRAM_WEBHOOK_SECRET:-}
+      - LEANKIT_TELEGRAM_ONLY_CRITICAL=${LEANKIT_TELEGRAM_ONLY_CRITICAL:-}
+      - LEANKIT_TELEGRAM_NOTIFY_EVENTS=${LEANKIT_TELEGRAM_NOTIFY_EVENTS:-}
+      - LEANKIT_TELEGRAM_DIGEST_EVENTS=${LEANKIT_TELEGRAM_DIGEST_EVENTS:-}
+      - LEANKIT_TELEGRAM_DIGEST_LIMIT=${LEANKIT_TELEGRAM_DIGEST_LIMIT:-}
+      - LEANKIT_TELEGRAM_DIGEST_HOUR=${LEANKIT_TELEGRAM_DIGEST_HOUR:-}
+      - LEANKIT_TELEGRAM_DIGEST_MINUTE=${LEANKIT_TELEGRAM_DIGEST_MINUTE:-}
+      - LEANKIT_TELEGRAM_DIGEST_TIMEZONE=${LEANKIT_TELEGRAM_DIGEST_TIMEZONE:-}
+      - LEANKIT_TELEGRAM_DIGEST_LOOKBACK_MINUTES=${LEANKIT_TELEGRAM_DIGEST_LOOKBACK_MINUTES:-}
+      - LEANKIT_TELEGRAM_DIGEST_SCHEDULER_ENABLED=${LEANKIT_TELEGRAM_DIGEST_SCHEDULER_ENABLED:-}
+      - LEANKIT_OPENCLAW_INGEST_SECRET=${LEANKIT_OPENCLAW_INGEST_SECRET:-}
+      - LEANKIT_OPENCLAW_REPLAY_WINDOW_MINUTES=${LEANKIT_OPENCLAW_REPLAY_WINDOW_MINUTES:-}
+    networks:
+      - app-network
+    volumes:
+      - ../../migration:/app/migration:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2G
+        reservations:
+          cpus: "0.5"
+          memory: 512M
+    healthcheck:
+      test: ["CMD", "sh", "-c",
+        'python -c "import urllib.request; urllib.request.urlopen(\"http://localhost:${ARCHON_SERVER_PORT:-8181}/health\")"']
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  archon-mcp:
+    build:
+      context: ../../python
+      dockerfile: Dockerfile.mcp
+      args:
+        BUILDKIT_INLINE_CACHE: 1
+        ARCHON_MCP_PORT: ${ARCHON_MCP_PORT:-8051}
+    image: archon-mcp:production
+    container_name: archon-mcp
+    restart: always
+    ports:
+      - "${ARCHON_MCP_PORT:-8051}:${ARCHON_MCP_PORT:-8051}"
+    environment:
+      - SUPABASE_URL=${SUPABASE_URL}
+      - SUPABASE_SERVICE_KEY=${SUPABASE_SERVICE_KEY}
+      - LOGFIRE_TOKEN=${LOGFIRE_TOKEN:-}
+      - SERVICE_DISCOVERY_MODE=docker_compose
+      - TRANSPORT=sse
+      - LOG_LEVEL=${LOG_LEVEL:-WARNING}
+      - API_SERVICE_URL=http://archon-server:${ARCHON_SERVER_PORT:-8181}
+      - AGENTS_ENABLED=${AGENTS_ENABLED:-true}
+      - AGENTS_SERVICE_URL=http://archon-agents:${ARCHON_AGENTS_PORT:-8052}
+      - ARCHON_MCP_PORT=${ARCHON_MCP_PORT:-8051}
+      - ARCHON_SERVER_PORT=${ARCHON_SERVER_PORT:-8181}
+      - ARCHON_AGENTS_PORT=${ARCHON_AGENTS_PORT:-8052}
+    networks:
+      - app-network
+    depends_on:
+      archon-server:
+        condition: service_healthy
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M
+        reservations:
+          cpus: "0.1"
+          memory: 128M
+    healthcheck:
+      test: ["CMD", "sh", "-c",
+        'python -c "import socket; s=socket.socket(); s.connect((\"localhost\", ${ARCHON_MCP_PORT:-8051})); s.close()"']
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  archon-agents:
+    build:
+      context: ../../python
+      dockerfile: Dockerfile.agents
+      args:
+        BUILDKIT_INLINE_CACHE: 1
+        ARCHON_AGENTS_PORT: ${ARCHON_AGENTS_PORT:-8052}
+    image: archon-agents:production
+    container_name: archon-agents
+    restart: always
+    ports:
+      - "${ARCHON_AGENTS_PORT:-8052}:${ARCHON_AGENTS_PORT:-8052}"
+    environment:
+      - SUPABASE_URL=${SUPABASE_URL}
+      - SUPABASE_SERVICE_KEY=${SUPABASE_SERVICE_KEY}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - LOGFIRE_TOKEN=${LOGFIRE_TOKEN:-}
+      - SERVICE_DISCOVERY_MODE=docker_compose
+      - LOG_LEVEL=${LOG_LEVEL:-WARNING}
+      - ARCHON_AGENTS_PORT=${ARCHON_AGENTS_PORT:-8052}
+      - ARCHON_SERVER_PORT=${ARCHON_SERVER_PORT:-8181}
+    networks:
+      - app-network
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 4G
+        reservations:
+          cpus: "0.5"
+          memory: 1G
+    healthcheck:
+      test: ["CMD", "sh", "-c",
+        'python -c "import urllib.request; urllib.request.urlopen(\"http://localhost:${ARCHON_AGENTS_PORT:-8052}/health\")"']
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  archon-agent-work-orders:
+    build:
+      context: ../../python
+      dockerfile: Dockerfile.agent-work-orders
+      args:
+        BUILDKIT_INLINE_CACHE: 1
+        AGENT_WORK_ORDERS_PORT: ${AGENT_WORK_ORDERS_PORT:-8053}
+    image: archon-agent-work-orders:production
+    container_name: archon-agent-work-orders
+    restart: always
+    depends_on:
+      - archon-server
+    ports:
+      - "${AGENT_WORK_ORDERS_PORT:-8053}:${AGENT_WORK_ORDERS_PORT:-8053}"
+    environment:
+      - ENABLE_AGENT_WORK_ORDERS=true
+      - SERVICE_DISCOVERY_MODE=docker_compose
+      - STATE_STORAGE_TYPE=supabase
+      - ARCHON_SERVER_URL=http://archon-server:${ARCHON_SERVER_PORT:-8181}
+      - ARCHON_MCP_URL=http://archon-mcp:${ARCHON_MCP_PORT:-8051}
+      - SUPABASE_URL=${SUPABASE_URL}
+      - SUPABASE_SERVICE_KEY=${SUPABASE_SERVICE_KEY}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN:-}
+      - LOGFIRE_TOKEN=${LOGFIRE_TOKEN:-}
+      - LOG_LEVEL=${LOG_LEVEL:-WARNING}
+      - AGENT_WORK_ORDERS_PORT=${AGENT_WORK_ORDERS_PORT:-8053}
+      - CLAUDE_CLI_PATH=${CLAUDE_CLI_PATH:-claude}
+      - GH_CLI_PATH=${GH_CLI_PATH:-gh}
+      - GH_TOKEN=${GITHUB_PAT_TOKEN}
+    networks:
+      - app-network
+    volumes:
+      - /tmp/agent-work-orders:/tmp/agent-work-orders
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2G
+        reservations:
+          cpus: "0.25"
+          memory: 256M
+    healthcheck:
+      test: ["CMD", "python", "-c",
+        'import urllib.request; urllib.request.urlopen("http://localhost:${AGENT_WORK_ORDERS_PORT:-8053}/health")']
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  archon-frontend:
+    build: ../../archon-ui-main
+    image: archon-frontend:production
+    container_name: archon-ui
+    restart: always
+    ports:
+      - "${ARCHON_UI_PORT:-3737}:3737"
+    environment:
+      - VITE_ARCHON_SERVER_PORT=${ARCHON_SERVER_PORT:-8181}
+      - ARCHON_SERVER_PORT=${ARCHON_SERVER_PORT:-8181}
+      - HOST=${HOST}
+      - PROD=${PROD:-true}
+      - VITE_ALLOWED_HOSTS=${VITE_ALLOWED_HOSTS}
+      - VITE_SHOW_DEVTOOLS=false
+      - DOCKER_ENV=true
+    networks:
+      - app-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3737"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    depends_on:
+      archon-server:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M
+
+networks:
+  app-network:
+    driver: bridge

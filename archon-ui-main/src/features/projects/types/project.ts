@@ -4,6 +4,23 @@
  * Properly typed project interfaces following vertical slice architecture
  */
 
+import type {
+  ApprovalRequestResponse,
+  BootstrapPlanListResponse as GeneratedBootstrapPlanListResponse,
+  BootstrapPlanMaterializeResponse as GeneratedBootstrapPlanMaterializeResponse,
+  BootstrapPlanResponse,
+  CreateProjectRequest as GeneratedCreateProjectRequest,
+  ExecutionRunResponse,
+  ExternalChannelHeartbeatResponse,
+  ExternalRequestResponse,
+  OpenClawChannelHealthResponse,
+  PlatformServiceHealthResponse,
+  ProjectResponse,
+  ServiceDependencyHealthResponse,
+  TelegramChannelHealthResponse,
+  UpdateProjectRequest as GeneratedUpdateProjectRequest,
+} from "../../../types/api-contracts.generated";
+
 // Project JSONB field types - replacing any with proper unions
 export type ProjectPRD = Record<string, unknown>;
 export type ProjectDocs = unknown[]; // Will be refined to ProjectDocument[] when fully migrated
@@ -40,77 +57,124 @@ export interface ProjectCreationProgress {
   project?: Project; // Forward reference - will be resolved
 }
 
-// Base Project interface (matches database schema)
-export interface Project {
-  id: string;
-  title: string;
-  prd?: ProjectPRD;
-  docs?: ProjectDocs;
-  features?: ProjectFeatures;
-  data?: ProjectData;
-  github_repo?: string;
-  created_at: string;
-  updated_at: string;
-  technical_sources?: string[];
-  business_sources?: string[];
+type ProjectContractFields = Omit<ProjectResponse, "docs" | "features" | "data">;
 
-  // Extended UI properties
+// Base Project type aligned with the API contract and extended for UI state
+export type Project = ProjectContractFields & {
+  prd?: ProjectPRD;
+  docs?: ProjectDocs | null;
+  features?: ProjectFeatures | null;
+  data?: ProjectData | null;
+
   description?: string;
   progress?: number;
   updated?: string; // Human-readable format
-  pinned: boolean;
-
-  // Creation progress tracking for inline display
   creationProgress?: ProjectCreationProgress;
+};
 
-  // Virtual Office fields
-  source_app?: string;
-  layout_id?: string;
-  team_config?: Record<string, unknown>[];
-  director_config?: Record<string, unknown>;
-  team_lead_config?: Record<string, unknown>;
-  office_settings?: Record<string, unknown>;
-}
-
-// Request types
-export interface CreateProjectRequest {
+// Bootstrap plan task summary used when rendering materialized task lists
+export interface BootstrapPlanTaskSummary {
+  id: string;
+  plan_key?: string;
   title: string;
-  description?: string;
-  github_repo?: string;
-  pinned?: boolean;
-  docs?: ProjectDocs;
-  features?: ProjectFeatures;
-  data?: ProjectData;
-  technical_sources?: string[];
-  business_sources?: string[];
-  // Virtual Office fields
-  source_app?: string;
-  layout_id?: string;
-  team_config?: Record<string, unknown>[];
-  director_config?: Record<string, unknown>;
-  team_lead_config?: Record<string, unknown>;
-  office_settings?: Record<string, unknown>;
+  status: string;
+  tags?: string[];
+  created_from?: string;
+  blocked_by?: string[];
 }
 
-export interface UpdateProjectRequest {
-  title?: string;
+// BootstrapPlan extends the generated contract to use typed created_tasks
+export type BootstrapPlan = Omit<BootstrapPlanResponse, "created_tasks"> & {
+  created_tasks?: BootstrapPlanTaskSummary[] | null;
+};
+
+// List and materialize responses re-typed to use the extended BootstrapPlan
+export type BootstrapPlanListResponse = Omit<GeneratedBootstrapPlanListResponse, "plans"> & {
+  plans: BootstrapPlan[];
+};
+
+export type BootstrapPlanMaterializeResponse = Omit<
+  GeneratedBootstrapPlanMaterializeResponse,
+  "plan" | "created_tasks"
+> & {
+  plan: BootstrapPlan;
+  created_tasks: BootstrapPlanTaskSummary[];
+};
+
+export type BootstrapPlanExecutionRun = Omit<ExecutionRunResponse, "retry_index"> & {
+  retry_index?: number;
+};
+
+// BootstrapTraceEvent - comes from the observability service (not the main API contract)
+export interface BootstrapTraceEvent {
+  id: string;
+  type: string;
+  event: string;
+  source: string;
+  sourceApp: string;
+  projectId?: string;
+  agentId?: string;
+  taskId?: string;
+  runId?: string;
+  executionRunId?: string;
+  bootstrapPlanId?: string;
+  timestamp: string;
+  data: Record<string, unknown>;
+}
+
+// ExternalRequest extends the generated contract to preserve structured payload type
+export type ExternalRequest = Omit<ExternalRequestResponse, "payload"> & {
+  payload?: {
+    architect_plan?: {
+      resolved_provider?: string;
+      strategy?: string;
+      summary?: string;
+      recommended_materialization?: string;
+      clarifying_questions?: string[];
+      suggested_tasks?: unknown[];
+    };
+    clarification_status?: string;
+    clarification_response_to_request_id?: string;
+    clarification_resolved_by_request_id?: string;
+    clarification_answers?: string[];
+    openclaw_sequence_snapshot?: {
+      step_key?: string | null;
+      history_count?: number;
+      sequence_closed?: boolean;
+      next_recommended_request_types?: string[];
+    };
+  } | null;
+};
+
+// ApprovalRequest - direct alias to the generated contract
+export type ApprovalRequest = ApprovalRequestResponse;
+
+// Channel health types - direct aliases to the generated contracts
+export type TelegramChannelHealth = TelegramChannelHealthResponse;
+export type OpenClawChannelHealth = OpenClawChannelHealthResponse;
+export type ExternalChannelHeartbeat = ExternalChannelHeartbeatResponse;
+export type ServiceDependencyHealth = ServiceDependencyHealthResponse;
+export type PlatformServiceHealth = PlatformServiceHealthResponse;
+
+type CreateProjectContractFields = Omit<GeneratedCreateProjectRequest, "description" | "github_repo" | "docs" | "features" | "data">;
+type UpdateProjectContractFields = Omit<GeneratedUpdateProjectRequest, "description" | "github_repo" | "docs" | "features" | "data">;
+
+export type CreateProjectRequest = CreateProjectContractFields & {
   description?: string;
   github_repo?: string;
+  docs?: ProjectDocs | null;
+  features?: ProjectFeatures | null;
+  data?: ProjectData | null;
+};
+
+export type UpdateProjectRequest = UpdateProjectContractFields & {
   prd?: ProjectPRD;
-  docs?: ProjectDocs;
-  features?: ProjectFeatures;
-  data?: ProjectData;
-  technical_sources?: string[];
-  business_sources?: string[];
-  pinned?: boolean;
-  // Virtual Office fields
-  source_app?: string;
-  layout_id?: string;
-  team_config?: Record<string, unknown>[];
-  director_config?: Record<string, unknown>;
-  team_lead_config?: Record<string, unknown>;
-  office_settings?: Record<string, unknown>;
-}
+  description?: string;
+  github_repo?: string;
+  docs?: ProjectDocs | null;
+  features?: ProjectFeatures | null;
+  data?: ProjectData | null;
+};
 
 // Utility types
 export interface MCPToolResponse<T = unknown> {

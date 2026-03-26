@@ -1,3 +1,9 @@
+import type {
+  CreateRuleRequest as GeneratedCreateRuleRequest,
+  RuleResponse as GeneratedRuleResponse,
+  UpdateRuleRequest as GeneratedUpdateRuleRequest,
+} from "../../../../types/api-contracts.generated";
+
 export type RuleSection =
   | "validation"
   | "integration"
@@ -19,33 +25,24 @@ export const RULE_SECTIONS: RuleSection[] = [
   "documentation",
 ];
 
-export interface Rule {
-  id: string;
+export type Rule = Omit<GeneratedRuleResponse, "section" | "source"> & {
   section: RuleSection;
-  rule_text: string;
-  project_id: string | null;
-  priority: number;
   source: string;
-  enabled: boolean;
-  created_at: string;
+  project_id: string | null;
   updated_at: string;
-}
+};
 
-export interface CreateRuleRequest {
+export type CreateRuleRequest = Omit<GeneratedCreateRuleRequest, "section" | "source" | "priority"> & {
   section: RuleSection;
-  rule_text: string;
+  source?: string;
   project_id?: string;
   priority?: number;
-  source?: string;
-}
+};
 
-export interface UpdateRuleRequest {
+export type UpdateRuleRequest = Omit<GeneratedUpdateRuleRequest, "section" | "source"> & {
   section?: RuleSection;
-  rule_text?: string;
-  priority?: number;
   source?: string;
-  enabled?: boolean;
-}
+};
 
 export interface OptimizeSuggestion {
   action: "add" | "modify" | "remove";

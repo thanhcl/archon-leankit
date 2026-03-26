@@ -13,7 +13,10 @@ import type {
   BudgetConfig,
   CostStatusResponse,
   CreateTaskRequest,
+  OwnerFeedbackRequest,
+  OwnerFeedbackResponse,
   PredictedVsActual,
+  ProjectTaskCountsMap,
   SprintStatsResponse,
   Task,
   TaskEstimate,
@@ -54,7 +57,7 @@ export function useProjectTasks(projectId: string | undefined, enabled = true) {
 // Fetch task counts for all projects
 export function useTaskCounts() {
   const { refetchInterval: countsRefetchInterval } = useSmartPolling(10_000); // 10s bg polling with smart pause
-  return useQuery<Awaited<ReturnType<typeof taskService.getTaskCountsForAllProjects>>>({
+  return useQuery<ProjectTaskCountsMap>({
     queryKey: taskKeys.counts(),
     queryFn: () => taskService.getTaskCountsForAllProjects(),
     refetchInterval: countsRefetchInterval,
@@ -226,7 +229,7 @@ export function useUpdateTask(projectId: string) {
       // Optimistically update
       queryClient.setQueryData<Task[]>(taskKeys.byProject(projectId), (old) => {
         if (!old) return old;
-        return old.map((task) => (task.id === taskId ? { ...task, ...updates } : task));
+        return old.map((task) => (task.id === taskId ? ({ ...task, ...updates } as Task) : task));
       });
 
       return { previousTasks };
@@ -288,7 +291,7 @@ export function useTransitionTask(projectId: string) {
 
       return { previousTasks };
     },
-    onError: (error, variables, context) => {
+    onError: (error, _variables, context) => {
       if (context?.previousTasks) {
         queryClient.setQueryData(taskKeys.byProject(projectId), context.previousTasks);
       }
@@ -300,6 +303,61 @@ export function useTransitionTask(projectId: string) {
         old ? old.map((t) => (t.id === data.task.id ? data.task : t)) : old,
       );
       showToast(`Task ${data.transition.to === "done" ? "approved" : "sent back"}`, "success");
+    },
+    onSettled: () => {
+      queryClient.invalidateQueries({ queryKey: taskKeys.byProject(projectId) });
+      queryClient.invalidateQueries({ queryKey: taskKeys.counts() });
+    },
+  });
+}
+
+// Re-plan task mutation — resets task to 'planning' with optional new description
+export function useRePlanTask(projectId: string) {
+  const queryClient = useQueryClient();
+  const { showToast } = useToast();
+
+  return useMutation<
+    { task: Task; transition: { from: string; to: string; action: string } },
+    Error,
+    { taskId: string; updatedDescription?: string; reason?: string }
+  >({
+    mutationFn: ({ taskId, updatedDescription, reason }) =>
+      taskService.rePlanTask(taskId, updatedDescription, "owner", reason),
+    onSuccess: (data) => {
+      queryClient.setQueryData<Task[]>(taskKeys.byProject(projectId), (old) =>
+        old ? old.map((t) => (t.id === data.task.id ? data.task : t)) : old,
+      );
+      showToast("Task reset to planning", "success");
+    },
+    onError: (error) => {
+      showToast(`Failed to re-plan task: ${error.message}`, "error");
+    },
+    onSettled: () => {
+      queryClient.invalidateQueries({ queryKey: taskKeys.byProject(projectId) });
+      queryClient.invalidateQueries({ queryKey: taskKeys.counts() });
+    },
+  });
+}
+
+// Continue task mutation — resumes paused/blocked task with operator guidance
+export function useContinueTask(projectId: string) {
+  const queryClient = useQueryClient();
+  const { showToast } = useToast();
+
+  return useMutation<
+    { task: Task; transition: { from: string; to: string; action: string } },
+    Error,
+    { taskId: string; guidance: string }
+  >({
+    mutationFn: ({ taskId, guidance }) => taskService.continueTask(taskId, guidance, "owner"),
+    onSuccess: (data) => {
+      queryClient.setQueryData<Task[]>(taskKeys.byProject(projectId), (old) =>
+        old ? old.map((t) => (t.id === data.task.id ? data.task : t)) : old,
+      );
+      showToast("Task resumed", "success");
+    },
+    onError: (error) => {
+      showToast(`Failed to continue task: ${error.message}`, "error");
     },
     onSettled: () => {
       queryClient.invalidateQueries({ queryKey: taskKeys.byProject(projectId) });
@@ -347,6 +405,36 @@ export function useDeleteTask(projectId: string) {
       queryClient.invalidateQueries({ queryKey: taskKeys.counts() });
       // Also refetch the project's task list to reconcile server-side ordering
       queryClient.invalidateQueries({ queryKey: taskKeys.byProject(projectId) });
+    },
+  });
+}
+
+// Submit owner feedback mutation for a completed task
+export function useSubmitFeedback(projectId: string) {
+  const queryClient = useQueryClient();
+  const { showToast } = useToast();
+
+  return useMutation<OwnerFeedbackResponse, Error, { taskId: string; feedback: OwnerFeedbackRequest }>({
+    mutationFn: ({ taskId, feedback }) => taskService.submitFeedback(taskId, feedback),
+    onSuccess: (data, { taskId }) => {
+      // Merge feedback fields back into the cached task list
+      queryClient.setQueryData<Task[]>(taskKeys.byProject(projectId), (old) => {
+        if (!old) return old;
+        return old.map((t) =>
+          t.id === taskId
+            ? {
+                ...t,
+                owner_rating: data.owner_rating,
+                owner_notes: data.owner_notes,
+                improvement_tags: data.improvement_tags,
+              }
+            : t,
+        );
+      });
+      showToast("Feedback saved", "success");
+    },
+    onError: (error) => {
+      showToast(`Failed to save feedback: ${error.message}`, "error");
     },
   });
 }

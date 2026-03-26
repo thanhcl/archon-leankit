@@ -15,10 +15,14 @@ Options:
 from __future__ import annotations
 
 import argparse
+import difflib
 import enum
 import inspect
+import re
 import sys
 import textwrap
+import types
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Union, get_args, get_origin
 
@@ -31,34 +35,72 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT / "python"))
 
 from src.server.models.api_contracts import (  # noqa: E402
+    ApprovalDecision,
+    ApprovalRequestListResponse,
+    ApprovalRequestResponse,
+    ApprovalRequestStatus,
+    BootstrapPlanListResponse,
+    BootstrapPlanMaterializeResponse,
+    BootstrapPlanPreviewItem,
+    BootstrapPlanPreviewResponse,
+    BootstrapPlanResponse,
     CreateProjectRequest,
+    CreateExecutionRunRequest,
     CreateRuleRequest,
     CreateTaskRequest,
+    OwnerFeedbackRequest,
+    OwnerFeedbackResponse,
+    CurrentVersionResponse,
+    ExecutionRunListResponse,
+    ExecutionRunResponse,
+    ExecutionRunStage,
+    ExecutionRunStatus,
+    ExternalChannelHeartbeatResponse,
+    ExternalInputModality,
+    ExternalRequestListResponse,
+    ExternalRequestMaterialization,
+    ExternalRequestResponse,
+    ExternalRequestStatus,
+    ExternalRequestType,
+    MigrationHistoryResponse,
+    MigrationRecord,
+    MigrationStatusResponse,
     OfficeConfigListResponse,
     OfficeConfigResponse,
+    OpenClawChannelHealthResponse,
+    PendingMigration,
+    PlatformServiceHealthResponse,
     ProjectListResponse,
     ProjectResponse,
+    ReleaseAsset,
     ReviewConfigRequest,
     ReviewConfigResponse,
     RuleListResponse,
     RuleResponse,
     RuleSource,
+    ServiceDependencyHealthResponse,
     SprintDay,
     SprintStatsResponse,
     SprintSummary,
     SprintTrends,
     TaskComplexity,
+    TaskRepoGuidancePack,
     TaskCountsListResponse,
     TaskCountsResponse,
     TaskListResponse,
     TaskPriority,
     TaskResponse,
     TaskStatus,
+    TaskType,
+    TelegramChannelHealthResponse,
     TransitionResponse,
     TransitionTaskRequest,
     UpdateProjectRequest,
+    UpdateExecutionRunRequest,
     UpdateRuleRequest,
     UpdateTaskRequest,
+    VersionCacheClearResponse,
+    VersionCheckResponse,
 )
 
 # ── Configuration ─────────────────────────────────────────────────────
@@ -70,17 +112,33 @@ ENUMS: list[type[enum.Enum]] = [
     TaskStatus,
     TaskPriority,
     TaskComplexity,
+    TaskType,
+    ExecutionRunStatus,
+    ExecutionRunStage,
     RuleSource,
+    ExternalRequestType,
+    ExternalRequestStatus,
+    ExternalRequestMaterialization,
+    ExternalInputModality,
+    ApprovalRequestStatus,
+    ApprovalDecision,
 ]
 
 # Models to export (order matters — dependencies first)
 MODELS: list[type[BaseModel]] = [
+    TaskRepoGuidancePack,
     TaskResponse,
     TaskListResponse,
     CreateTaskRequest,
     UpdateTaskRequest,
     TransitionTaskRequest,
     TransitionResponse,
+    OwnerFeedbackRequest,
+    OwnerFeedbackResponse,
+    ExecutionRunResponse,
+    ExecutionRunListResponse,
+    CreateExecutionRunRequest,
+    UpdateExecutionRunRequest,
     ProjectResponse,
     ProjectListResponse,
     CreateProjectRequest,
@@ -99,9 +157,34 @@ MODELS: list[type[BaseModel]] = [
     SprintDay,
     SprintTrends,
     SprintStatsResponse,
+    ReleaseAsset,
+    VersionCheckResponse,
+    CurrentVersionResponse,
+    VersionCacheClearResponse,
+    MigrationRecord,
+    PendingMigration,
+    MigrationStatusResponse,
+    MigrationHistoryResponse,
+    BootstrapPlanResponse,
+    BootstrapPlanListResponse,
+    BootstrapPlanMaterializeResponse,
+    BootstrapPlanPreviewItem,
+    BootstrapPlanPreviewResponse,
+    ExternalRequestResponse,
+    ExternalRequestListResponse,
+    ApprovalRequestResponse,
+    ApprovalRequestListResponse,
+    TelegramChannelHealthResponse,
+    OpenClawChannelHealthResponse,
+    ServiceDependencyHealthResponse,
+    ExternalChannelHeartbeatResponse,
+    PlatformServiceHealthResponse,
 ]
 
 # ── Type Mapping ──────────────────────────────────────────────────────
+
+
+UNION_ORIGINS = {Union, types.UnionType}
 
 
 def _python_type_to_ts(annotation: Any) -> str:
@@ -122,6 +205,8 @@ def _python_type_to_ts(annotation: Any) -> str:
         return "number"
     if annotation is bool:
         return "boolean"
+    if annotation in {date, datetime}:
+        return "string"
 
     # Any
     if annotation is Any:
@@ -131,7 +216,7 @@ def _python_type_to_ts(annotation: Any) -> str:
     args = get_args(annotation)
 
     # Union (includes X | None from PEP 604)
-    if origin is Union:
+    if origin in UNION_ORIGINS:
         ts_parts = [_python_type_to_ts(a) for a in args]
         # Collapse "T | null" into optional handling at field level
         return " | ".join(ts_parts)
@@ -172,7 +257,7 @@ def _python_type_to_ts(annotation: Any) -> str:
 def _is_optional(annotation: Any) -> bool:
     """Check if a type annotation is Optional (union with None)."""
     origin = get_origin(annotation)
-    if origin is Union:
+    if origin in UNION_ORIGINS:
         return type(None) in get_args(annotation)
     return False
 
@@ -180,7 +265,7 @@ def _is_optional(annotation: Any) -> bool:
 def _unwrap_optional(annotation: Any) -> Any:
     """Remove None from a Union type, returning the inner type."""
     origin = get_origin(annotation)
-    if origin is Union:
+    if origin in UNION_ORIGINS:
         args = [a for a in get_args(annotation) if a is not type(None)]
         if len(args) == 1:
             return args[0]
@@ -247,6 +332,39 @@ def generate_all() -> str:
     return "\n".join(parts)
 
 
+# ── Diff helpers ──────────────────────────────────────────────────────
+
+_TYPE_DECL_RE = re.compile(r"^export (?:type|interface) (\w+)")
+
+
+def _find_diverged_type_names(existing: str, generated: str) -> list[str]:
+    """Return names of types whose definitions differ between existing and generated content."""
+    # Build a map of type_name -> block text for each file
+    def _extract_type_blocks(text: str) -> dict[str, str]:
+        blocks: dict[str, str] = {}
+        current_name: str | None = None
+        current_lines: list[str] = []
+        for line in text.splitlines():
+            m = _TYPE_DECL_RE.match(line)
+            if m:
+                if current_name is not None:
+                    blocks[current_name] = "\n".join(current_lines)
+                current_name = m.group(1)
+                current_lines = [line]
+            elif current_name is not None:
+                current_lines.append(line)
+        if current_name is not None:
+            blocks[current_name] = "\n".join(current_lines)
+        return blocks
+
+    existing_blocks = _extract_type_blocks(existing)
+    generated_blocks = _extract_type_blocks(generated)
+    all_names = set(existing_blocks) | set(generated_blocks)
+    return [
+        name for name in all_names if existing_blocks.get(name) != generated_blocks.get(name)
+    ]
+
+
 # ── CLI ───────────────────────────────────────────────────────────────
 
 
@@ -274,9 +392,23 @@ def main() -> int:
             return 1
         existing = output_path.read_text()
         if existing != content:
-            print(f"FAIL: {output_path} is out of date. Run `pnpm generate:types` to regenerate.")
+            diverged = _find_diverged_type_names(existing, content)
+            print(f"FAIL: {output_path} is out of date.")
+            if diverged:
+                print(f"\nDiverged types ({len(diverged)}): {', '.join(sorted(diverged))}")
+            diff_lines = list(
+                difflib.unified_diff(
+                    existing.splitlines(),
+                    content.splitlines(),
+                    fromfile="existing (committed)",
+                    tofile="generated (from models)",
+                    lineterm="",
+                )
+            )
+            print("\nDiff:\n" + "\n".join(diff_lines))
+            print(f"\nFix: run `pnpm generate:types` (or `npm run generate:types`) and commit the result.")
             return 1
-        print(f"OK: {output_path} is up to date.")
+        print(f"OK: {output_path} is up to date ({len(ENUMS)} enums, {len(MODELS)} interfaces).")
         return 0
 
     # Write mode

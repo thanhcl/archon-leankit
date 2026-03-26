@@ -71,7 +71,113 @@ jobs:
       #     name: frontend-coverage
       #     token: ${{ secrets.CODECOV_TOKEN }}
 
-  # Job 2: Backend Testing (Python/pytest)
+  # Job 2: Contract Drift Check (TypeScript ↔ Python models)
+  contract-drift:
+    name: Contract Drift Check
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          version: "latest"
+
+      - name: Set up Python
+        run: uv python install ${{ env.PYTHON_VERSION }}
+
+      - name: Install Python dependencies
+        working-directory: ./python
+        run: uv sync --group all
+
+      - name: Check TypeScript types match Pydantic models
+        run: |
+          echo "## TypeScript ↔ Python contract drift check" >> $GITHUB_STEP_SUMMARY
+          if uv run --directory python python scripts/generate-ts-types.py --check; then
+            echo "✅ TypeScript types are in sync with Python models." >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ TypeScript types are out of sync with Python models." >> $GITHUB_STEP_SUMMARY
+            echo "Run \`npm run generate:types\` and commit the updated file." >> $GITHUB_STEP_SUMMARY
+            exit 1
+          fi
+
+      - name: Validate Python API contracts are importable
+        working-directory: ./python
+        run: |
+          uv run python - << 'EOF'
+          import sys, importlib.util, pathlib
+
+          contracts_path = pathlib.Path("src/server/models/api_contracts.py")
+          spec = importlib.util.spec_from_file_location("api_contracts", contracts_path)
+          mod = importlib.util.module_from_spec(spec)
+          try:
+              spec.loader.exec_module(mod)
+          except Exception as exc:
+              print(f"FAIL: could not import {contracts_path}: {exc}", file=sys.stderr)
+              sys.exit(1)
+
+          # Verify all types used by the TS generator are present
+          required = [
+              "TaskStatus", "TaskPriority", "TaskComplexity", "TaskType",
+              "ExecutionRunStatus", "ExecutionRunStage", "RuleSource",
+              "TaskResponse", "TaskListResponse", "CreateTaskRequest", "UpdateTaskRequest",
+              "TransitionTaskRequest", "TransitionResponse",
+              "ExecutionRunResponse", "ExecutionRunListResponse",
+              "CreateExecutionRunRequest", "UpdateExecutionRunRequest",
+              "ProjectResponse", "ProjectListResponse",
+              "CreateProjectRequest", "UpdateProjectRequest",
+              "OfficeConfigResponse", "OfficeConfigListResponse",
+              "TaskCountsResponse", "TaskCountsListResponse",
+              "RuleResponse", "RuleListResponse", "CreateRuleRequest", "UpdateRuleRequest",
+              "ReviewConfigRequest", "ReviewConfigResponse",
+              "SprintSummary", "SprintDay", "SprintTrends", "SprintStatsResponse",
+          ]
+          missing = [name for name in required if not hasattr(mod, name)]
+          if missing:
+              print(f"FAIL: missing contract symbols: {', '.join(missing)}", file=sys.stderr)
+              sys.exit(1)
+
+          print(f"OK: all {len(required)} contract symbols present in api_contracts.py")
+          EOF
+
+  # Job 3a: Import Boundary Tests (engine/runtime package isolation)
+  import-boundary-tests:
+    name: Import Boundary Tests (engine isolation)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./python
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          version: "latest"
+
+      - name: Set up Python
+        run: uv python install ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: uv sync --group all
+
+      - name: Run import boundary tests
+        run: |
+          echo "## Import Boundary Check (engine package isolation)" >> $GITHUB_STEP_SUMMARY
+          if uv run pytest tests/server/services/engine/test_import_boundaries.py \
+               -v --tb=short --timeout=30; then
+            echo "✅ No boundary violations found in engine package." >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ Engine package boundary violations detected." >> $GITHUB_STEP_SUMMARY
+            echo "Engine modules must not import from api_routes/, mcp_server/, or channels/." >> $GITHUB_STEP_SUMMARY
+            exit 1
+          fi
+
+  # Job 3b: Backend Testing (Python/pytest)
   backend-tests:
     name: Backend Tests (Python + pytest)
     runs-on: ubuntu-latest
@@ -245,7 +351,7 @@ jobs:
   test-summary:
     name: Test Results Summary
     runs-on: ubuntu-latest
-    needs: [frontend-tests, backend-tests, docker-build-test]
+    needs: [frontend-tests, contract-drift, import-boundary-tests, backend-tests, docker-build-test]
     if: always()
 
     steps:
@@ -257,6 +363,11 @@ jobs:
           echo "# 🧪 Archon V2 Beta - CI Test Results" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           
+          # Contract Drift Results
+          echo "## 📋 Contract Drift Check" >> $GITHUB_STEP_SUMMARY
+          echo "See contract-drift job for TypeScript ↔ Python model sync status." >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
           # Frontend Results
           echo "## 🎨 Frontend Tests (React + Vitest)" >> $GITHUB_STEP_SUMMARY
           if [ -f "frontend-test-results/coverage/test-results.json" ]; then

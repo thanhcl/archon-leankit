@@ -7,12 +7,13 @@ import { isOptimistic } from "@/features/shared/utils/optimistic";
 import { Card } from "../../../ui/primitives";
 import { OptimisticIndicator } from "../../../ui/primitives/OptimisticIndicator";
 import { cn } from "../../../ui/primitives/styles";
-import { useTaskActions, useTransitionTask } from "../hooks";
+import { useContinueTask, useRePlanTask, useTaskActions, useTransitionTask } from "../hooks";
 import type { Assignee, Task, TaskEstimate, TaskPriority } from "../types";
 import { getOrderColor, getOrderGlow } from "../utils/task-styles";
 import { TaskPriorityComponent } from ".";
 import { TaskAssignee } from "./TaskAssignee";
 import { TaskCardActions } from "./TaskCardActions";
+import { TaskFeedbackPanel } from "./TaskFeedbackPanel";
 
 function formatEstimatedTime(seconds: number): string {
   if (seconds <= 0) return "";
@@ -50,6 +51,8 @@ export const TaskCard: React.FC<TaskCardProps> = ({
 
   const { changeAssignee, changePriority, isUpdating } = useTaskActions(projectId);
   const transitionMutation = useTransitionTask(projectId);
+  const rePlanMutation = useRePlanTask(projectId);
+  const continueMutation = useContinueTask(projectId);
 
   const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
     id: task.id,
@@ -93,6 +96,23 @@ export const TaskCard: React.FC<TaskCardProps> = ({
       transitionMutation.mutate({ taskId: task.id, newStatus: "assigned", reason: reason.trim() });
     }
   }, [transitionMutation, task.id]);
+
+  const handleRePlan = useCallback(() => {
+    const newDesc = window.prompt("Updated description (leave blank to keep current):");
+    // User pressed Cancel — abort
+    if (newDesc === null) return;
+    rePlanMutation.mutate({
+      taskId: task.id,
+      updatedDescription: newDesc.trim() || undefined,
+    });
+  }, [rePlanMutation, task.id]);
+
+  const handleContinue = useCallback(() => {
+    const guidance = window.prompt("Provide guidance to continue the task (required):");
+    if (guidance?.trim()) {
+      continueMutation.mutate({ taskId: task.id, guidance: guidance.trim() });
+    }
+  }, [continueMutation, task.id]);
 
   const isHighlighted = hoveredTaskId === task.id;
   const isSelected = selectedTasks?.has(task.id) || false;
@@ -145,8 +165,8 @@ export const TaskCard: React.FC<TaskCardProps> = ({
         <div
           className={cn(
             "absolute left-0 top-0 bottom-0 w-[3px] rounded-l-lg opacity-80 group-hover:w-[4px] group-hover:opacity-100 transition-all duration-300",
-            getOrderColor(task.task_order),
-            getOrderGlow(task.task_order),
+            getOrderColor(task.task_order ?? 0),
+            getOrderGlow(task.task_order ?? 0),
           )}
         />
 
@@ -179,8 +199,10 @@ export const TaskCard: React.FC<TaskCardProps> = ({
                 onDelete={handleDelete}
                 onApprove={handleApprove}
                 onReject={handleReject}
+                onRePlan={handleRePlan}
+                onContinue={handleContinue}
                 isDeleting={false}
-                isTransitioning={transitionMutation.isPending}
+                isTransitioning={transitionMutation.isPending || rePlanMutation.isPending || continueMutation.isPending}
               />
             </div>
           </div>
@@ -207,6 +229,25 @@ export const TaskCard: React.FC<TaskCardProps> = ({
 
           {!task.description && <div className="flex-1"></div>}
 
+          {/* Tags */}
+          {task.tags && task.tags.length > 0 && (
+            <div className="flex flex-wrap gap-1 pl-1.5 pr-3 mb-2">
+              {task.tags.slice(0, 3).map((tag) => (
+                <span
+                  key={tag}
+                  className="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium bg-cyan-500/10 text-cyan-600 dark:text-cyan-400 border border-cyan-500/20"
+                >
+                  {tag}
+                </span>
+              ))}
+              {task.tags.length > 3 && (
+                <span className="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium bg-gray-500/10 text-gray-500 dark:text-gray-400 border border-gray-500/20">
+                  +{task.tags.length - 3}
+                </span>
+              )}
+            </div>
+          )}
+
           {/* Footer */}
           <div className="flex items-center justify-between mt-auto pt-2 pl-1.5 pr-3">
             <TaskAssignee assignee={task.assignee} onAssigneeChange={handleAssigneeChange} isLoading={isUpdating} />
@@ -227,6 +268,9 @@ export const TaskCard: React.FC<TaskCardProps> = ({
               isLoading={isUpdating}
             />
           </div>
+
+          {/* Owner feedback — only rendered for done tasks */}
+          {task.status === "done" && <TaskFeedbackPanel task={task} projectId={projectId} />}
         </div>
       </Card>
     </div>

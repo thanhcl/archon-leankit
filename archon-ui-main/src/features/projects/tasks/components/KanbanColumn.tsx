@@ -4,13 +4,13 @@ import { Activity, CheckCircle2, Eye, ListTodo, Plus } from "lucide-react";
 import { useCallback, useMemo, useState } from "react";
 import { cn } from "../../../ui/primitives/styles";
 import { useCreateTask } from "../hooks";
-import type { DatabaseTaskStatus, Task, TaskEstimate, TaskPriority } from "../types";
+import type { DatabaseTaskStatus, Task, TaskBoardStatus, TaskEstimate, TaskPriority } from "../types";
 import { getColumnGlow } from "../utils/task-styles";
 import { InlineTaskForm } from "./InlineTaskForm";
 import { TaskCard } from "./TaskCard";
 
 interface KanbanColumnProps {
-  status: Task["status"];
+  status: TaskBoardStatus;
   title?: string;
   tasks: Task[];
   projectId: string;

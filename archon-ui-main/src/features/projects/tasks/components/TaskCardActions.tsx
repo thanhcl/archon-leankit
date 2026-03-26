@@ -1,4 +1,4 @@
-import { Check, Clipboard, Edit, RotateCcw, Trash2 } from "lucide-react";
+import { Check, Clipboard, Edit, RefreshCw, RotateCcw, Trash2 } from "lucide-react";
 import type React from "react";
 import { useToast } from "@/features/shared/hooks/useToast";
 import { cn, glassmorphism } from "../../../ui/primitives/styles";
@@ -12,6 +12,8 @@ interface TaskCardActionsProps {
   onDelete: () => void;
   onApprove?: () => void;
   onReject?: () => void;
+  onRePlan?: () => void;
+  onContinue?: () => void;
   isDeleting?: boolean;
   isTransitioning?: boolean;
 }
@@ -24,6 +26,8 @@ export const TaskCardActions: React.FC<TaskCardActionsProps> = ({
   onDelete,
   onApprove,
   onReject,
+  onRePlan,
+  onContinue,
   isDeleting = false,
   isTransitioning = false,
 }) => {
@@ -53,6 +57,18 @@ export const TaskCardActions: React.FC<TaskCardActionsProps> = ({
   };
 
   const showReviewActions = taskStatus === "review" && onApprove && onReject;
+
+  // Re-plan: available for any non-terminal, non-executing state
+  const showRePlan =
+    onRePlan &&
+    !["done", "cancelled", "executing", "review"].includes(taskStatus);
+
+  // Continue: available from paused/blocked states
+  const CONTINUABLE_STATUSES = new Set([
+    "on-hold", "failed", "escalated", "planning", "owner-qa",
+    "assigned", "draft", "proposed", "approved",
+  ]);
+  const showContinue = onContinue && CONTINUABLE_STATUSES.has(taskStatus);
 
   return (
     <div className="flex items-center gap-1.5">
@@ -105,6 +121,58 @@ export const TaskCardActions: React.FC<TaskCardActionsProps> = ({
             </button>
           </SimpleTooltip>
         </>
+      )}
+
+      {/* Re-plan button — resets to planning with preserved lineage */}
+      {showRePlan && (
+        <SimpleTooltip content={isTransitioning ? "Processing..." : "Re-plan task"}>
+          <button
+            type="button"
+            onClick={(e) => {
+              e.stopPropagation();
+              if (!isTransitioning) onRePlan();
+            }}
+            disabled={isTransitioning}
+            className={cn(
+              "w-5 h-5 rounded-full flex items-center justify-center",
+              "transition-all duration-300",
+              "bg-violet-100/80 dark:bg-violet-500/20",
+              "text-violet-600 dark:text-violet-400",
+              "hover:bg-violet-200 dark:hover:bg-violet-500/30",
+              "hover:shadow-[0_0_10px_rgba(139,92,246,0.3)]",
+              isTransitioning && "opacity-50 cursor-not-allowed",
+            )}
+            aria-label={`Re-plan ${taskTitle}`}
+          >
+            <RefreshCw className={cn("w-3 h-3", isTransitioning && "animate-pulse")} />
+          </button>
+        </SimpleTooltip>
+      )}
+
+      {/* Continue button — resumes paused/blocked task with guidance */}
+      {showContinue && (
+        <SimpleTooltip content={isTransitioning ? "Processing..." : "Continue task"}>
+          <button
+            type="button"
+            onClick={(e) => {
+              e.stopPropagation();
+              if (!isTransitioning) onContinue();
+            }}
+            disabled={isTransitioning}
+            className={cn(
+              "w-5 h-5 rounded-full flex items-center justify-center",
+              "transition-all duration-300",
+              "bg-blue-100/80 dark:bg-blue-500/20",
+              "text-blue-600 dark:text-blue-400",
+              "hover:bg-blue-200 dark:hover:bg-blue-500/30",
+              "hover:shadow-[0_0_10px_rgba(59,130,246,0.3)]",
+              isTransitioning && "opacity-50 cursor-not-allowed",
+            )}
+            aria-label={`Continue ${taskTitle}`}
+          >
+            <RotateCcw className={cn("w-3 h-3", isTransitioning && "animate-pulse")} />
+          </button>
+        </SimpleTooltip>
       )}
 
       <SimpleTooltip content={isDeleting ? "Deleting..." : "Delete task"}>

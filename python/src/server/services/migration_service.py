@@ -4,6 +4,7 @@ Database migration tracking and management service.
 
 import hashlib
 from pathlib import Path
+import re
 from typing import Any
 
 import logfire
@@ -41,6 +42,8 @@ class PendingMigration:
 
 class MigrationService:
     """Service for managing database migrations."""
+
+    _VERSION_DIR_PATTERN = re.compile(r"^\d")
 
     def __init__(self):
         self._supabase: Client | None = None
@@ -137,6 +140,8 @@ class MigrationService:
                 continue
 
             version = version_dir.name
+            if not self._VERSION_DIR_PATTERN.match(version):
+                continue
 
             # Scan all SQL files in version directory
             for sql_file in sorted(version_dir.glob("*.sql")):

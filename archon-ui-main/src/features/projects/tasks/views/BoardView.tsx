@@ -14,13 +14,13 @@ import { sortableKeyboardCoordinates } from "@dnd-kit/sortable";
 import { useCallback, useState } from "react";
 import { KanbanColumn } from "../components/KanbanColumn";
 import { TaskCardOverlay } from "../components/TaskCardOverlay";
-import type { Task, TaskEstimate } from "../types";
+import type { Task, TaskBoardStatus, TaskEstimate } from "../types";
 
 interface BoardViewProps {
   tasks: Task[];
   projectId: string;
-  onTaskMove: (taskId: string, newStatus: Task["status"]) => void;
-  onTaskReorder: (taskId: string, targetIndex: number, status: Task["status"]) => void;
+  onTaskMove: (taskId: string, newStatus: TaskBoardStatus) => void;
+  onTaskReorder: (taskId: string, targetIndex: number, status: TaskBoardStatus) => void;
   onTaskEdit?: (task: Task) => void;
   onTaskDelete?: (task: Task) => void;
   estimates?: Record<string, TaskEstimate>;
@@ -43,11 +43,11 @@ export const BoardView = ({
     useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }),
   );
 
-  const getTasksByStatus = (status: Task["status"]) => {
-    return tasks.filter((task) => task.status === status).sort((a, b) => a.task_order - b.task_order);
+  const getTasksByStatus = (status: TaskBoardStatus) => {
+    return tasks.filter((task) => task.status === status).sort((a, b) => (a.task_order ?? 0) - (b.task_order ?? 0));
   };
 
-  const columns: Array<{ status: Task["status"]; title: string }> = [
+  const columns: Array<{ status: TaskBoardStatus; title: string }> = [
     { status: "todo", title: "Todo" },
     { status: "doing", title: "Doing" },
     { status: "review", title: "Review" },
@@ -72,8 +72,8 @@ export const BoardView = ({
 
       // Determine the target container (column status)
       const overData = over.data.current;
-      const overStatus = overData?.status as Task["status"] | undefined;
-      const overColumnId = overData?.columnId as Task["status"] | undefined;
+      const overStatus = overData?.status as TaskBoardStatus | undefined;
+      const overColumnId = overData?.columnId as TaskBoardStatus | undefined;
 
       // Target is a column droppable
       const targetStatus = overColumnId || overStatus;
@@ -101,10 +101,10 @@ export const BoardView = ({
       if (overData?.sortable) {
         const overTask = tasks.find((t) => t.id === over.id);
         if (overTask && overTask.status === activeTaskData.status) {
-          const statusTasks = getTasksByStatus(activeTaskData.status);
+          const statusTasks = getTasksByStatus(activeTaskData.status as TaskBoardStatus);
           const overIndex = statusTasks.findIndex((t) => t.id === over.id);
           if (overIndex !== -1) {
-            onTaskReorder(activeTaskData.id as string, overIndex, activeTaskData.status);
+            onTaskReorder(activeTaskData.id as string, overIndex, activeTaskData.status as TaskBoardStatus);
           }
         }
       }

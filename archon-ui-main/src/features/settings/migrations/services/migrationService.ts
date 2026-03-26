@@ -3,7 +3,11 @@
  */
 
 import { callAPIWithETag } from "@/features/shared/api/apiClient";
-import type { MigrationHistoryResponse, MigrationStatusResponse, PendingMigration } from "../types";
+import type {
+  MigrationHistoryResponse,
+  MigrationStatusResponse,
+  PendingMigration,
+} from "@/types/api-contracts.generated";
 
 export const migrationService = {
   /**

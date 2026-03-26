@@ -10,15 +10,20 @@ export type { UseTaskActionsReturn, UseTaskEditorReturn } from "./hooks";
 export type {
   Assignee,
   BudgetConfig,
+  BoardTaskStatus,
   CommonAssignee,
   CostStatusResponse,
   CreateTaskRequest,
   DatabaseTaskStatus,
+  OwnerFeedbackRequest,
+  OwnerFeedbackResponse,
   PredictedVsActual,
+  ProjectTaskCountsMap,
   SprintEntry,
   SprintStatsResponse,
   SprintStatsSummary,
   Task,
+  TaskBoardStatus,
   TaskCodeExample,
   TaskCounts,
   TaskEstimate,
@@ -30,4 +35,4 @@ export type {
 } from "./task";
 
 // Export constants
-export { COMMON_ASSIGNEES } from "./task";
+export { COMMON_ASSIGNEES, EMPTY_TASK_COUNTS, getTaskCount } from "./task";

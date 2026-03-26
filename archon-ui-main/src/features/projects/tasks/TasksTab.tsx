@@ -9,7 +9,7 @@ import { Button, Card } from "../../ui/primitives";
 import { cn, glassmorphism } from "../../ui/primitives/styles";
 import { TaskEditModal } from "./components/TaskEditModal";
 import { useDeleteTask, useProjectTasks, useTaskEstimates, useUpdateTask } from "./hooks";
-import type { Task } from "./types";
+import type { Task, TaskBoardStatus, UpdateTaskRequest } from "./types";
 import { getReorderTaskOrder, ORDER_INCREMENT, validateTaskOrder } from "./utils";
 import { BoardView, SprintDashboard, TableView } from "./views";
 
@@ -78,17 +78,17 @@ export const TasksTab = ({ projectId }: TasksTabProps) => {
   // Get default order for new tasks in a status
   const getDefaultTaskOrder = useCallback((statusTasks: Task[]) => {
     if (statusTasks.length === 0) return ORDER_INCREMENT;
-    const maxOrder = Math.max(...statusTasks.map((t) => t.task_order));
+    const maxOrder = Math.max(...statusTasks.map((t) => t.task_order ?? 0));
     return maxOrder + ORDER_INCREMENT;
   }, []);
 
   // Task reordering - immediate update
   const handleTaskReorder = useCallback(
-    async (taskId: string, targetIndex: number, status: Task["status"]) => {
+    async (taskId: string, targetIndex: number, status: TaskBoardStatus) => {
       // Get all tasks in the target status, sorted by current order
       const statusTasks = (tasks as Task[])
         .filter((task) => task.status === status)
-        .sort((a, b) => a.task_order - b.task_order);
+        .sort((a, b) => (a.task_order ?? 0) - (b.task_order ?? 0));
 
       const movingTaskIndex = statusTasks.findIndex((task) => task.id === taskId);
       if (movingTaskIndex === -1 || targetIndex < 0 || targetIndex > statusTasks.length) return;
@@ -153,12 +153,12 @@ export const TasksTab = ({ projectId }: TasksTabProps) => {
   );
 
   // Inline update for task fields
-  const updateTaskInline = async (taskId: string, updates: Partial<Task>) => {
+  const updateTaskInline = async (taskId: string, updates: UpdateTaskRequest) => {
     try {
       // Validate task_order if present (ensures integer precision)
       const processedUpdates = { ...updates };
       if (processedUpdates.task_order !== undefined) {
-        processedUpdates.task_order = validateTaskOrder(processedUpdates.task_order);
+        processedUpdates.task_order = validateTaskOrder(processedUpdates.task_order ?? 0);
       }
 
       await updateTaskMutation.mutateAsync({

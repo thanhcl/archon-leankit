@@ -18,20 +18,35 @@ import os
 import signal
 import sys
 import time
+from datetime import UTC, datetime
 from pathlib import Path
 from urllib.request import Request, urlopen
 
 # Add python dir to path so relative imports in src work
 sys.path.insert(0, os.path.dirname(__file__))
 
-from src.server.services.engine.capacity_tracker import GlobalCapacityTracker
+from src.server.config.env_aliases import get_control_plane_url, get_env_value
+from src.server.services.engine.capacity_tracker import GlobalCapacityTracker, SharedAgentPool
 from src.server.services.engine.task_engine import TaskEngine
 
-ARCHON_API = os.environ.get("ARCHON_API_URL", "http://localhost:8181")
 
-# Parallel execution limits (env vars)
-DEFAULT_MAX_PARALLEL = int(os.environ.get("MAX_PARALLEL", "3"))
-MAX_PARALLEL_GLOBAL = int(os.environ.get("MAX_PARALLEL_GLOBAL", "10"))
+def resolve_engine_runtime_config(env: dict[str, str] | os._Environ[str] | None = None) -> dict[str, int | str]:
+    """Resolve engine runtime configuration from platform and legacy env names."""
+    source = env or os.environ
+    return {
+        "archon_api": get_control_plane_url(source),
+        "default_max_parallel": int(
+            get_env_value("LEANKIT_ENGINE_MAX_PARALLEL", "MAX_PARALLEL", default="3", env=source) or "3"
+        ),
+        "max_parallel_global": int(
+            get_env_value("LEANKIT_ENGINE_MAX_PARALLEL_GLOBAL", "MAX_PARALLEL_GLOBAL", default="10", env=source)
+            or "10"
+        ),
+        "task_timeout": int(
+            get_env_value("LEANKIT_ENGINE_TASK_TIMEOUT_SECONDS", "TASK_ENGINE_TIMEOUT", default="1800", env=source)
+            or "1800"
+        ),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -39,11 +54,30 @@ MAX_PARALLEL_GLOBAL = int(os.environ.get("MAX_PARALLEL_GLOBAL", "10"))
 # ---------------------------------------------------------------------------
 
 
+def register_engine_heartbeat(archon_api: str, started_at: str) -> None:
+    """Register engine startup with Archon API for uptime tracking.
+
+    Failure is non-fatal — the engine continues even if the heartbeat can't be stored.
+    """
+    try:
+        url = f"{archon_api}/api/engine/heartbeat"
+        body = json.dumps({"started_at": started_at}).encode()
+        req = Request(url, data=body, method="POST")
+        req.add_header("Content-Type", "application/json")
+        urlopen(req, timeout=5)
+        print(f"[engine] Heartbeat registered (started_at={started_at})")
+    except Exception as e:
+        print(f"  [warn] Could not register engine heartbeat: {e}")
+
+
 def fetch_projects(max_retries: int = 3, delay: int = 5) -> list[dict]:
     """Fetch project configs from Archon API with retry."""
+    runtime = resolve_engine_runtime_config()
+    archon_api = str(runtime["archon_api"])
+    default_max_parallel = int(runtime["default_max_parallel"])
     for attempt in range(max_retries):
         try:
-            url = f"{ARCHON_API}/api/projects/office-configs"
+            url = f"{archon_api}/api/projects/office-configs"
             resp = urlopen(Request(url), timeout=10)
             data = json.loads(resp.read())
             projects = data.get("projects", data) if isinstance(data, dict) else data
@@ -84,11 +118,11 @@ def fetch_projects(max_retries: int = 3, delay: int = 5) -> list[dict]:
                         build_command = "echo 'no build command configured'"
 
                 # Per-project max_concurrent from office_settings, fallback to env default
-                max_concurrent = settings.get("max_concurrent", DEFAULT_MAX_PARALLEL)
+                max_concurrent = settings.get("max_concurrent", default_max_parallel)
                 try:
                     max_concurrent = int(max_concurrent)
                 except (TypeError, ValueError):
-                    max_concurrent = DEFAULT_MAX_PARALLEL
+                    max_concurrent = default_max_parallel
 
                 result.append({
                     "project_id": p["id"],
@@ -110,12 +144,103 @@ def fetch_projects(max_retries: int = 3, delay: int = 5) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+# Shared agent pool setup
+# ---------------------------------------------------------------------------
+
+
+def fetch_agent_pools(archon_api: str) -> dict:
+    """Fetch shared agent pool configuration from Archon API.
+
+    Returns empty pool config if the endpoint is unreachable or returns no pools.
+    """
+    try:
+        url = f"{archon_api}/api/engine/agent-pools"
+        resp = urlopen(Request(url), timeout=5)
+        data = json.loads(resp.read())
+        return data if isinstance(data, dict) else {}
+    except Exception as e:
+        print(f"  [warn] Could not fetch agent pools config: {e}")
+        return {}
+
+
+def fetch_project_capacity_policies(archon_api: str, project_ids: list[str]) -> dict[str, dict]:
+    """Fetch capacity_policy for each project from its engine policy.
+
+    Returns dict mapping project_id -> capacity_policy dict.
+    """
+    result: dict[str, dict] = {}
+    for pid in project_ids:
+        try:
+            url = f"{archon_api}/api/engine-policies/{pid}"
+            resp = urlopen(Request(url), timeout=5)
+            data = json.loads(resp.read())
+            policy = data.get("policy") or {}
+            cap = policy.get("capacity_policy") or {}
+            if cap:
+                result[pid] = cap
+        except Exception as e:
+            print(f"  [warn] Could not fetch engine policy for {pid[:8]}: {e}")
+    return result
+
+
+def build_agent_pools(
+    pool_configs: list[dict],
+    project_capacity_policies: dict[str, dict],
+) -> dict[str, SharedAgentPool]:
+    """Instantiate SharedAgentPool objects from config and project policies.
+
+    Returns dict mapping pool_id -> SharedAgentPool.
+    """
+    pools: dict[str, SharedAgentPool] = {}
+
+    # Build per-project-limits for each pool from project capacity policies
+    pool_project_limits: dict[str, dict[str, int]] = {}
+    for project_id, cap in project_capacity_policies.items():
+        pool_id = cap.get("pool_id")
+        pool_slots = cap.get("pool_slots")
+        if pool_id and isinstance(pool_slots, int) and pool_slots >= 1:
+            pool_project_limits.setdefault(pool_id, {})[project_id] = pool_slots
+
+    for cfg in pool_configs:
+        pool_id = cfg.get("pool_id", "").strip()
+        total_slots = cfg.get("total_slots", 0)
+        if not pool_id or total_slots < 1:
+            print(f"  [warn] Skipping invalid pool config: {cfg}")
+            continue
+
+        try:
+            pool = SharedAgentPool(
+                pool_id=pool_id,
+                total_slots=total_slots,
+                per_project_limits=pool_project_limits.get(pool_id),
+                default_project_slots=cfg.get("default_project_slots", 1),
+                priority_reserve=cfg.get("priority_reserve", 1),
+            )
+            pools[pool_id] = pool
+            print(
+                f"  [engine] Pool '{pool_id}': total_slots={total_slots} "
+                f"priority_reserve={cfg.get('priority_reserve', 1)} "
+                f"projects={list(pool_project_limits.get(pool_id, {}).keys())}"
+            )
+        except ValueError as e:
+            print(f"  [warn] Skipping pool '{pool_id}': {e}")
+
+    return pools
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 
 async def main() -> None:
-    print(f"[engine] Fetching projects from {ARCHON_API}...")
+    runtime = resolve_engine_runtime_config()
+    archon_api = str(runtime["archon_api"])
+    default_max_parallel = int(runtime["default_max_parallel"])
+    max_parallel_global = int(runtime["max_parallel_global"])
+    task_timeout = int(runtime["task_timeout"])
+
+    print(f"[engine] Fetching projects from {archon_api}...")
     projects = fetch_projects()
 
     if not projects:
@@ -127,28 +252,47 @@ async def main() -> None:
         print(f"  - {p['name']} ({p['project_id'][:8]}...) -> {p['path']}")
         print(f"    build: {p['build']}")
 
-    task_timeout = int(os.environ.get("TASK_ENGINE_TIMEOUT", "1800"))
     print(f"[engine] Task timeout: {task_timeout}s ({task_timeout // 60}m)")
-    print(f"[engine] Global parallel limit: {MAX_PARALLEL_GLOBAL} | Default per-project: {DEFAULT_MAX_PARALLEL}")
+    print(f"[engine] Global parallel limit: {max_parallel_global} | Default per-project: {default_max_parallel}")
 
-    global_tracker = GlobalCapacityTracker(max_global=MAX_PARALLEL_GLOBAL)
+    global_tracker = GlobalCapacityTracker(max_global=max_parallel_global)
+
+    # Load shared agent pools from configuration
+    pool_configs_data = fetch_agent_pools(archon_api)
+    pool_configs = pool_configs_data.get("pools", [])
+    project_ids = [p["project_id"] for p in projects]
+    project_capacity_policies = fetch_project_capacity_policies(archon_api, project_ids)
+    agent_pools = build_agent_pools(pool_configs, project_capacity_policies)
+    if agent_pools:
+        print(f"[engine] Loaded {len(agent_pools)} shared agent pool(s): {list(agent_pools.keys())}")
+    else:
+        print("[engine] No shared agent pools configured (per-project and global limits only)")
 
     engines: list[tuple[str, TaskEngine]] = []
     for proj in projects:
         project_path = str(Path(proj["path"]).expanduser())
-        per_project_limit = proj.get("max_concurrent", DEFAULT_MAX_PARALLEL)
+        per_project_limit = proj.get("max_concurrent", default_max_parallel)
+
+        # Resolve the pool this project belongs to (if any)
+        cap_policy = project_capacity_policies.get(proj["project_id"], {})
+        pool_id = cap_policy.get("pool_id")
+        agent_pool = agent_pools.get(pool_id) if pool_id else None
+
         engine = TaskEngine(
             project_path=project_path,
             project_id=proj["project_id"],
+            source_app=proj.get("source_app"),
             build_command=proj["build"],
             poll_interval=30,
             max_parallel=per_project_limit,
             default_timeout=task_timeout,
             shutdown_grace=60,
             global_tracker=global_tracker,
+            agent_pool=agent_pool,
         )
         engines.append((proj["name"], engine))
-        print(f"  - {proj['name']}: max_concurrent={per_project_limit}")
+        pool_label = f" pool={pool_id}" if pool_id else ""
+        print(f"  - {proj['name']}: max_concurrent={per_project_limit}{pool_label}")
 
     # Graceful shutdown via Ctrl+C / SIGTERM
     shutdown_event = asyncio.Event()
@@ -161,6 +305,10 @@ async def main() -> None:
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, _signal_handler)
+
+    # Register engine startup heartbeat for health endpoint uptime tracking
+    engine_started_at = datetime.now(UTC).isoformat()
+    register_engine_heartbeat(archon_api, engine_started_at)
 
     # Start all engines
     print(f"[engine] Starting {len(engines)} project engines...")

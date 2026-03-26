@@ -68,7 +68,6 @@ List all projects.
         "strategy": "parallel"
       },
       "team_lead_config": {
-        "review_mode": "self-review",
         "auto_assign": true
       },
       "office_settings": {
@@ -113,7 +112,6 @@ Optimized endpoint for Virtual Office — returns only office-related fields.
         "strategy": "parallel"
       },
       "team_lead_config": {
-        "review_mode": "self-review",
         "auto_assign": true
       },
       "office_settings": {
@@ -157,6 +155,12 @@ Create a new project.
   "pinned": false,
   "source_app": "virtual-office",
   "layout_id": "layout-001",
+  "create_bootstrap_task": true,
+  "bootstrap_template": "default-app",
+  "project_type": "web-app",
+  "bootstrap_policy": "standard",
+  "bootstrap_architect_provider": "chatgpt-codex",
+  "bootstrap_architect_model": "gpt-5.4",
   "team_config": [],
   "director_config": {},
   "team_lead_config": {},
@@ -177,14 +181,61 @@ Create a new project.
 | `pinned`           | bool    | No       | Pin project to top                 |
 | `source_app`       | string  | No       | Originating application            |
 | `layout_id`        | string  | No       | Virtual Office layout ID           |
+| `create_bootstrap_task` | bool | No      | Auto-create a runner-owned bootstrap task for the new project |
+| `bootstrap_template` | string | No      | Template hint used by the bootstrap task and runner routing |
+| `project_type`      | string  | No       | Project shape hint for bootstrap prompts, tags, and validation criteria |
+| `bootstrap_policy`  | string  | No       | Bootstrap strictness hint such as `standard`, `rapid`, or `strict` |
+| `bootstrap_architect_provider` | string | No | Requested architect-provider for bootstrap planning, for example `rule-based`, `chatgpt-codex`, or `claude-chat` |
+| `bootstrap_architect_model` | string | No | Optional model hint passed through bootstrap planning metadata |
 | `team_config`      | array   | No       | Agent team configuration           |
 | `director_config`  | object  | No       | Director agent configuration       |
 | `team_lead_config` | object  | No       | Team lead configuration            |
 | `office_settings`  | object  | No       | Virtual Office settings            |
 
+Legacy fallback note: if older projects still store `team_lead_config.review_mode`,
+`director_config.review_mode`, `office_settings.review_mode`,
+`office_settings.preferred_runner` / `office_settings.default_runner`, or
+`office_settings.isolation_mode` / `office_settings.worktree_mode` plus matching
+copies in `team_lead_config` / `director_config`, the backend
+still reads those values as fallbacks. The canonical project-level location is
+`/api/engine-policies/{project_id}`. Project create/update flows now mirror
+recognized legacy policy values into `archon_engine_policies`, and the database
+backfill migration preserves older records. New writes should use
+`/api/engine-policies/{project_id}` for runner, review, and isolation policy.
+
 ### Response
 
-Returns the created project object.
+Returns the created project object. When bootstrap is enabled, the project
+payload may include:
+
+- `bootstrap_task`: backward-compatible summary of the first scaffold task
+- `bootstrap_tasks`: ordered task-pack summaries for scaffold, validation, and
+  follow-up planning
+- `bootstrap_plan`: persisted bootstrap plan record summary when plan storage is
+  available
+- `bootstrap_template`, `project_type`, `bootstrap_policy`: normalized control
+  hints used when generating the bootstrap task pack
+- `bootstrap_architect_provider`, `bootstrap_architect_model`: architect-provider
+  planning metadata for the bootstrap plan request
+
+The bootstrap task pack is created with dependency chaining via `blocked_by`
+so the execution engine can run the project bootstrap flow sequentially.
+The default planner emits:
+
+- scaffold
+- validation
+- follow-up planning
+
+When `bootstrap_policy` is `strict`, an additional architecture-baseline task is
+inserted between validation and follow-up planning.
+
+Current baseline note: non-`rule-based` architect providers are accepted as
+request metadata and traced into bootstrap task tags. In the AI-assisted project
+creation path, Archon now defaults supported project types such as `web-app`,
+`api-service`, `library`, and `automation` to provider-generated bootstrap
+planning when no explicit `bootstrap_architect_provider` is supplied. Archon
+still falls back to the internal rule-based planner when the selected provider
+fails, is unavailable, or the project type is outside the supported default set.
 
 ---
 
@@ -287,6 +338,7 @@ Get task count breakdown for all projects.
         "assigned": 4,
         "executing": 2,
         "architect-review": 1,
+        "code-review": 1,
         "review": 3,
         "done": 6,
         "failed": 1,

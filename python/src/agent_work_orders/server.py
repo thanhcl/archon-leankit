@@ -14,30 +14,69 @@ import httpx
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from .api.routes import log_buffer, router
-from .config import config
+from .api.routes import log_buffer, router, telemetry_store
+from .config import config, validate_startup_config
 from .database.client import check_database_health
 from .utils.structured_logger import (
     configure_structured_logging_with_buffer,
     get_logger,
 )
+from src.server.config.required_config import required_config_reference
+
+
+def _warn_optional_vars(log: Any) -> None:
+    """Log warnings for optional environment variables that are not set.
+
+    When the agent work orders feature is enabled, missing auth credentials will
+    cause task execution failures. Surface these gaps at startup instead of at
+    runtime.
+    """
+    optional_vars: list[tuple[str, str]] = [
+        ("ANTHROPIC_API_KEY", "Required for Claude API authentication (alternative: CLAUDE_CODE_OAUTH_TOKEN)"),
+        ("CLAUDE_CODE_OAUTH_TOKEN", "OAuth token for Claude CLI (alternative: ANTHROPIC_API_KEY)"),
+        ("GITHUB_PAT_TOKEN", "Required for gh CLI authentication and PR creation"),
+    ]
+    # Only warn on auth vars if the feature is enabled — missing vars are expected when disabled
+    if config.ENABLED:
+        has_claude_auth = bool(os.getenv("ANTHROPIC_API_KEY") or os.getenv("CLAUDE_CODE_OAUTH_TOKEN"))
+        if not has_claude_auth:
+            log.warning(
+                "Missing Claude authentication",
+                extra={
+                    "detail": "Neither ANTHROPIC_API_KEY nor CLAUDE_CODE_OAUTH_TOKEN is set. "
+                    f"Task execution will fail. See {required_config_reference('agent-work-orders')}."
+                },
+            )
+        if not os.getenv("GITHUB_PAT_TOKEN"):
+            log.warning(
+                "Optional environment variable not set",
+                extra={
+                    "var": "GITHUB_PAT_TOKEN",
+                    "detail": f"{optional_vars[2][1]}. See {required_config_reference('agent-work-orders')}.",
+                },
+            )
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """Lifespan context manager for startup and shutdown tasks"""
-    # Configure structured logging with buffer for SSE streaming
-    configure_structured_logging_with_buffer(config.LOG_LEVEL, log_buffer)
+    # Configure structured logging with buffer for SSE streaming and telemetry persistence
+    configure_structured_logging_with_buffer(config.LOG_LEVEL, log_buffer, telemetry_store)
 
     logger = get_logger(__name__)
 
     logger.info(
         "Starting Agent Work Orders service",
         extra={
-            "port": os.getenv("AGENT_WORK_ORDERS_PORT", "8053"),
-            "service_discovery_mode": os.getenv("SERVICE_DISCOVERY_MODE", "local"),
+            "port": config.get_service_port(),
+            "service_discovery_mode": config.SERVICE_DISCOVERY_MODE,
         },
     )
+
+    validate_startup_config()
+
+    # Warn on missing optional vars that affect runtime behavior
+    _warn_optional_vars(logger)
 
     # Start log buffer cleanup task
     await log_buffer.start_cleanup_task()
@@ -78,8 +117,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         logger.info("Git validation successful")
 
     # Log service URLs
-    archon_server_url = os.getenv("ARCHON_SERVER_URL")
-    archon_mcp_url = os.getenv("ARCHON_MCP_URL")
+    archon_server_url = config.get_archon_server_url()
+    archon_mcp_url = config.get_archon_mcp_url()
 
     if archon_server_url:
         logger.info(
@@ -181,7 +220,7 @@ async def health_check() -> dict[str, Any]:
         }
 
     # Check Archon server connectivity (if configured)
-    archon_server_url = os.getenv("ARCHON_SERVER_URL")
+    archon_server_url = config.get_archon_server_url()
     if archon_server_url:
         try:
             async with httpx.AsyncClient(timeout=5.0) as client:
@@ -206,7 +245,7 @@ async def health_check() -> dict[str, Any]:
         health_status["storage_type"] = config.STATE_STORAGE_TYPE
 
     # Check MCP server connectivity (if configured)
-    archon_mcp_url = os.getenv("ARCHON_MCP_URL")
+    archon_mcp_url = config.get_archon_mcp_url()
     if archon_mcp_url:
         try:
             async with httpx.AsyncClient(timeout=5.0) as client:
@@ -271,7 +310,7 @@ async def root() -> dict:
 if __name__ == "__main__":
     import uvicorn
 
-    port = int(os.getenv("AGENT_WORK_ORDERS_PORT", "8053"))
+    port = int(config.get_service_port())
     uvicorn.run(
         "src.agent_work_orders.server:app",
         host="0.0.0.0",

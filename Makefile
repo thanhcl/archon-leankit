@@ -5,7 +5,7 @@ SHELL := /bin/bash
 # Docker compose command - prefer newer 'docker compose' plugin over standalone 'docker-compose'
 COMPOSE ?= $(shell docker compose version >/dev/null 2>&1 && echo "docker compose" || echo "docker-compose")
 
-.PHONY: help dev dev-docker dev-docker-full dev-work-orders dev-hybrid-work-orders stop test test-fe test-be lint lint-fe lint-be clean install check agent-work-orders
+.PHONY: help dev dev-docker dev-docker-full dev-work-orders dev-hybrid-work-orders stop test test-fe test-be lint lint-fe lint-be clean install check agent-work-orders migrate-leankit-local
 
 help:
 	@echo "Archon Development Commands"
@@ -26,6 +26,7 @@ help:
 	@echo "  make clean                  - Remove containers and volumes"
 	@echo "  make install                - Install dependencies"
 	@echo "  make check                  - Check environment setup"
+	@echo "  make migrate-leankit-local  - Apply LeanKit extension migrations to local Supabase"
 
 # Install dependencies
 install:
@@ -43,6 +44,11 @@ check:
 	@docker --version > /dev/null 2>&1 || { echo "✗ Docker not found"; exit 1; }
 	@$(COMPOSE) version > /dev/null 2>&1 || { echo "✗ Docker Compose not found"; exit 1; }
 	@echo "✓ Environment OK"
+
+migrate-leankit-local:
+	@echo "Applying LeanKit extension migrations to local Supabase..."
+	@./scripts/apply-local-leankit-migrations.sh
+	@echo "✓ LeanKit local migrations applied"
 
 
 # Hybrid development (recommended)

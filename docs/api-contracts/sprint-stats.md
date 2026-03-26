@@ -26,6 +26,7 @@ Primary source for project-level task statistics. See [projects.md](projects.md#
         "assigned": 4,
         "executing": 2,
         "architect-review": 1,
+        "code-review": 1,
         "review": 3,
         "done": 6,
         "failed": 1,

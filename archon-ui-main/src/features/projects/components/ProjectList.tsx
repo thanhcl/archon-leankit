@@ -2,13 +2,15 @@ import { motion } from "framer-motion";
 import { AlertCircle, Loader2 } from "lucide-react";
 import React from "react";
 import { Button } from "../../ui/primitives";
+import { EMPTY_TASK_COUNTS } from "../tasks/types";
+import type { ProjectTaskCountsMap } from "../tasks/types";
 import type { Project } from "../types";
 import { ProjectCard } from "./ProjectCard";
 
 interface ProjectListProps {
   projects: Project[];
   selectedProject: Project | null;
-  taskCounts: Record<string, { todo: number; doing: number; review: number; done: number }>;
+  taskCounts: ProjectTaskCountsMap;
   isLoading: boolean;
   error: Error | null;
   onProjectSelect: (project: Project) => void;
@@ -105,7 +107,7 @@ export const ProjectList: React.FC<ProjectListProps> = ({
               <ProjectCard
                 project={project}
                 isSelected={selectedProject?.id === project.id}
-                taskCounts={taskCounts[project.id] || { todo: 0, doing: 0, review: 0, done: 0 }}
+                taskCounts={taskCounts[project.id] ?? EMPTY_TASK_COUNTS}
                 onSelect={onProjectSelect}
                 onPin={onPinProject}
                 onDelete={onDeleteProject}

@@ -1,26 +1,34 @@
 """
 Cost Budget Service Module
 
-Tracks cumulative cost per project per sprint and enforces budget limits.
-Parses total_cost_usd from task execution_result, accumulates daily/sprint costs,
-and provides budget enforcement (warnings at 80%, pause at 100%).
+Tracks cumulative cost per project per day/week and enforces budget limits.
+Queries cost_usd from execution_runs (primary) or falls back to parsing
+total_cost_usd from task execution_result. Provides budget enforcement
+(warnings at 80%, pause at 100%) with fail-open behavior when cost data
+is unavailable.
 """
 
 import json
 import re
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from src.server.utils import get_supabase_client
 
+from ..config.env_aliases import get_engine_default_daily_budget, get_engine_default_weekly_budget
 from ..config.logfire_config import get_logger
 
 logger = get_logger(__name__)
 
-# Budget defaults
-DEFAULT_MAX_COST_PER_DAY = 100.0
-DEFAULT_MAX_COST_PER_SPRINT = 500.0
+# Budget defaults read from environment variables
+DEFAULT_DAILY_BUDGET = get_engine_default_daily_budget()
+DEFAULT_WEEKLY_BUDGET = get_engine_default_weekly_budget()
+
+# Aliases for backward-compatible references
+DEFAULT_MAX_COST_PER_DAY = DEFAULT_DAILY_BUDGET
+DEFAULT_MAX_COST_PER_SPRINT = DEFAULT_WEEKLY_BUDGET
+
 BUDGET_WARNING_THRESHOLD = 0.8  # 80%
 
 
@@ -31,34 +39,38 @@ class CostBudgetService:
         self.supabase_client = supabase_client or get_supabase_client()
 
     def get_cost_status(self, project_id: str) -> tuple[bool, dict[str, Any]]:
-        """Get current cost status for a project including spend vs budget."""
-        try:
-            tasks = self._fetch_project_tasks(project_id)
-            budget_config = self._get_budget_config(project_id)
+        """Get current cost status for a project including spend vs budget.
 
+        Queries execution_runs as the primary cost source. Falls back to task
+        execution_result parsing if execution_runs are unavailable (fail-open).
+        """
+        try:
+            budget_config = self._get_budget_config(project_id)
             today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
-            # Accumulate costs
+            # Primary: query execution_runs for accurate daily/weekly costs
+            daily_cost, weekly_cost = self._fetch_costs_from_execution_runs(project_id)
+
+            # Fallback breakdown from tasks for detailed daily_breakdown view
+            tasks = self._fetch_project_tasks(project_id)
             daily_costs = self._accumulate_daily_costs(tasks)
-            total_cost = sum(daily_costs.values())
-            today_cost = daily_costs.get(today, 0.0)
 
-            # Budget status
-            max_day = budget_config["max_cost_per_day"]
-            max_sprint = budget_config["max_cost_per_sprint"]
+            # Budget limits
+            max_day = budget_config["daily_budget_usd"]
+            max_week = budget_config["weekly_budget_usd"]
 
-            daily_pct = (today_cost / max_day) if max_day > 0 else 0.0
-            sprint_pct = (total_cost / max_sprint) if max_sprint > 0 else 0.0
+            daily_pct = (daily_cost / max_day) if max_day > 0 else 0.0
+            weekly_pct = (weekly_cost / max_week) if max_week > 0 else 0.0
 
             daily_exceeded = daily_pct >= 1.0
-            sprint_exceeded = sprint_pct >= 1.0
+            weekly_exceeded = weekly_pct >= 1.0
             daily_warning = daily_pct >= BUDGET_WARNING_THRESHOLD and not daily_exceeded
-            sprint_warning = sprint_pct >= BUDGET_WARNING_THRESHOLD and not sprint_exceeded
+            weekly_warning = weekly_pct >= BUDGET_WARNING_THRESHOLD and not weekly_exceeded
 
             status = "ok"
-            if daily_exceeded or sprint_exceeded:
+            if daily_exceeded or weekly_exceeded:
                 status = "exceeded"
-            elif daily_warning or sprint_warning:
+            elif daily_warning or weekly_warning:
                 status = "warning"
 
             return True, {
@@ -66,18 +78,26 @@ class CostBudgetService:
                 "status": status,
                 "today": {
                     "date": today,
-                    "cost_usd": round(today_cost, 4),
+                    "cost_usd": round(daily_cost, 4),
                     "budget_usd": max_day,
                     "usage_pct": round(daily_pct * 100, 1),
                     "exceeded": daily_exceeded,
                     "warning": daily_warning,
                 },
+                "weekly": {
+                    "total_cost_usd": round(weekly_cost, 4),
+                    "budget_usd": max_week,
+                    "usage_pct": round(weekly_pct * 100, 1),
+                    "exceeded": weekly_exceeded,
+                    "warning": weekly_warning,
+                },
+                # Keep sprint key as alias for backward compat with existing consumers
                 "sprint": {
-                    "total_cost_usd": round(total_cost, 4),
-                    "budget_usd": max_sprint,
-                    "usage_pct": round(sprint_pct * 100, 1),
-                    "exceeded": sprint_exceeded,
-                    "warning": sprint_warning,
+                    "total_cost_usd": round(weekly_cost, 4),
+                    "budget_usd": max_week,
+                    "usage_pct": round(weekly_pct * 100, 1),
+                    "exceeded": weekly_exceeded,
+                    "warning": weekly_warning,
                 },
                 "daily_breakdown": {
                     date: round(cost, 4)
@@ -107,9 +127,9 @@ class CostBudgetService:
                 exceeded_parts.append(
                     f"daily (${status['today']['cost_usd']:.2f}/${status['today']['budget_usd']:.2f})"
                 )
-            if status["sprint"]["exceeded"]:
+            if status["weekly"]["exceeded"]:
                 exceeded_parts.append(
-                    f"sprint (${status['sprint']['total_cost_usd']:.2f}/${status['sprint']['budget_usd']:.2f})"
+                    f"weekly (${status['weekly']['total_cost_usd']:.2f}/${status['weekly']['budget_usd']:.2f})"
                 )
             reason = f"Budget exceeded: {', '.join(exceeded_parts)}"
             return False, {"allowed": False, "reason": reason, "status": status}
@@ -127,6 +147,58 @@ class CostBudgetService:
             logger.info(f"Task cost recorded | project_id={project_id} | task_id={task_id} | cost=${cost:.4f}")
         return cost
 
+    def _fetch_costs_from_execution_runs(self, project_id: str) -> tuple[float, float]:
+        """Query execution_runs for daily and weekly costs.
+
+        Returns (daily_cost_usd, weekly_cost_usd). Fail-open: returns (0.0, 0.0)
+        with a warning log if the query fails or cost_usd fields are null (CI-5 not yet available).
+        """
+        try:
+            today = datetime.now(timezone.utc).date()
+            week_start = today - timedelta(days=6)  # rolling 7-day window
+
+            response = (
+                self.supabase_client.table("archon_execution_runs")
+                .select("cost_usd, started_at")
+                .eq("project_id", project_id)
+                .gte("started_at", week_start.isoformat())
+                .execute()
+            )
+
+            runs = response.data or []
+
+            # Warn when cost_usd is null — indicates CI-5 LLM metrics not yet populated
+            null_count = sum(1 for r in runs if r.get("cost_usd") is None)
+            if null_count > 0:
+                logger.warning(
+                    f"execution_runs has {null_count} rows with null cost_usd — "
+                    f"LLM metrics (CI-5) not yet available, allowing execution | "
+                    f"project_id={project_id}"
+                )
+
+            today_str = today.isoformat()
+            daily_cost = 0.0
+            weekly_cost = 0.0
+
+            for run in runs:
+                cost = run.get("cost_usd")
+                if cost is None:
+                    continue  # skip null rows; fail-open
+                cost_f = float(cost)
+                weekly_cost += cost_f
+                started_at = run.get("started_at") or ""
+                if started_at.startswith(today_str):
+                    daily_cost += cost_f
+
+            return daily_cost, weekly_cost
+
+        except Exception as e:
+            logger.warning(
+                f"Failed to fetch costs from execution_runs, allowing execution | "
+                f"project_id={project_id} | error={e}"
+            )
+            return 0.0, 0.0
+
     def _fetch_project_tasks(self, project_id: str) -> list[dict]:
         """Fetch all non-archived tasks for a project that have execution results."""
         response = (
@@ -138,36 +210,43 @@ class CostBudgetService:
         )
         return response.data or []
 
-    def _get_budget_config(self, project_id: str) -> dict[str, float]:
+    def _get_budget_config(self, project_id: str | None) -> dict[str, float]:
         """Get budget configuration for a project.
 
-        Reads from the project's metadata if available, otherwise uses defaults.
+        Reads from the project's metadata if available, otherwise uses env-var-backed defaults.
+        Supports both new field names (daily_budget_usd, weekly_budget_usd) and legacy names
+        (max_cost_per_day, max_cost_per_sprint).
         """
-        try:
-            response = (
-                self.supabase_client.table("archon_projects")
-                .select("metadata")
-                .eq("id", project_id)
-                .single()
-                .execute()
-            )
-            metadata = response.data.get("metadata") if response.data else None
-            if isinstance(metadata, dict):
-                budget = metadata.get("cost_budget", {})
-                if isinstance(budget, dict):
-                    return {
-                        "max_cost_per_day": float(budget.get("max_cost_per_day", DEFAULT_MAX_COST_PER_DAY)),
-                        "max_cost_per_sprint": float(budget.get("max_cost_per_sprint", DEFAULT_MAX_COST_PER_SPRINT)),
-                    }
-        except Exception as e:
-            logger.debug(f"Could not read budget config for project {project_id}: {e}")
+        if project_id:
+            try:
+                response = (
+                    self.supabase_client.table("archon_projects")
+                    .select("metadata")
+                    .eq("id", project_id)
+                    .single()
+                    .execute()
+                )
+                metadata = response.data.get("metadata") if response.data else None
+                if isinstance(metadata, dict):
+                    budget = metadata.get("cost_budget", {})
+                    if isinstance(budget, dict):
+                        daily = float(
+                            budget.get("daily_budget_usd")
+                            or budget.get("max_cost_per_day")
+                            or DEFAULT_DAILY_BUDGET
+                        )
+                        weekly = float(
+                            budget.get("weekly_budget_usd")
+                            or budget.get("max_cost_per_sprint")
+                            or DEFAULT_WEEKLY_BUDGET
+                        )
+                        return {"daily_budget_usd": daily, "weekly_budget_usd": weekly}
+            except Exception as e:
+                logger.debug(f"Could not read budget config for project {project_id}: {e}")
 
-        return {
-            "max_cost_per_day": DEFAULT_MAX_COST_PER_DAY,
-            "max_cost_per_sprint": DEFAULT_MAX_COST_PER_SPRINT,
-        }
+        return {"daily_budget_usd": DEFAULT_DAILY_BUDGET, "weekly_budget_usd": DEFAULT_WEEKLY_BUDGET}
 
-    def update_budget_config(self, project_id: str, max_cost_per_day: float, max_cost_per_sprint: float) -> tuple[bool, dict]:
+    def update_budget_config(self, project_id: str, daily_budget_usd: float, weekly_budget_usd: float) -> tuple[bool, dict]:
         """Update budget configuration for a project by writing to project metadata."""
         try:
             # Read current metadata to preserve other fields
@@ -188,8 +267,8 @@ class CostBudgetService:
             updated_metadata = {
                 **existing_metadata,
                 "cost_budget": {
-                    "max_cost_per_day": max_cost_per_day,
-                    "max_cost_per_sprint": max_cost_per_sprint,
+                    "daily_budget_usd": daily_budget_usd,
+                    "weekly_budget_usd": weekly_budget_usd,
                 },
             }
 
@@ -197,10 +276,10 @@ class CostBudgetService:
                 {"metadata": updated_metadata}
             ).eq("id", project_id).execute()
 
-            config = {"max_cost_per_day": max_cost_per_day, "max_cost_per_sprint": max_cost_per_sprint}
+            config = {"daily_budget_usd": daily_budget_usd, "weekly_budget_usd": weekly_budget_usd}
             logger.info(
                 f"Budget config updated | project_id={project_id} | "
-                f"max_cost_per_day=${max_cost_per_day} | max_cost_per_sprint=${max_cost_per_sprint}"
+                f"daily_budget_usd=${daily_budget_usd} | weekly_budget_usd=${weekly_budget_usd}"
             )
             return True, {"budget_config": config}
 

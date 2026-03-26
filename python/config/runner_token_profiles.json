@@ -1,0 +1,28 @@
+{
+  "profiles": {
+    "simple_bugfix": {
+      "max_tokens": 8192,
+      "temperature_pct": 50,
+      "model_hint": "haiku",
+      "description": "Lightweight profile for simple bug fixes and patches"
+    },
+    "standard_feature": {
+      "max_tokens": 12288,
+      "temperature_pct": 60,
+      "model_hint": "haiku",
+      "description": "Standard profile for routine feature implementation"
+    },
+    "complex_architecture": {
+      "max_tokens": 20480,
+      "temperature_pct": 75,
+      "model_hint": "sonnet",
+      "description": "High-capacity profile for complex architectural work"
+    },
+    "research_exploration": {
+      "max_tokens": 25600,
+      "temperature_pct": 80,
+      "model_hint": "sonnet",
+      "description": "Exploratory profile for research and investigation tasks"
+    }
+  }
+}

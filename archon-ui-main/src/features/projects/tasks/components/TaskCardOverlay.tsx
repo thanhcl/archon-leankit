@@ -32,12 +32,12 @@ export const TaskCardOverlay = ({ task, estimate }: TaskCardOverlayProps) => {
         )}
       >
         <div
-          className={cn(
-            "absolute left-0 top-0 bottom-0 w-[4px] rounded-l-lg opacity-100",
-            getOrderColor(task.task_order),
-            getOrderGlow(task.task_order),
-          )}
-        />
+            className={cn(
+              "absolute left-0 top-0 bottom-0 w-[4px] rounded-l-lg opacity-100",
+              getOrderColor(task.task_order ?? 0),
+              getOrderGlow(task.task_order ?? 0),
+            )}
+          />
 
         <div className="flex flex-col h-full p-3">
           <div className="flex items-center gap-2 mb-2 pl-1.5">

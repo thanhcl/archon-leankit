@@ -6,7 +6,7 @@ import { cn, glassmorphism } from "../../../ui/primitives/styles";
 import { EditableTableCell } from "../components/EditableTableCell";
 import { TaskAssignee } from "../components/TaskAssignee";
 import { useDeleteTask, useUpdateTask } from "../hooks";
-import type { Assignee, Task } from "../types";
+import type { Assignee, Task, TaskBoardStatus, UpdateTaskRequest } from "../types";
 import { getOrderColor, getOrderGlow, ItemTypes } from "../utils/task-styles";
 
 const rowVariants = {
@@ -22,8 +22,8 @@ interface TableViewProps {
   onTaskView?: (task: Task) => void;
   onTaskComplete?: (taskId: string) => void;
   onTaskDelete?: (task: Task) => void;
-  onTaskReorder: (taskId: string, newOrder: number, status: Task["status"]) => void;
-  onTaskUpdate?: (taskId: string, updates: Partial<Task>) => Promise<void>;
+  onTaskReorder: (taskId: string, newOrder: number, status: TaskBoardStatus) => void;
+  onTaskUpdate?: (taskId: string, updates: UpdateTaskRequest) => Promise<void>;
 }
 
 interface DraggableRowProps {
@@ -33,7 +33,7 @@ interface DraggableRowProps {
   onTaskView?: (task: Task) => void;
   onTaskComplete?: (taskId: string) => void;
   onTaskDelete?: (task: Task) => void;
-  onTaskReorder: (taskId: string, newOrder: number, status: Task["status"]) => void;
+  onTaskReorder: (taskId: string, newOrder: number, status: TaskBoardStatus) => void;
 }
 
 const DraggableRow = ({
@@ -71,7 +71,7 @@ const DraggableRow = ({
       if (draggedIndex === hoveredIndex) return;
 
       // Move the task for visual feedback
-      onTaskReorder(draggedItem.id, hoveredIndex, task.status);
+      onTaskReorder(draggedItem.id, hoveredIndex, task.status as TaskBoardStatus);
 
       // Update the dragged item's index
       draggedItem.index = hoveredIndex;
@@ -83,7 +83,7 @@ const DraggableRow = ({
 
   // Handle field updates using mutations
   const handleUpdateField = async (field: keyof Task, value: string) => {
-    const updates: Partial<Task> = { [field]: value };
+    const updates = { [field]: value } as UpdateTaskRequest;
 
     await updateTaskMutation.mutateAsync({
       taskId: task.id,
@@ -130,7 +130,7 @@ const DraggableRow = ({
     >
       {/* Priority/Order Indicator */}
       <td className="w-1 p-0">
-        <div className={cn("w-1 h-full", getOrderColor(task.task_order), getOrderGlow(task.task_order))} />
+        <div className={cn("w-1 h-full", getOrderColor(task.task_order ?? 0), getOrderGlow(task.task_order ?? 0))} />
       </td>
 
       {/* Title */}
@@ -165,6 +165,31 @@ const DraggableRow = ({
             className="text-sm"
             isUpdating={updateTaskMutation.isPending}
           />
+        </div>
+      </td>
+
+      {/* Tags */}
+      <td className="px-4 py-2 w-48">
+        <div className="flex flex-wrap gap-1">
+          {task.tags && task.tags.length > 0 ? (
+            <>
+              {task.tags.slice(0, 2).map((tag) => (
+                <span
+                  key={tag}
+                  className="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium bg-cyan-500/10 text-cyan-600 dark:text-cyan-400 border border-cyan-500/20"
+                >
+                  {tag}
+                </span>
+              ))}
+              {task.tags.length > 2 && (
+                <span className="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium bg-gray-500/10 text-gray-500 dark:text-gray-400 border border-gray-500/20">
+                  +{task.tags.length - 2}
+                </span>
+              )}
+            </>
+          ) : (
+            <span className="text-xs text-gray-400">—</span>
+          )}
         </div>
       </td>
 
@@ -237,7 +262,7 @@ export const TableView = ({
 }: TableViewProps) => {
   // Group tasks by status for better organization
   const groupedTasks = React.useMemo(() => {
-    const groups: Record<Task["status"], Task[]> = {
+    const groups: Record<TaskBoardStatus, Task[]> = {
       todo: [],
       doing: [],
       review: [],
@@ -245,18 +270,20 @@ export const TableView = ({
     };
 
     tasks.forEach((task) => {
-      groups[task.status].push(task);
+      if (task.status in groups) {
+        groups[task.status as TaskBoardStatus].push(task);
+      }
     });
 
     // Sort each group by task_order
     Object.keys(groups).forEach((status) => {
-      groups[status as Task["status"]].sort((a, b) => a.task_order - b.task_order);
+      groups[status as TaskBoardStatus].sort((a, b) => (a.task_order ?? 0) - (b.task_order ?? 0));
     });
 
     return groups;
   }, [tasks]);
 
-  const statusOrder: Task["status"][] = ["todo", "doing", "review", "done"];
+  const statusOrder: TaskBoardStatus[] = ["todo", "doing", "review", "done"];
 
   return (
     <div className="overflow-x-auto">
@@ -267,6 +294,7 @@ export const TableView = ({
             <th className="px-4 py-3 text-left text-sm font-medium text-gray-700 dark:text-gray-300">Title</th>
             <th className="px-4 py-3 text-left text-sm font-medium text-gray-700 dark:text-gray-300 w-32">Status</th>
             <th className="px-4 py-3 text-left text-sm font-medium text-gray-700 dark:text-gray-300 w-40">Feature</th>
+            <th className="px-4 py-3 text-left text-sm font-medium text-gray-700 dark:text-gray-300 w-48">Tags</th>
             <th className="px-4 py-3 text-left text-sm font-medium text-gray-700 dark:text-gray-300 w-36">Assignee</th>
             <th className="px-4 py-3 text-left text-sm font-medium text-gray-700 dark:text-gray-300 w-28">Actions</th>
           </tr>
@@ -280,7 +308,7 @@ export const TableView = ({
               <React.Fragment key={status}>
                 {/* Status group header */}
                 <tr className="bg-gray-100/50 dark:bg-gray-800/50">
-                  <td colSpan={6} className="px-4 py-2">
+                  <td colSpan={7} className="px-4 py-2">
                     <div className="flex items-center gap-2">
                       <span
                         className={cn(
@@ -314,7 +342,7 @@ export const TableView = ({
           })}
           {tasks.length === 0 && (
             <tr>
-              <td colSpan={6} className="text-center py-8 text-gray-400">
+              <td colSpan={7} className="text-center py-8 text-gray-400">
                 No tasks yet. Create your first task to get started.
               </td>
             </tr>

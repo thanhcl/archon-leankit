@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { callAPIWithETag } from "../../../../shared/api/apiClient";
+import type { TaskCountsListResponse } from "../../../../../types/api-contracts.generated";
 import type { CreateTaskRequest, DatabaseTaskStatus, Task, UpdateTaskRequest } from "../../types";
 import { taskService } from "../taskService";
 
@@ -34,7 +35,14 @@ describe("taskService", () => {
 
     const mockTask: Task = {
       id: "task-123",
-      ...mockTaskData,
+      project_id: mockTaskData.project_id,
+      title: mockTaskData.title,
+      description: mockTaskData.description ?? "",
+      status: mockTaskData.status ?? "todo",
+      assignee: mockTaskData.assignee ?? "User",
+      task_order: mockTaskData.task_order ?? 0,
+      priority: mockTaskData.priority ?? "medium",
+      feature: mockTaskData.feature,
       created_at: "2024-01-01T00:00:00Z",
       updated_at: "2024-01-01T00:00:00Z",
     };
@@ -288,7 +296,14 @@ describe("taskService", () => {
 
       const fullTask: Task = {
         id: "task-full",
-        ...fullTaskData,
+        project_id: fullTaskData.project_id,
+        title: fullTaskData.title,
+        description: fullTaskData.description ?? "",
+        status: fullTaskData.status ?? "todo",
+        assignee: fullTaskData.assignee ?? "User",
+        task_order: fullTaskData.task_order ?? 0,
+        priority: fullTaskData.priority ?? "medium",
+        feature: fullTaskData.feature,
         created_at: "2024-01-01T00:00:00Z",
         updated_at: "2024-01-01T00:00:00Z",
         // Additional fields that might be added by backend
@@ -386,6 +401,49 @@ describe("taskService", () => {
       expect(result).toEqual(mockResponse.task);
       expect(result).not.toHaveProperty("message");
       expect(result).not.toHaveProperty("metadata");
+    });
+  });
+
+  describe("getTaskCountsForAllProjects", () => {
+    it("should preserve the current map-shaped response", async () => {
+      const countsByProject = {
+        "project-1": { todo: 2, doing: 1, review: 0, done: 4 },
+        "project-2": { todo: 0, doing: 3, review: 1, done: 1 },
+      };
+
+      (callAPIWithETag as any).mockResolvedValueOnce(countsByProject);
+
+      const result = await taskService.getTaskCountsForAllProjects();
+
+      expect(callAPIWithETag).toHaveBeenCalledWith("/api/projects/task-counts");
+      expect(result).toEqual(countsByProject);
+    });
+
+    it("should normalize generated contract list responses into the UI map shape", async () => {
+      const generatedResponse: TaskCountsListResponse = {
+        projects: [
+          {
+            id: "project-1",
+            title: "Project One",
+            task_counts: { todo: 2, doing: 1, review: 0, done: 4 },
+          },
+          {
+            id: "project-2",
+            title: "Project Two",
+            task_counts: { todo: 0, doing: 3, review: 1, done: 1 },
+          },
+        ],
+        timestamp: "2026-03-25T00:00:00Z",
+      };
+
+      (callAPIWithETag as any).mockResolvedValueOnce(generatedResponse);
+
+      const result = await taskService.getTaskCountsForAllProjects();
+
+      expect(result).toEqual({
+        "project-1": generatedResponse.projects[0].task_counts,
+        "project-2": generatedResponse.projects[1].task_counts,
+      });
     });
   });
 });

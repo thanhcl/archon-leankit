@@ -1,7 +1,7 @@
 import { useCallback } from "react";
 import { useToast } from "@/features/shared/hooks/useToast";
 import { useProjectFeatures } from "../../hooks/useProjectQueries";
-import type { Assignee, CreateTaskRequest, Task, UpdateTaskRequest, UseTaskEditorReturn } from "../types";
+import type { Assignee, CreateTaskRequest, Task, TaskBoardStatus, UpdateTaskRequest, UseTaskEditorReturn } from "../types";
 import { useCreateTask, useUpdateTask } from "./useTaskQueries";
 
 export const useTaskEditor = (projectId: string): UseTaskEditorReturn => {
@@ -22,9 +22,9 @@ export const useTaskEditor = (projectId: string): UseTaskEditorReturn => {
   const isSaving = createTaskMutation.isPending || updateTaskMutation.isPending;
 
   // Get default order for new tasks based on status
-  const getDefaultTaskOrder = useCallback((status: Task["status"]) => {
+  const getDefaultTaskOrder = useCallback((status: TaskBoardStatus) => {
     // Simple priority mapping: todo=50, doing=25, review=75, done=100
-    const statusOrderMap = { todo: 50, doing: 25, review: 75, done: 100 };
+    const statusOrderMap: Record<TaskBoardStatus, number> = { todo: 50, doing: 25, review: 75, done: 100 };
     return statusOrderMap[status] || 50;
   }, []);
 
@@ -50,11 +50,11 @@ export const useTaskEditor = (projectId: string): UseTaskEditorReturn => {
         project_id: projectId,
         title: localTask.title || "",
         description: localTask.description || "",
-        status: (localTask.status as Task["status"]) || "todo",
+        status: (localTask.status as TaskBoardStatus) || "todo",
         assignee: (localTask.assignee as Assignee) || "User",
         priority: localTask.priority || "medium",
         feature: localTask.feature || "",
-        task_order: localTask.task_order || getDefaultTaskOrder((localTask.status as Task["status"]) || "todo"),
+        task_order: localTask.task_order || getDefaultTaskOrder((localTask.status as TaskBoardStatus) || "todo"),
       };
     },
     [projectId, getDefaultTaskOrder],

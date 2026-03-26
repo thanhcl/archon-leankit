@@ -1,4 +1,5 @@
 import { callAPIWithETag } from "../../../shared/api/apiClient";
+import type { RuleListResponse } from "../../../../types/api-contracts.generated";
 import type {
   CreateRuleRequest,
   OptimizeResult,
@@ -8,21 +9,16 @@ import type {
   UpdateRuleRequest,
 } from "../types";
 
-interface RulesResponse {
-  rules: Rule[];
-  total_count: number;
-}
-
 interface RuleResponse {
   rule: Rule;
 }
 
 export const ruleService = {
   async getRulesByProject(projectId: string): Promise<Rule[]> {
-    const response = await callAPIWithETag<RulesResponse>(
+    const response = await callAPIWithETag<RuleListResponse>(
       `/api/rules?project_id=${encodeURIComponent(projectId)}&include_global=false&enabled_only=false`,
     );
-    return response.rules || [];
+    return (response.rules || []) as Rule[];
   },
 
   async getRule(ruleId: string): Promise<Rule> {

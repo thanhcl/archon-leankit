@@ -5,6 +5,7 @@ All models follow exact naming from the PRD specification.
 
 from datetime import datetime, timezone
 from enum import Enum
+from typing import Any
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -318,6 +319,36 @@ class StepHistory(BaseModel):
             pass
 
         return None  # All steps complete
+
+
+class TelemetryEvent(BaseModel):
+    """A single persisted telemetry event.
+
+    Core correlation and classification fields are first-class attributes.
+    All additional structured log fields are surfaced under extra_fields.
+    """
+
+    id: int = Field(..., description="Auto-incremented row ID in the telemetry store")
+    work_order_id: str | None = Field(None, description="Work order correlation ID")
+    task_id: str | None = Field(None, description="Task correlation ID")
+    run_id: str | None = Field(None, description="Run correlation ID")
+    project_id: str | None = Field(None, description="Project correlation ID")
+    level: str = Field(..., description="Log level (debug, info, warning, error)")
+    event: str = Field(..., description="Structured event name")
+    timestamp: str = Field(..., description="ISO-8601 timestamp when the event was emitted")
+    extra_fields: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Additional structured log fields beyond the core schema",
+    )
+
+
+class TelemetryEventsPage(BaseModel):
+    """Paginated response for telemetry event queries."""
+
+    events: list[TelemetryEvent]
+    total: int = Field(..., description="Total events matching the applied filters")
+    limit: int = Field(..., description="Maximum events requested per page")
+    offset: int = Field(..., description="Number of matching events skipped")
 
 
 class CommandNotFoundError(Exception):

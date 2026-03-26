@@ -11,6 +11,7 @@ from fastapi import APIRouter, HTTPException, Query
 from sse_starlette.sse import EventSourceResponse
 
 from ..agent_executor.agent_cli_executor import AgentCLIExecutor
+from ..config import config
 from ..command_loader.claude_command_loader import ClaudeCommandLoader
 from ..github_integration.github_client import GitHubClient
 from ..models import (
@@ -27,6 +28,8 @@ from ..models import (
     GitHubRepositoryVerificationResponse,
     GitProgressSnapshot,
     StepHistory,
+    TelemetryEvent,
+    TelemetryEventsPage,
     UpdateRepositoryRequest,
 )
 from ..sandbox_manager.sandbox_factory import SandboxFactory
@@ -35,6 +38,7 @@ from ..state_manager.repository_factory import create_repository
 from ..utils.id_generator import generate_work_order_id
 from ..utils.log_buffer import WorkOrderLogBuffer
 from ..utils.structured_logger import get_logger
+from ..utils.telemetry_store import TelemetryEventStore
 from ..workflow_engine.workflow_orchestrator import WorkflowOrchestrator
 from .sse_streams import stream_work_order_logs
 
@@ -136,6 +140,7 @@ sandbox_factory = SandboxFactory()
 github_client = GitHubClient()
 command_loader = ClaudeCommandLoader()
 log_buffer = WorkOrderLogBuffer()
+telemetry_store = TelemetryEventStore(config.TELEMETRY_DB_PATH)
 orchestrator = WorkflowOrchestrator(
     agent_executor=agent_executor,
     sandbox_factory=sandbox_factory,
@@ -576,6 +581,103 @@ async def verify_repository_access(repository_id: str) -> dict[str, bool | str]:
             error=str(e)
         )
         raise HTTPException(status_code=500, detail=f"Failed to verify repository: {e}") from e
+
+
+@router.get("/telemetry/events")
+async def query_telemetry_events(
+    work_order_id: str | None = Query(None, description="Filter by work order ID"),
+    task_id: str | None = Query(None, description="Filter by task ID"),
+    run_id: str | None = Query(None, description="Filter by run ID"),
+    project_id: str | None = Query(None, description="Filter by project ID"),
+    from_time: str | None = Query(None, description="ISO timestamp lower bound (inclusive)"),
+    to_time: str | None = Query(None, description="ISO timestamp upper bound (inclusive)"),
+    level: str | None = Query(None, description="Filter by log level (info, warning, error, debug)"),
+    limit: int = Query(100, ge=1, le=1000, description="Maximum events to return"),
+    offset: int = Query(0, ge=0, description="Number of matching events to skip"),
+) -> TelemetryEventsPage:
+    """Query persisted telemetry events with time-range and correlation filters.
+
+    Returns events stored in the durable SQLite backend, beyond the in-memory
+    replay buffer. All filters are combined with AND.
+
+    Correlation filters (work_order_id, task_id, run_id, project_id) let callers
+    retrieve the full history for a specific work unit. Time-range filters
+    (from_time, to_time) accept ISO-8601 timestamps.
+
+    Results are ordered oldest-first and paginated via limit/offset.
+
+    Args:
+        work_order_id: Exact match on work order ID
+        task_id: Exact match on task ID
+        run_id: Exact match on run ID
+        project_id: Exact match on project ID
+        from_time: Lower bound timestamp (inclusive, ISO-8601)
+        to_time: Upper bound timestamp (inclusive, ISO-8601)
+        level: Log level filter (case-insensitive)
+        limit: Page size (1–1000)
+        offset: Pagination offset
+
+    Returns:
+        TelemetryEventsPage with events and total count
+
+    Examples:
+        GET /api/agent-work-orders/telemetry/events?work_order_id=wo-123
+        GET /api/agent-work-orders/telemetry/events?from_time=2025-01-01T00:00:00Z&level=error
+    """
+    logger.info(
+        "telemetry_events_query_started",
+        work_order_id=work_order_id,
+        task_id=task_id,
+        run_id=run_id,
+        project_id=project_id,
+        from_time=from_time,
+        to_time=to_time,
+        level=level,
+        limit=limit,
+        offset=offset,
+    )
+
+    try:
+        raw_events, total = telemetry_store.query_events(
+            work_order_id=work_order_id,
+            task_id=task_id,
+            run_id=run_id,
+            project_id=project_id,
+            from_time=from_time,
+            to_time=to_time,
+            level=level,
+            limit=limit,
+            offset=offset,
+        )
+
+        # Convert raw dicts to TelemetryEvent models
+        core_fields = {"id", "work_order_id", "task_id", "run_id", "project_id", "level", "event", "timestamp"}
+        events = [
+            TelemetryEvent(
+                id=e["id"],
+                work_order_id=e.get("work_order_id"),
+                task_id=e.get("task_id"),
+                run_id=e.get("run_id"),
+                project_id=e.get("project_id"),
+                level=e["level"],
+                event=e["event"],
+                timestamp=e["timestamp"],
+                extra_fields={k: v for k, v in e.items() if k not in core_fields},
+            )
+            for e in raw_events
+        ]
+
+        logger.info(
+            "telemetry_events_query_completed",
+            result_count=len(events),
+            total=total,
+        )
+
+        return TelemetryEventsPage(events=events, total=total, limit=limit, offset=offset)
+
+    except Exception as e:
+        logger.error("telemetry_events_query_failed", error=str(e), exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to query telemetry events: {e}") from e
 
 
 @router.get("/{agent_work_order_id}")

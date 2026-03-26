@@ -4,29 +4,37 @@
  * Main task interfaces and types following vertical slice architecture
  */
 
+import type {
+  CreateTaskRequest as GeneratedCreateTaskRequest,
+  OwnerFeedbackRequest,
+  OwnerFeedbackResponse,
+  SprintDay,
+  SprintStatsResponse as GeneratedSprintStatsResponse,
+  SprintSummary,
+  SprintTrends,
+  TaskCountsResponse as GeneratedTaskCountsResponse,
+  TaskComplexity,
+  TaskRepoGuidancePack,
+  TaskResponse,
+  TaskStatus,
+  TaskType,
+  UpdateTaskRequest as GeneratedUpdateTaskRequest,
+} from "../../../../types/api-contracts.generated";
+
+export type { OwnerFeedbackRequest, OwnerFeedbackResponse };
+
 // Import priority type from priority.ts to avoid duplication
 import type { TaskPriority } from "./priority";
 export type { TaskPriority };
+export type { TaskComplexity };
 
 // Task type classification - using database values directly
-export type TaskTypeName = "bug" | "feature" | "improvement" | "docs" | "refactor" | "test";
+export type TaskTypeName = TaskType;
 
 // Database status enum - using database values directly
-export type DatabaseTaskStatus =
-  | "draft"
-  | "proposed"
-  | "approved"
-  | "planning"
-  | "owner-qa"
-  | "assigned"
-  | "executing"
-  | "architect-review"
-  | "review"
-  | "done"
-  | "failed"
-  | "escalated"
-  | "on-hold"
-  | "cancelled";
+export type BoardTaskStatus = "todo" | "doing";
+export type DatabaseTaskStatus = TaskStatus | BoardTaskStatus;
+export type TaskBoardStatus = BoardTaskStatus | "review" | "done";
 
 // Assignee type - flexible string to support any agent name
 export type Assignee = string;
@@ -36,21 +44,13 @@ export const COMMON_ASSIGNEES = ["User", "Archon", "Coding Agent"] as const;
 export type CommonAssignee = (typeof COMMON_ASSIGNEES)[number];
 
 // Task counts for project overview
-export interface TaskCounts {
-  draft: number;
-  proposed: number;
-  approved: number;
-  planning: number;
-  "owner-qa": number;
-  assigned: number;
-  executing: number;
-  "architect-review": number;
-  review: number;
-  done: number;
-  failed: number;
-  escalated: number;
-  "on-hold": number;
-  cancelled: number;
+export type TaskCounts = GeneratedTaskCountsResponse["task_counts"] & Partial<Record<DatabaseTaskStatus, number>>;
+export type ProjectTaskCountsMap = Record<string, TaskCounts>;
+
+export const EMPTY_TASK_COUNTS: TaskCounts = {};
+
+export function getTaskCount(taskCounts: TaskCounts, status: DatabaseTaskStatus): number {
+  return taskCounts[status] ?? 0;
 }
 
 // Task source and code example types (replacing any)
@@ -70,78 +70,68 @@ export type TaskCodeExample =
     }
   | Record<string, unknown>;
 
-// Base Task interface (matches database schema)
-export interface Task {
-  id: string;
-  project_id: string;
-  title: string;
-  description: string;
+type TaskContractFields = Omit<
+  TaskResponse,
+  | "description"
+  | "status"
+  | "task_order"
+  | "complexity"
+  | "retry_count"
+  | "max_retries"
+  | "archived"
+  | "archived_at"
+  | "archived_by"
+  | "blocked_by"
+  | "allowed_paths"
+  | "forbidden_paths"
+  | "repo_guidance_packs"
+  | "task_type"
+  | "phase"
+  | "module"
+  | "sprint"
+  | "tags"
+  | "sources"
+  | "code_examples"
+  | "acceptance_criteria"
+  | "execution_prompt"
+  | "featureColor"
+  | "linked_plan_item"
+>;
+
+// Base task type aligned with the API contract and extended for UI-only fields
+export type Task = TaskContractFields & {
+  description?: string | null;
   status: DatabaseTaskStatus;
-  assignee: Assignee; // Can be any string - agent names, "User", etc.
-  task_order: number;
-  feature?: string;
-  sources?: TaskSource[];
-  code_examples?: TaskCodeExample[];
-  created_at: string;
-  updated_at: string;
-
-  // Soft delete fields
-  archived?: boolean;
-  archived_at?: string;
-  archived_by?: string;
-
-  // Priority field (required database field)
-  priority: TaskPriority;
-
-  // Extended UI properties
-  featureColor?: string;
-
-  // Categorization fields
-  task_type?: TaskTypeName;
-  phase?: string;
-  module?: string;
-  sprint?: string;
-  tags?: string[];
-
-  // Lifecycle fields
-  parent_task_id?: string;
-  blocked_by?: string[];
-  complexity?: "simple" | "complex";
-  owner?: string;
-  source_app?: string;
+  task_order?: number | null;
+  complexity?: TaskComplexity;
   retry_count?: number;
   max_retries?: number;
-  state_changed_at?: string;
-
-  // Ownership tracking
-  created_by?: string; // "owner" | "engine" | "auto-breakdown" | "code-review"
-  created_from?: string; // "api" | "telegram" | "board-ui" | "mcp" | "auto"
-  executed_by?: { model: string; session_id: string; source_app: string; duration_seconds?: number } | null;
-  reviewed_by?: Array<{
-    stage: string;
-    agent: string;
-    model: string;
-    actor: string;
-    verdict?: string;
-    confidence?: number;
-    mode?: string;
-  }>;
-
-  // Large fields (may be absent when exclude_large_fields=true)
-  acceptance_criteria?: unknown[];
-  execution_result?: Record<string, unknown> | null;
-  architect_review?: Record<string, unknown> | null;
-  execution_prompt?: string;
-  state_history?: Record<string, unknown>[];
-
-  // Stats (present when exclude_large_fields=true)
-  stats?: { sources_count: number; code_examples_count: number };
-
-  // Estimation fields (populated from task-estimates endpoint)
+  archived?: boolean;
+  archived_at?: string | null;
+  archived_by?: string | null;
+  blocked_by?: string[] | null;
+  allowed_paths?: string[] | null;
+  forbidden_paths?: string[] | null;
+  repo_guidance_packs?: TaskRepoGuidancePack[] | null;
+  task_type?: TaskTypeName;
+  phase?: string | null;
+  module?: string | null;
+  sprint?: string | null;
+  tags?: string[] | null;
+  acceptance_criteria?: unknown[] | null;
+  execution_prompt?: string | null;
+  featureColor?: string;
+  sources?: TaskSource[] | null;
+  code_examples?: TaskCodeExample[] | null;
+  linked_plan_item?: unknown;
   estimate_duration_seconds?: number;
   estimate_cost_usd?: number;
   estimate_confidence?: "none" | "low" | "medium" | "high";
-}
+  // Owner feedback fields (populated after task completion)
+  owner_rating?: number | null;
+  owner_notes?: string | null;
+  improvement_tags?: string[] | null;
+};
 
 // Estimation types
 export interface TaskEstimate {
@@ -165,33 +155,12 @@ export interface PredictedVsActual {
 }
 
 // Sprint stats types (from GET /api/projects/{id}/sprint-stats)
-export interface SprintEntry {
-  date: string;
-  tasks_completed: number;
-  first_pass_rate: number;
-  avg_retries: number;
-  avg_duration_hours: number;
-  estimated_cost_usd: number;
-}
+export type SprintEntry = SprintDay;
+export type SprintStatsSummary = SprintSummary;
 
-export interface SprintStatsSummary {
-  total_tasks: number;
-  done: number;
-  first_pass_rate: number;
-  avg_retries: number;
-  avg_duration_hours: number;
-  estimated_cost_usd: number;
-}
-
-export interface SprintStatsResponse {
-  project_id: string;
-  group_by: string;
-  summary: SprintStatsSummary;
-  sprints: SprintEntry[];
-  trends: {
-    available: boolean;
-    previous_date?: string;
-    current_date?: string;
+export type SprintStatsResponse = Omit<GeneratedSprintStatsResponse, "trends"> & {
+  group_by?: string;
+  trends: Omit<SprintTrends, "tasks_completed_delta" | "first_pass_rate_delta"> & {
     tasks_completed_delta?: number;
     first_pass_rate_delta?: number;
     avg_retries_delta?: number;
@@ -199,10 +168,8 @@ export interface SprintStatsResponse {
     estimated_cost_usd_delta?: number;
     message?: string;
   };
-  top_learnings: string[];
-  code_patterns_count: number;
-  injection_metrics: Record<string, number>;
-}
+  injection_metrics?: Record<string, number>;
+};
 
 // Budget configuration (from GET/PUT /api/projects/{id}/budget-config)
 export interface BudgetConfig {
@@ -241,63 +208,36 @@ export interface CostStatusResponse {
   };
 }
 
-// Request types
-export interface CreateTaskRequest {
-  project_id: string;
-  title: string;
-  description: string;
-  status?: DatabaseTaskStatus;
-  assignee?: Assignee; // Optional assignee string
-  task_order?: number;
-  feature?: string;
-  featureColor?: string;
-  priority?: TaskPriority;
-  sources?: TaskSource[];
-  code_examples?: TaskCodeExample[];
-  // Categorization fields
-  task_type?: TaskTypeName;
-  phase?: string;
-  module?: string;
-  sprint?: string;
-  tags?: string[];
-  // Lifecycle fields
-  parent_task_id?: string;
-  blocked_by?: string[];
-  owner?: string;
-  acceptance_criteria?: unknown[];
-  execution_prompt?: string;
-  source_app?: string;
-  complexity?: "simple" | "complex";
-  max_retries?: number;
-  // Ownership tracking
-  created_by?: string;
-  created_from?: string;
-}
+type CreateTaskContractFields = Omit<
+  GeneratedCreateTaskRequest,
+  "status" | "assignee" | "task_order" | "priority" | "complexity" | "task_type" | "max_retries" | "sources" | "code_examples"
+>;
 
-export interface UpdateTaskRequest {
-  title?: string;
-  description?: string;
+type UpdateTaskContractFields = Omit<
+  GeneratedUpdateTaskRequest,
+  "status" | "assignee" | "priority" | "complexity" | "task_type" | "sources" | "code_examples"
+>;
+
+export type CreateTaskRequest = CreateTaskContractFields & {
   status?: DatabaseTaskStatus;
-  assignee?: Assignee; // Optional assignee string
+  assignee?: Assignee;
   task_order?: number;
-  feature?: string;
   featureColor?: string;
   priority?: TaskPriority;
   sources?: TaskSource[];
   code_examples?: TaskCodeExample[];
-  // Categorization fields
   task_type?: TaskTypeName;
-  phase?: string;
-  module?: string;
-  sprint?: string;
-  tags?: string[];
-  // Lifecycle fields
-  parent_task_id?: string;
-  blocked_by?: string[];
-  owner?: string;
-  acceptance_criteria?: unknown[];
-  execution_prompt?: string;
-  source_app?: string;
-  complexity?: "simple" | "complex";
+  complexity?: TaskComplexity;
   max_retries?: number;
-}
+};
+
+export type UpdateTaskRequest = UpdateTaskContractFields & {
+  status?: DatabaseTaskStatus;
+  assignee?: Assignee;
+  featureColor?: string;
+  priority?: TaskPriority;
+  sources?: TaskSource[];
+  code_examples?: TaskCodeExample[];
+  task_type?: TaskTypeName;
+  complexity?: TaskComplexity;
+};

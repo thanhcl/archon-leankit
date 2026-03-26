@@ -88,7 +88,17 @@ This new vision for Archon replaces the old one (the agenteer). Archon used to b
    - For cloud Supabase: They recently introduced a new type of service role key but use the legacy one (the longer one).
    - For local Supabase: Set `SUPABASE_URL` to http://host.docker.internal:8000 (unless you have an IP address set up). To get `SUPABASE_SERVICE_KEY` run `supabase status -o env`.
 
-3. **Database Setup**: In your [Supabase project](https://supabase.com/dashboard) SQL Editor, copy, paste, and execute the contents of `migration/complete_setup.sql`
+3. **Database Setup**:
+   - In your [Supabase project](https://supabase.com/dashboard) SQL Editor, copy, paste, and execute the contents of `migration/complete_setup.sql`
+   - Then apply LeanKit extension migrations from the unified migration folder:
+     ```bash
+     make migrate-leankit-local
+     ```
+   - LeanKit-specific migrations now live in:
+     - `migration/0.1.0-leankit/`
+   - Historical transitional SQL has been archived under:
+     - `migration/archive/0.1.0-leankit-transition/`
+   - `migration/` is now the single migration root; the older standalone `migrations/` folder has been removed
 
 4. **Start Services** (choose one):
 
@@ -108,6 +118,33 @@ This new vision for Archon replaces the old one (the agenteer). Archon used to b
 5. **Configure API Keys**:
    - Open http://localhost:3737
    - You'll automatically be brought through an onboarding flow to set your API key (OpenAI is default)
+
+6. **Optional: Configure External Channels for LeanKit Platform Pilot**
+   - Add Telegram/OpenClaw variables to `.env` when you are ready to test mobile approval or voice/message ingress
+   - Start from the commented block in [.env.example](/Users/thanhcl/Development/TrueAI/archon-leankit/.env.example)
+   - Minimum live pilot config:
+     - `LEANKIT_TELEGRAM_BOT_TOKEN`
+     - `LEANKIT_TELEGRAM_CHAT_ID`
+     - `LEANKIT_TELEGRAM_WEBHOOK_SECRET`
+     - `LEANKIT_OPENCLAW_INGEST_SECRET`
+   - Recommended with scheduler-backed digests:
+     - `LEANKIT_TELEGRAM_DIGEST_HOUR`
+     - `LEANKIT_TELEGRAM_DIGEST_MINUTE`
+     - `LEANKIT_TELEGRAM_DIGEST_TIMEZONE`
+     - `LEANKIT_TELEGRAM_DIGEST_LOOKBACK_MINUTES`
+     - `LEANKIT_OBSERVABILITY_REPLAY_URL`
+   - Pilot smoke tooling:
+     ```bash
+     python3 /Users/thanhcl/Development/TrueAI/archon-leankit/scripts/channel-smoke.py health
+     python3 /Users/thanhcl/Development/TrueAI/archon-leankit/scripts/channel-smoke.py openclaw-ingest --project-id <project_id> --modality voice
+     python3 /Users/thanhcl/Development/TrueAI/archon-leankit/scripts/channel-smoke.py openclaw-architect --project-id <project_id> --modality text
+     python3 /Users/thanhcl/Development/TrueAI/archon-leankit/scripts/channel-smoke.py pilot --project-id <project_id> --modality voice --force-digest
+     ```
+     - `channel-smoke.py` now auto-loads repo-local `.env`, so it can be run from any working directory
+   - Full pilot checklist:
+     - [/Users/thanhcl/Development/TrueAI/leankit-platform/docs/operations/external-channels-e2e-checklist.md](/Users/thanhcl/Development/TrueAI/leankit-platform/docs/operations/external-channels-e2e-checklist.md)
+   - Notification/digest refactor plan for `archon-leankit`:
+     - [/Users/thanhcl/Development/TrueAI/archon-leankit/docs/notification-adapter-implementation-plan.md](/Users/thanhcl/Development/TrueAI/archon-leankit/docs/notification-adapter-implementation-plan.md)
 
 ## ⚡ Quick Test
 
@@ -184,15 +221,20 @@ If you need to completely reset your database and start fresh:
 
    ⚠️ WARNING: This will delete all Archon specific tables and data! Nothing else will be touched in your DB though.
 
-2. **Rebuild Database**: After reset, run `migration/complete_setup.sql` to create all the tables again.
+2. **Rebuild Database**: After reset, run `migration/complete_setup.sql` to create the base schema again.
+3. **Apply LeanKit Extensions**:
 
-3. **Restart Services**:
+   ```bash
+   make migrate-leankit-local
+   ```
+
+4. **Restart Services**:
 
    ```bash
    docker compose --profile full up -d
    ```
 
-4. **Reconfigure**:
+5. **Reconfigure**:
    - Select your LLM/embedding provider and set the API key again
    - Re-upload any documents or re-crawl websites
 
@@ -201,6 +243,13 @@ The reset script safely removes all tables, functions, triggers, and policies wi
 </details>
 
 ## 📚 Documentation
+
+### Operational Runbooks
+
+- `docs/runbooks/operator-runbook.md` for daily operator checks, approvals, execution monitoring, and manual digest recovery
+- `docs/runbooks/admin-runbook.md` for configuration validation, migrations, and controlled service restarts
+- `docs/runbooks/developer-runbook.md` for local setup, validation, and debugging
+- `docs/operations/event-troubleshooting-runbook.md` for deeper event-path diagnosis after the operator daily checks
 
 ### Core Services
 
@@ -338,6 +387,16 @@ ARCHON_MCP_PORT=8051
 ARCHON_AGENTS_PORT=8052
 AGENT_WORK_ORDERS_PORT=8053
 ```
+
+Platform-aligned aliases are also supported for the core backend services:
+
+```bash
+LEANKIT_CONTROL_PLANE_PORT=8181
+LEANKIT_CONTROL_PLANE_MCP_PORT=8051
+LEANKIT_AGENT_SERVICE_PORT=8052
+```
+
+When both names are set, the `LEANKIT_*` alias is preferred by the LeanKit platform integration work.
 
 Example: Running on different ports:
 
@@ -482,7 +541,7 @@ newgrp docker
 
 - Check backend is running: `curl http://localhost:8181/health`
 - Verify port configuration in `.env`
-- For custom ports, ensure both `ARCHON_SERVER_PORT` and `VITE_ARCHON_SERVER_PORT` are set
+- For custom ports, ensure the backend and frontend agree on the server port. Legacy `ARCHON_SERVER_PORT` still works, and `LEANKIT_CONTROL_PLANE_PORT` is the preferred platform alias
 
 #### Docker Compose Hangs
 

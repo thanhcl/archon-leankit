@@ -8,9 +8,12 @@ instead of direct database access or service imports.
 
 import json
 import logging
+import os
 from typing import Any
 
 import httpx
+
+from ..server.config.env_aliases import get_control_plane_mcp_port
 
 logger = logging.getLogger(__name__)
 
@@ -35,9 +38,7 @@ class MCPClient:
                 self.mcp_url = get_mcp_url()
             except ImportError:
                 # Fallback for when running in agents container
-                import os
-
-                mcp_port = os.getenv("ARCHON_MCP_PORT", "8051")
+                mcp_port = get_control_plane_mcp_port() or "8051"
                 if os.getenv("DOCKER_CONTAINER"):
                     self.mcp_url = f"http://archon-mcp:{mcp_port}"
                 else:

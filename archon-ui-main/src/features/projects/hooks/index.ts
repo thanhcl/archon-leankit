@@ -10,10 +10,21 @@
  */
 
 export {
+  useBootstrapPlanExecutionRuns,
+  useBootstrapPlanTraceEvents,
+  useExternalChannelHeartbeat,
+  useOpenClawChannelHealth,
   projectKeys,
+  useProjectApprovalRequests,
+  useProjectArchitectRequests,
+  useProjectExternalRequests,
+  useBootstrapPlans,
   useCreateProject,
   useDeleteProject,
+  useMaterializeBootstrapPlanBacklog,
+  usePlatformServiceHealth,
   useProjectFeatures,
   useProjects,
+  useTelegramChannelHealth,
   useUpdateProject,
 } from "./useProjectQueries";

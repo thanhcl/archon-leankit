@@ -7,7 +7,7 @@ import { CheckCircle, Copy, Database, ExternalLink, X } from "lucide-react";
 import React from "react";
 import { useToast } from "@/features/shared/hooks/useToast";
 import { copyToClipboard } from "@/features/shared/utils/clipboard";
-import type { PendingMigration } from "../types";
+import type { PendingMigration } from "@/types/api-contracts.generated";
 
 interface PendingMigrationsModalProps {
   isOpen: boolean;

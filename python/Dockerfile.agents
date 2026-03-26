@@ -15,6 +15,9 @@ RUN uv pip install --system --group agents
 # Copy agents code - no dependencies on server code
 # Agents use MCP tools for all operations
 COPY src/agents/ src/agents/
+COPY src/server/__init__.py src/server/
+COPY src/server/config/__init__.py src/server/config/
+COPY src/server/config/env_aliases.py src/server/config/
 COPY src/__init__.py src/
 
 # Set environment variables
@@ -24,6 +27,7 @@ ENV PYTHONUNBUFFERED=1
 # Expose Agents port
 ARG ARCHON_AGENTS_PORT=8052
 ENV ARCHON_AGENTS_PORT=${ARCHON_AGENTS_PORT}
+ENV LEANKIT_AGENT_SERVICE_PORT=${ARCHON_AGENTS_PORT}
 EXPOSE ${ARCHON_AGENTS_PORT}
 
 # Health check

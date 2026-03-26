@@ -57,6 +57,16 @@ export ARCHON_MCP_URL=http://localhost:8051
 uv run python -m uvicorn src.agent_work_orders.server:app --port 8053 --reload
 ```
 
+Platform-aligned aliases are also supported and preferred for LeanKit platform
+integration:
+
+```bash
+export LEANKIT_CONTROL_PLANE_URL=http://localhost:8181
+export LEANKIT_CONTROL_PLANE_MCP_URL=http://localhost:8051
+export LEANKIT_AGENT_WORK_ORDERS_PORT=8053
+export LEANKIT_ENABLE_AGENT_WORK_ORDERS=true
+```
+
 ## Running with Docker
 
 ### Build and Run
@@ -90,10 +100,20 @@ docker compose up -d
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `AGENT_WORK_ORDERS_PORT` | `8053` | Port for agent work orders service |
+| `LEANKIT_AGENT_WORK_ORDERS_PORT` | Alias | Preferred LeanKit platform alias for agent work orders port |
 | `SERVICE_DISCOVERY_MODE` | `local` | Service discovery mode (`local` or `docker_compose`) |
 | `ARCHON_SERVER_URL` | Auto | Main server URL (auto-configured by discovery mode) |
+| `LEANKIT_CONTROL_PLANE_URL` | Alias | Preferred LeanKit platform alias for Archon server URL |
 | `ARCHON_MCP_URL` | Auto | MCP server URL (auto-configured by discovery mode) |
+| `LEANKIT_CONTROL_PLANE_MCP_URL` | Alias | Preferred LeanKit platform alias for Archon MCP URL |
+| `ENABLE_AGENT_WORK_ORDERS` | `false` | Legacy feature gate for enabling the service |
+| `LEANKIT_ENABLE_AGENT_WORK_ORDERS` | Alias | Preferred LeanKit platform alias for enabling the service |
 | `CLAUDE_CLI_PATH` | `claude` | Path to Claude CLI executable |
+| `LEANKIT_RUNNER_CLAUDE_PATH` | Alias | Preferred LeanKit platform alias for Claude CLI path |
+| `LEANKIT_RUNNER_CLAUDE_MODEL` | Alias | Preferred LeanKit platform alias for Claude model selection |
+| `LEANKIT_RUNNER_CLAUDE_MAX_TURNS` | Alias | Preferred LeanKit platform alias for max turns |
+| `LEANKIT_RUNNER_SKIP_PERMISSIONS` | Alias | Preferred LeanKit platform alias for skip permissions flag |
+| `LEANKIT_RUNNER_TIMEOUT_SECONDS` | Alias | Preferred LeanKit platform alias for execution timeout |
 | `GH_CLI_PATH` | `gh` | Path to GitHub CLI executable |
 | `GH_TOKEN` | - | GitHub Personal Access Token for gh CLI authentication (required for PR creation) |
 | `LOG_LEVEL` | `INFO` | Logging level |
@@ -101,6 +121,9 @@ docker compose up -d
 | `FILE_STATE_DIRECTORY` | `agent-work-orders-state` | Directory for file-based state (when `STATE_STORAGE_TYPE=file`) |
 | `SUPABASE_URL` | - | Supabase project URL (required when `STATE_STORAGE_TYPE=supabase`) |
 | `SUPABASE_SERVICE_KEY` | - | Supabase service key (required when `STATE_STORAGE_TYPE=supabase`) |
+
+When both legacy and platform-aligned names are present, the `LEANKIT_*`
+variable takes precedence.
 
 ### State Storage Options
 

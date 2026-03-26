@@ -6,7 +6,7 @@ Base URL: `/api/tasks`
 
 All fields use **snake_case**. Database values are used directly (no mapping layers).
 
-**Task Statuses**: `draft`, `proposed`, `approved`, `planning`, `owner-qa`, `assigned`, `executing`, `architect-review`, `review`, `done`, `failed`, `escalated`, `on-hold`, `cancelled`
+**Task Statuses**: `draft`, `proposed`, `approved`, `planning`, `owner-qa`, `assigned`, `executing`, `architect-review`, `code-review`, `review`, `done`, `failed`, `escalated`, `on-hold`, `cancelled`
 
 ---
 
@@ -234,16 +234,17 @@ Transition a task to a new status with state machine validation.
 |---------------------|--------------------------------------------------------------|
 | `draft`             | `proposed`, `approved`, `cancelled`                          |
 | `proposed`          | `approved`, `cancelled`                                      |
-| `approved`          | `planning` (complex), `assigned` (simple), `cancelled`       |
+| `approved`          | `planning` (complex), `assigned` (simple), `on-hold`, `cancelled` |
 | `planning`          | `owner-qa`, `assigned`, `cancelled`                          |
 | `owner-qa`          | `assigned`, `cancelled`                                      |
-| `assigned`          | `executing`, `cancelled`                                     |
-| `executing`         | `architect-review`, `failed`, `cancelled`                    |
-| `architect-review`  | `review`, `assigned` (retry), `escalated`, `cancelled`       |
-| `review`            | `done`, `assigned` (owner reject), `cancelled`               |
-| `failed`            | `assigned` (retry), `escalated`, `cancelled`                 |
+| `assigned`          | `executing`, `on-hold`, `cancelled`                          |
+| `executing`         | `architect-review`, `failed`, `on-hold`, `cancelled`         |
+| `architect-review`  | `code-review`, `assigned` (retry), `escalated`, `on-hold`, `cancelled` |
+| `code-review`       | `review`, `assigned` (retry), `escalated`, `on-hold`, `cancelled` |
+| `review`            | `done`, `assigned` (owner reject), `on-hold`, `cancelled`    |
+| `failed`            | `assigned` (retry), `escalated`, `on-hold`, `cancelled`      |
 | `escalated`         | `assigned`, `on-hold`, `cancelled`                           |
-| `on-hold`           | `approved` (resume), `cancelled`                             |
+| `on-hold`           | `approved` (resume), `assigned` (resume), `cancelled`        |
 | `done`, `cancelled` | Terminal — no further transitions                            |
 
 ---
@@ -288,6 +289,6 @@ Get the valid next states for a task's current status.
 {
   "task_id": "t-abc123",
   "current_status": "assigned",
-  "next_states": ["executing", "cancelled"]
+  "next_states": ["cancelled", "executing", "on-hold"]
 }
 ```

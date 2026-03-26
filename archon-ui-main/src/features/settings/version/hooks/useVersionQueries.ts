@@ -5,8 +5,8 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { STALE_TIMES } from "@/features/shared/config/queryPatterns";
 import { useSmartPolling } from "@/features/shared/hooks/useSmartPolling";
+import type { VersionCheckResponse } from "@/types/api-contracts.generated";
 import { versionService } from "../services/versionService";
-import type { VersionCheckResponse } from "../types";
 
 // Query key factory
 export const versionKeys = {

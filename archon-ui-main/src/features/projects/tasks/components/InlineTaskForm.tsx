@@ -1,12 +1,12 @@
 import { Plus } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { cn } from "../../../ui/primitives/styles";
-import type { DatabaseTaskStatus, TaskPriority } from "../types";
+import type { TaskBoardStatus, TaskPriority } from "../types";
 
 interface InlineTaskFormProps {
   projectId: string;
-  status: DatabaseTaskStatus;
-  onSubmit: (data: { title: string; priority: TaskPriority; status: DatabaseTaskStatus }) => void;
+  status: TaskBoardStatus;
+  onSubmit: (data: { title: string; priority: TaskPriority; status: TaskBoardStatus }) => void;
   onCancel: () => void;
   isSubmitting?: boolean;
 }

@@ -1,6 +1,6 @@
 import { useQueryClient } from "@tanstack/react-query";
 import { motion } from "framer-motion";
-import { Activity, Book, CheckCircle2, FileText, List, ListTodo, Pin, ScrollText } from "lucide-react";
+import { Activity, Book, CheckCircle2, FileText, GitBranchPlus, List, ListTodo, Pin, ScrollText } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import { useStaggeredEntrance } from "../../../hooks/useStaggeredEntrance";
@@ -13,12 +13,15 @@ import { cn } from "../../ui/primitives/styles";
 import { NewProjectModal } from "../components/NewProjectModal";
 import { ProjectHeader } from "../components/ProjectHeader";
 import { ProjectList } from "../components/ProjectList";
+import { BootstrapPlansTab } from "../bootstrap/BootstrapPlansTab";
 import { DocsTab } from "../documents/DocsTab";
 import { projectKeys, useDeleteProject, useProjects, useUpdateProject } from "../hooks/useProjectQueries";
 import { KBTab } from "../kb/KBTab";
 import { RulesTab } from "../rules/RulesTab";
 import { useTaskCounts } from "../tasks/hooks";
+import { EMPTY_TASK_COUNTS, getTaskCount } from "../tasks/types";
 import { TasksTab } from "../tasks/TasksTab";
+import type { TaskCounts } from "../tasks/types";
 import type { Project } from "../types";
 
 interface ProjectsViewProps {
@@ -218,6 +221,7 @@ export function ProjectsView({ className = "", "data-id": dataId }: ProjectsView
                     { id: "tasks", label: "Tasks", icon: <ListTodo className="w-4 h-4" /> },
                     { id: "rules", label: "Rules", icon: <ScrollText className="w-4 h-4" /> },
                     { id: "kb", label: "KB", icon: <Book className="w-4 h-4" /> },
+                    { id: "bootstrap", label: "Bootstrap", icon: <GitBranchPlus className="w-4 h-4" /> },
                   ]}
                   activeSection={activeTab}
                   onSectionClick={(id) => setActiveTab(id as string)}
@@ -236,6 +240,7 @@ export function ProjectsView({ className = "", "data-id": dataId }: ProjectsView
                 {activeTab === "tasks" && <TasksTab projectId={selectedProject.id} />}
                 {activeTab === "rules" && <RulesTab projectId={selectedProject.id} />}
                 {activeTab === "kb" && <KBTab projectId={selectedProject.id} />}
+                {activeTab === "bootstrap" && <BootstrapPlansTab projectId={selectedProject.id} />}
               </div>
             </motion.div>
           )}
@@ -265,7 +270,7 @@ export function ProjectsView({ className = "", "data-id": dataId }: ProjectsView
                     key={project.id}
                     project={project}
                     isSelected={selectedProject?.id === project.id}
-                    taskCounts={taskCounts[project.id] || { todo: 0, doing: 0, review: 0, done: 0 }}
+                    taskCounts={taskCounts[project.id] ?? EMPTY_TASK_COUNTS}
                     onSelect={() => handleProjectSelect(project)}
                   />
                 ))}
@@ -352,12 +357,7 @@ export function ProjectsView({ className = "", "data-id": dataId }: ProjectsView
 interface SidebarProjectCardProps {
   project: Project;
   isSelected: boolean;
-  taskCounts: {
-    todo: number;
-    doing: number;
-    review: number;
-    done: number;
-  };
+  taskCounts: TaskCounts;
   onSelect: () => void;
 }
 
@@ -408,14 +408,14 @@ const SidebarProjectCard: React.FC<SidebarProjectCardProps> = ({ project, isSele
 
         {/* Status Pills - horizontal layout with icons */}
         <div className="flex items-center gap-1.5">
-          <StatPill color="pink" value={taskCounts.todo} size="sm" icon={<ListTodo className="w-3 h-3" />} />
+          <StatPill color="pink" value={getTaskCount(taskCounts, "todo")} size="sm" icon={<ListTodo className="w-3 h-3" />} />
           <StatPill
             color="blue"
-            value={taskCounts.doing + taskCounts.review}
+            value={getTaskCount(taskCounts, "doing") + getTaskCount(taskCounts, "review")}
             size="sm"
             icon={<Activity className="w-3 h-3" />}
           />
-          <StatPill color="green" value={taskCounts.done} size="sm" icon={<CheckCircle2 className="w-3 h-3" />} />
+          <StatPill color="green" value={getTaskCount(taskCounts, "done")} size="sm" icon={<CheckCircle2 className="w-3 h-3" />} />
         </div>
       </div>
     </SelectableCard>

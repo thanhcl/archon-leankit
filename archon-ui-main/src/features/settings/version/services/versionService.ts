@@ -3,7 +3,11 @@
  */
 
 import { callAPIWithETag } from "@/features/shared/api/apiClient";
-import type { CurrentVersionResponse, VersionCheckResponse } from "../types";
+import type {
+  CurrentVersionResponse,
+  VersionCacheClearResponse,
+  VersionCheckResponse,
+} from "@/types/api-contracts.generated";
 
 export const versionService = {
   /**
@@ -35,12 +39,12 @@ export const versionService = {
   /**
    * Clear version cache to force fresh check
    */
-  async clearCache(): Promise<{ message: string; success: boolean }> {
+  async clearCache(): Promise<VersionCacheClearResponse> {
     try {
       const response = await callAPIWithETag("/api/version/clear-cache", {
         method: "POST",
       });
-      return response as { message: string; success: boolean };
+      return response as VersionCacheClearResponse;
     } catch (error) {
       console.error("Error clearing version cache:", error);
       throw error;

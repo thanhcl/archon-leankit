@@ -1,8 +1,9 @@
 """
 Consolidated task management tools for Archon MCP Server.
 
-Supports 14-state lifecycle: draft, proposed, approved, planning, owner-qa,
-assigned, executing, architect-review, review, done, failed, escalated, on-hold, cancelled.
+Supports 15-state lifecycle: draft, proposed, approved, planning, owner-qa,
+assigned, executing, architect-review, code-review, review, done, failed,
+escalated, on-hold, cancelled.
 """
 
 import json
@@ -25,7 +26,7 @@ DEFAULT_PAGE_SIZE = 10
 
 VALID_STATUSES = [
     "draft", "proposed", "approved", "planning", "owner-qa",
-    "assigned", "executing", "architect-review", "review",
+    "assigned", "executing", "architect-review", "code-review", "review",
     "done", "failed", "escalated", "on-hold", "cancelled",
 ]
 
@@ -102,8 +103,9 @@ def register_task_tools(mcp: FastMCP):
         """
         Find and search tasks (consolidated: list + search + get).
 
-        Supports 14-state lifecycle: draft, proposed, approved, planning, owner-qa,
-        assigned, executing, architect-review, review, done, failed, escalated, on-hold, cancelled.
+        Supports 15-state lifecycle: draft, proposed, approved, planning, owner-qa,
+        assigned, executing, architect-review, code-review, review, done, failed,
+        escalated, on-hold, cancelled.
 
         Args:
             query: Keyword search in title, description, feature (optional)
@@ -273,7 +275,7 @@ def register_task_tools(mcp: FastMCP):
         """
         Manage tasks (consolidated: create/update/delete).
 
-        Supports 14-state lifecycle. New tasks default to "draft" status.
+        Supports 15-state lifecycle. New tasks default to "draft" status.
 
         TASK GRANULARITY GUIDANCE:
         - For feature-specific projects: Create detailed implementation tasks
@@ -630,21 +632,23 @@ login/register endpoints, password hashing, and role-based access control")
         Transition a task to a new lifecycle state with validation and audit trail.
 
         Valid lifecycle states: draft, proposed, approved, planning, owner-qa,
-        assigned, executing, architect-review, review, done, failed, escalated, on-hold, cancelled.
+        assigned, executing, architect-review, code-review, review, done, failed,
+        escalated, on-hold, cancelled.
 
         Transition rules:
         - draft → proposed, approved, cancelled
         - proposed → approved, cancelled
-        - approved → planning (complex), assigned (simple)
-        - planning → owner-qa, assigned
-        - owner-qa → assigned
-        - assigned → executing
-        - executing → architect-review, failed
-        - architect-review → review, assigned (retry), escalated
-        - review → done, assigned (owner reject)
-        - failed → assigned (retry), escalated
+        - approved → planning (complex), assigned (simple), on-hold, cancelled
+        - planning → owner-qa, assigned, cancelled
+        - owner-qa → assigned, cancelled
+        - assigned → executing, on-hold, cancelled
+        - executing → architect-review, failed, on-hold, cancelled
+        - architect-review → code-review, assigned (retry), escalated, on-hold, cancelled
+        - code-review → review, assigned (retry), escalated, on-hold, cancelled
+        - review → done, assigned (owner reject), on-hold, cancelled
+        - failed → assigned (retry), escalated, on-hold, cancelled
         - escalated → assigned, on-hold, cancelled
-        - on-hold → approved (resume)
+        - on-hold → approved (resume), assigned (resume), cancelled
         - done, cancelled → terminal (no transitions)
 
         Some transitions require a reason (rejections, failures, escalations, holds, cancellations).
@@ -715,3 +719,150 @@ login/register endpoints, password hashing, and role-based access control")
         except Exception as e:
             logger.error(f"Error transitioning task: {e}", exc_info=True)
             return MCPErrorFormatter.from_exception(e, "transition task")
+
+    @mcp.tool()
+    async def re_plan_task(
+        ctx: Context,
+        task_id: str,
+        updated_description: str | None = None,
+        changed_by: str = "mcp",
+        reason: str | None = None,
+    ) -> str:
+        """
+        Reset a task to 'planning' state, preserving task ID, lineage, and history.
+
+        Use when a task needs replanning due to changed requirements, failed execution,
+        or new information. The optional updated_description replaces the current
+        description with fresh context for the planning cycle.
+
+        Args:
+            task_id: Task UUID to re-plan
+            updated_description: Optional new description to replace current one
+            changed_by: Who is triggering re-plan (default: "mcp")
+            reason: Optional note about why re-planning is needed
+
+        Returns: {success: bool, task: object, transition: {from, to, action, reason}}
+        """
+        try:
+            api_url = get_api_url()
+            timeout = get_default_timeout()
+
+            payload: dict = {"changed_by": changed_by}
+            if updated_description is not None:
+                payload["updated_description"] = updated_description
+            if reason is not None:
+                payload["reason"] = reason
+
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                response = await client.post(
+                    urljoin(api_url, f"/api/tasks/{task_id}/re-plan"),
+                    json=payload,
+                )
+
+                if response.status_code == 200:
+                    result = response.json()
+                    task = result.get("task")
+                    if task:
+                        task = optimize_task_response(task)
+                    return json.dumps({
+                        "success": True,
+                        "task": task,
+                        "transition": result.get("transition"),
+                        "message": result.get("message", "Task re-planned successfully"),
+                    })
+                elif response.status_code == 404:
+                    return MCPErrorFormatter.format_error(
+                        error_type="not_found",
+                        message=f"Task {task_id} not found",
+                        suggestion="Verify the task ID is correct",
+                        http_status=404,
+                    )
+                elif response.status_code == 400:
+                    error_detail = response.json().get("detail", "Cannot re-plan task")
+                    return MCPErrorFormatter.format_error(
+                        error_type="invalid_operation",
+                        message=error_detail,
+                        suggestion="Check current task status — terminal tasks (done/cancelled) cannot be re-planned",
+                    )
+                else:
+                    return MCPErrorFormatter.from_http_error(response, "re-plan task")
+
+        except httpx.RequestError as e:
+            return MCPErrorFormatter.from_exception(
+                e, "re-plan task", {"task_id": task_id}
+            )
+        except Exception as e:
+            logger.error(f"Error re-planning task: {e}", exc_info=True)
+            return MCPErrorFormatter.from_exception(e, "re-plan task")
+
+    @mcp.tool()
+    async def continue_task(
+        ctx: Context,
+        task_id: str,
+        guidance: str,
+        changed_by: str = "mcp",
+    ) -> str:
+        """
+        Resume a paused or blocked task by providing operator guidance.
+
+        Appends the guidance text to the task description and transitions the task to
+        'assigned' so the engine can pick up execution again. Preserves task ID,
+        plan_item_id, and full state history.
+
+        Valid from: on-hold, failed, escalated, planning, owner-qa, assigned,
+                    draft, proposed, approved.
+
+        Args:
+            task_id: Task UUID to continue
+            guidance: Clarification or additional instructions for the agent
+            changed_by: Who is providing the guidance (default: "mcp")
+
+        Returns: {success: bool, task: object, transition: {from, to, action, guidance}}
+        """
+        try:
+            api_url = get_api_url()
+            timeout = get_default_timeout()
+
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                response = await client.post(
+                    urljoin(api_url, f"/api/tasks/{task_id}/continue"),
+                    json={"guidance": guidance, "changed_by": changed_by},
+                )
+
+                if response.status_code == 200:
+                    result = response.json()
+                    task = result.get("task")
+                    if task:
+                        task = optimize_task_response(task)
+                    return json.dumps({
+                        "success": True,
+                        "task": task,
+                        "transition": result.get("transition"),
+                        "message": result.get("message", "Task continued successfully"),
+                    })
+                elif response.status_code == 404:
+                    return MCPErrorFormatter.format_error(
+                        error_type="not_found",
+                        message=f"Task {task_id} not found",
+                        suggestion="Verify the task ID is correct",
+                        http_status=404,
+                    )
+                elif response.status_code == 400:
+                    error_detail = response.json().get("detail", "Cannot continue task")
+                    return MCPErrorFormatter.format_error(
+                        error_type="invalid_operation",
+                        message=error_detail,
+                        suggestion="Check current task status. Continue is valid from: "
+                                   "on-hold, failed, escalated, planning, owner-qa, assigned, "
+                                   "draft, proposed, approved",
+                    )
+                else:
+                    return MCPErrorFormatter.from_http_error(response, "continue task")
+
+        except httpx.RequestError as e:
+            return MCPErrorFormatter.from_exception(
+                e, "continue task", {"task_id": task_id}
+            )
+        except Exception as e:
+            logger.error(f"Error continuing task: {e}", exc_info=True)
+            return MCPErrorFormatter.from_exception(e, "continue task")

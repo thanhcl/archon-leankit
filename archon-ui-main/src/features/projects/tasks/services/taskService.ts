@@ -5,6 +5,7 @@
 
 import { callAPIWithETag } from "../../../shared/api/apiClient";
 import { formatZodErrors, ValidationError } from "../../../shared/types/errors";
+import type { TaskCountsListResponse } from "../../../../types/api-contracts.generated";
 
 import { validateCreateTask, validateUpdateTask, validateUpdateTaskStatus } from "../schemas";
 import type {
@@ -12,14 +13,35 @@ import type {
   CostStatusResponse,
   CreateTaskRequest,
   DatabaseTaskStatus,
+  OwnerFeedbackRequest,
+  OwnerFeedbackResponse,
   PredictedVsActual,
+  ProjectTaskCountsMap,
   SprintStatsResponse,
   Task,
-  TaskCounts,
   TaskEstimate,
   UpdateBudgetConfigRequest,
   UpdateTaskRequest,
 } from "../types";
+
+function isTaskCountsListResponse(response: unknown): response is TaskCountsListResponse {
+  return typeof response === "object" && response !== null && Array.isArray((response as TaskCountsListResponse).projects);
+}
+
+function normalizeTaskCountsResponse(response: ProjectTaskCountsMap | TaskCountsListResponse | null | undefined) {
+  if (!response) {
+    return {};
+  }
+
+  if (!isTaskCountsListResponse(response)) {
+    return response;
+  }
+
+  return response.projects.reduce<ProjectTaskCountsMap>((countsByProject, project) => {
+    countsByProject[project.id] = project.task_counts;
+    return countsByProject;
+  }, {});
+}
 
 export const taskService = {
   /**
@@ -208,6 +230,63 @@ export const taskService = {
   },
 
   /**
+   * Re-plan a task: reset to 'planning' state, preserving ID and lineage.
+   * Optionally update the description with new context.
+   */
+  async rePlanTask(
+    taskId: string,
+    updatedDescription?: string,
+    changedBy: string = "owner",
+    reason?: string,
+  ): Promise<{ task: Task; transition: { from: string; to: string; action: string } }> {
+    try {
+      const body: Record<string, string> = { changed_by: changedBy };
+      if (updatedDescription !== undefined) body.updated_description = updatedDescription;
+      if (reason) body.reason = reason;
+
+      const response = await callAPIWithETag<{
+        message: string;
+        task: Task;
+        transition: { from: string; to: string; action: string };
+      }>(`/api/tasks/${taskId}/re-plan`, {
+        method: "POST",
+        body: JSON.stringify(body),
+      });
+
+      return { task: response.task, transition: response.transition };
+    } catch (error) {
+      console.error(`Failed to re-plan task ${taskId}:`, error);
+      throw error;
+    }
+  },
+
+  /**
+   * Continue a paused/blocked task by providing operator guidance.
+   * Appends guidance to description and transitions to 'assigned'.
+   */
+  async continueTask(
+    taskId: string,
+    guidance: string,
+    changedBy: string = "owner",
+  ): Promise<{ task: Task; transition: { from: string; to: string; action: string } }> {
+    try {
+      const response = await callAPIWithETag<{
+        message: string;
+        task: Task;
+        transition: { from: string; to: string; action: string };
+      }>(`/api/tasks/${taskId}/continue`, {
+        method: "POST",
+        body: JSON.stringify({ guidance, changed_by: changedBy }),
+      });
+
+      return { task: response.task, transition: response.transition };
+    } catch (error) {
+      console.error(`Failed to continue task ${taskId}:`, error);
+      throw error;
+    }
+  },
+
+  /**
    * Get task estimates for a project (predicted duration and cost)
    */
   async getTaskEstimates(projectId: string): Promise<{
@@ -227,10 +306,10 @@ export const taskService = {
    * Get task counts for all projects in a single batch request
    * Optimized endpoint to avoid N+1 query problem
    */
-  async getTaskCountsForAllProjects(): Promise<Record<string, TaskCounts>> {
+  async getTaskCountsForAllProjects(): Promise<ProjectTaskCountsMap> {
     try {
-      const response = await callAPIWithETag<Record<string, TaskCounts>>("/api/projects/task-counts");
-      return response || {};
+      const response = await callAPIWithETag<ProjectTaskCountsMap | TaskCountsListResponse>("/api/projects/task-counts");
+      return normalizeTaskCountsResponse(response);
     } catch (error) {
       console.error("Failed to get task counts for all projects:", error);
       throw error;
@@ -278,6 +357,22 @@ export const taskService = {
       return await response.json();
     } catch (error) {
       console.error(`Failed to update budget config for project ${projectId}:`, error);
+      throw error;
+    }
+  },
+
+  /**
+   * Submit owner feedback (rating, notes, tags) for a completed task.
+   * Only accepted for tasks with status 'done'.
+   */
+  async submitFeedback(taskId: string, feedback: OwnerFeedbackRequest): Promise<OwnerFeedbackResponse> {
+    try {
+      return await callAPIWithETag<OwnerFeedbackResponse>(`/api/tasks/${taskId}/feedback`, {
+        method: "POST",
+        body: JSON.stringify(feedback),
+      });
+    } catch (error) {
+      console.error(`Failed to submit feedback for task ${taskId}:`, error);
       throw error;
     }
   },

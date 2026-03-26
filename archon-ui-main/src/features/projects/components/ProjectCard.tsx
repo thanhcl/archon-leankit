@@ -4,18 +4,15 @@ import { isOptimistic } from "@/features/shared/utils/optimistic";
 import { OptimisticIndicator } from "../../ui/primitives/OptimisticIndicator";
 import { SelectableCard } from "../../ui/primitives/selectable-card";
 import { cn } from "../../ui/primitives/styles";
+import { getTaskCount } from "../tasks/types";
+import type { TaskCounts } from "../tasks/types";
 import type { Project } from "../types";
 import { ProjectCardActions } from "./ProjectCardActions";
 
 interface ProjectCardProps {
   project: Project;
   isSelected: boolean;
-  taskCounts: {
-    todo: number;
-    doing: number;
-    review: number;
-    done: number;
-  };
+  taskCounts: TaskCounts;
   onSelect: (project: Project) => void;
   onPin: (e: React.MouseEvent, projectId: string) => void;
   onDelete: (e: React.MouseEvent, projectId: string, title: string) => void;
@@ -116,7 +113,7 @@ export const ProjectCard: React.FC<ProjectCardProps> = ({
                     isSelected ? "text-pink-600 dark:text-pink-400" : "text-gray-500 dark:text-gray-600",
                   )}
                 >
-                  {taskCounts.todo || 0}
+                  {getTaskCount(taskCounts, "todo")}
                 </span>
               </div>
             </div>
@@ -166,7 +163,7 @@ export const ProjectCard: React.FC<ProjectCardProps> = ({
                     isSelected ? "text-blue-600 dark:text-blue-400" : "text-gray-500 dark:text-gray-600",
                   )}
                 >
-                  {(taskCounts.doing || 0) + (taskCounts.review || 0)}
+                  {getTaskCount(taskCounts, "doing") + getTaskCount(taskCounts, "review")}
                 </span>
               </div>
             </div>
@@ -218,7 +215,7 @@ export const ProjectCard: React.FC<ProjectCardProps> = ({
                     isSelected ? "text-green-600 dark:text-green-400" : "text-gray-500 dark:text-gray-600",
                   )}
                 >
-                  {taskCounts.done || 0}
+                  {getTaskCount(taskCounts, "done")}
                 </span>
               </div>
             </div>
