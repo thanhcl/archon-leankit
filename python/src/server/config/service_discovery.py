@@ -11,6 +11,8 @@ from urllib.parse import urlparse
 
 import httpx
 
+from .env_aliases import get_agent_service_port, get_control_plane_mcp_port, get_control_plane_port
+
 
 class Environment(Enum):
     """Deployment environment types"""
@@ -29,27 +31,30 @@ class ServiceDiscovery:
 
     def __init__(self):
         # Get ports during initialization
-        server_port = os.getenv("ARCHON_SERVER_PORT")
-        mcp_port = os.getenv("ARCHON_MCP_PORT")
-        agents_port = os.getenv("ARCHON_AGENTS_PORT")
+        server_port = get_control_plane_port()
+        mcp_port = get_control_plane_mcp_port()
+        agents_port = get_agent_service_port()
         agent_work_orders_port = os.getenv("AGENT_WORK_ORDERS_PORT")
 
         # Required ports (core services)
         if not server_port:
             raise ValueError(
                 "ARCHON_SERVER_PORT environment variable is required. "
+                "Preferred platform alias: LEANKIT_CONTROL_PLANE_PORT. "
                 "Please set it in your .env file or environment. "
                 "Default value: 8181"
             )
         if not mcp_port:
             raise ValueError(
                 "ARCHON_MCP_PORT environment variable is required. "
+                "Preferred platform alias: LEANKIT_CONTROL_PLANE_MCP_PORT. "
                 "Please set it in your .env file or environment. "
                 "Default value: 8051"
             )
         if not agents_port:
             raise ValueError(
                 "ARCHON_AGENTS_PORT environment variable is required. "
+                "Preferred platform alias: LEANKIT_AGENT_SERVICE_PORT. "
                 "Please set it in your .env file or environment. "
                 "Default value: 8052"
             )

@@ -214,7 +214,7 @@ class HealthMonitor:
             elif status == "failed":
                 failed_count += 1
                 total_processed += 1
-            elif status in ("review", "architect-review"):
+            elif status in ("review", "architect-review", "code-review"):
                 total_processed += 1
 
         total_completed = len(completed)

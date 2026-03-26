@@ -9,6 +9,9 @@ from urllib.parse import urlparse
 
 from jose import jwt
 
+from .env_aliases import get_control_plane_mcp_port
+from .required_config import missing_env_message, required_config_reference
+
 
 class ConfigurationError(Exception):
     """Raised when there's an error in configuration."""
@@ -173,11 +176,25 @@ def load_environment_config() -> EnvironmentConfig:
     # Required environment variables for database access
     supabase_url = os.getenv("SUPABASE_URL")
     if not supabase_url:
-        raise ConfigurationError("SUPABASE_URL environment variable is required")
+        raise ConfigurationError(
+            missing_env_message(
+                "archon-backend",
+                ("SUPABASE_URL",),
+                detail="The backend cannot initialize credentials or database clients without it.",
+                anchor="archon-backend",
+            )
+        )
 
     supabase_service_key = os.getenv("SUPABASE_SERVICE_KEY")
     if not supabase_service_key:
-        raise ConfigurationError("SUPABASE_SERVICE_KEY environment variable is required")
+        raise ConfigurationError(
+            missing_env_message(
+                "archon-backend",
+                ("SUPABASE_SERVICE_KEY",),
+                detail="Use the Supabase service_role key so startup validation can confirm write access.",
+                anchor="archon-backend",
+            )
+        )
 
     # Validate required fields
     if openai_api_key:
@@ -217,12 +234,15 @@ def load_environment_config() -> EnvironmentConfig:
     port_str = os.getenv("PORT")
     if not port_str:
         # This appears to be for MCP configuration based on default 8051
-        port_str = os.getenv("ARCHON_MCP_PORT")
+        port_str = get_control_plane_mcp_port()
         if not port_str:
             raise ConfigurationError(
-                "PORT or ARCHON_MCP_PORT environment variable is required. "
-                "Please set it in your .env file or environment. "
-                "Default value: 8051"
+                missing_env_message(
+                    "archon-backend",
+                    ("LEANKIT_CONTROL_PLANE_MCP_PORT", "ARCHON_MCP_PORT", "PORT"),
+                    detail="Preferred platform alias: LEANKIT_CONTROL_PLANE_MCP_PORT.",
+                    anchor="archon-backend",
+                )
             )
     transport = os.getenv("TRANSPORT", "sse")
 
@@ -240,6 +260,31 @@ def load_environment_config() -> EnvironmentConfig:
         port=port,
         transport=transport,
     )
+
+
+def warn_optional_vars() -> None:
+    """Log warnings for optional environment variables that are not set.
+
+    Called at startup to surface missing optional configuration before it causes
+    silent failures at runtime (e.g., embedding provider unavailable).
+    """
+    import logging
+
+    _logger = logging.getLogger(__name__)
+
+    optional_vars: list[tuple[str, str]] = [
+        ("OPENAI_API_KEY", "Required for OpenAI embeddings and contextual processing"),
+        ("LOGFIRE_TOKEN", "Required for Logfire observability and tracing"),
+    ]
+
+    for var_name, description in optional_vars:
+        if not os.getenv(var_name):
+            _logger.warning(
+                "Optional environment variable not set: %s — %s. See %s",
+                var_name,
+                description,
+                required_config_reference("archon-backend"),
+            )
 
 
 def get_config() -> EnvironmentConfig:

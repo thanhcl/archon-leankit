@@ -24,6 +24,7 @@ logger = get_logger(__name__)
 PROMOTE_THRESHOLD = 3
 TABLE = "archon_learnings"
 PATTERNS_TABLE = "archon_code_patterns"
+PROMOTION_LOG_TABLE = "archon_promotion_log"
 
 PATTERN_PROMOTE_CONFIDENCE = 0.9
 PATTERN_PROMOTE_USAGE = 3
@@ -80,6 +81,7 @@ class LearningProcessor:
         task: dict[str, Any],
         learnings: list[dict[str, Any]],
         code_patterns: list[dict[str, Any]] | None = None,
+        execution_run_id: str | None = None,
     ) -> list[str]:
         """Process learnings and code patterns from a completed task.
 
@@ -96,7 +98,7 @@ class LearningProcessor:
             similar = await self.find_similar(learning.get("description", ""), project_id)
 
             if similar:
-                await self.increment_recurrence(similar, task_id)
+                await self.increment_recurrence(similar, task_id, execution_run_id)
                 new_count = (similar.get("recurrence_count") or 1) + 1
 
                 if new_count >= PROMOTE_THRESHOLD and similar.get("status") == "pending":
@@ -104,7 +106,7 @@ class LearningProcessor:
 
                 ids.append(similar["id"])
             else:
-                learning_id = await self.store(task, learning)
+                learning_id = await self.store(task, learning, execution_run_id)
                 if learning_id:
                     ids.append(learning_id)
 
@@ -116,7 +118,12 @@ class LearningProcessor:
 
     # ── Storage ───────────────────────────────────────────────────────
 
-    async def store(self, task: dict[str, Any], learning: dict[str, Any]) -> str | None:
+    async def store(
+        self,
+        task: dict[str, Any],
+        learning: dict[str, Any],
+        execution_run_id: str | None = None,
+    ) -> str | None:
         """Store a new learning."""
         try:
             data = {
@@ -129,6 +136,7 @@ class LearningProcessor:
                 "pattern_key": _pattern_key(learning),
                 "recurrence_count": 1,
                 "related_tasks": [task["id"]] if task.get("id") else [],
+                "source_run_ids": [execution_run_id] if execution_run_id else [],
                 "status": "pending",
             }
 
@@ -173,18 +181,28 @@ class LearningProcessor:
 
     # ── Recurrence tracking ───────────────────────────────────────────
 
-    async def increment_recurrence(self, existing: dict[str, Any], task_id: str | None) -> None:
-        """Increment recurrence count and link the task."""
+    async def increment_recurrence(
+        self,
+        existing: dict[str, Any],
+        task_id: str | None,
+        execution_run_id: str | None = None,
+    ) -> None:
+        """Increment recurrence count and link the task and execution run."""
         try:
             lid = existing["id"]
             related = existing.get("related_tasks") or []
             if task_id and task_id not in related:
                 related = related + [task_id]
 
+            source_runs = existing.get("source_run_ids") or []
+            if execution_run_id and execution_run_id not in source_runs:
+                source_runs = source_runs + [execution_run_id]
+
             self._client.table(TABLE).update({
                 "recurrence_count": (existing.get("recurrence_count") or 1) + 1,
                 "last_seen": datetime.now().isoformat(),
                 "related_tasks": related,
+                "source_run_ids": source_runs,
             }).eq("id", lid).execute()
 
             logger.info(
@@ -201,6 +219,7 @@ class LearningProcessor:
 
         If the learning has a suggested_rule, also creates a pending entry in
         archon_rule_suggestions for the owner to approve/reject in the Rules UI.
+        Writes a promotion log entry regardless.
         """
         lid = learning["id"]
 
@@ -220,6 +239,9 @@ class LearningProcessor:
 
             logger.info(f"Learning auto-promoted to KB | id={lid} | rule={learning['suggested_rule'][:80]}")
 
+            # Write promotion audit log
+            await self._log_promotion(learning, promotion_type="auto", promoted_to="KB")
+
             # Create a pending rule suggestion for owner review
             await self._create_rule_suggestion(learning)
 
@@ -228,6 +250,42 @@ class LearningProcessor:
 
         except Exception as e:
             logger.error(f"Failed to auto-promote learning {lid}: {e}")
+
+    async def _log_promotion(
+        self,
+        learning: dict[str, Any],
+        promotion_type: str,
+        promoted_to: str,
+    ) -> None:
+        """Write a promotion audit entry to archon_promotion_log."""
+        lid = learning["id"]
+        recurrence = learning.get("recurrence_count", 1)
+        source_runs = learning.get("source_run_ids") or []
+        source_tasks = learning.get("related_tasks") or []
+        confidence = round(min(0.95, 0.5 + max(0, recurrence - 1) * 0.1), 2)
+        reason = (
+            f"Recurred {recurrence}x across {len(source_runs)} run(s) / "
+            f"{len(source_tasks)} task(s)"
+        )
+        try:
+            self._client.table(PROMOTION_LOG_TABLE).insert({
+                "learning_id": lid,
+                "project_id": learning.get("project_id"),
+                "promotion_type": promotion_type,
+                "promoted_to": promoted_to,
+                "recurrence_count": recurrence,
+                "source_run_ids": source_runs,
+                "source_task_ids": source_tasks,
+                "confidence": confidence,
+                "reason": reason,
+                "learning_description": (learning.get("description", ""))[:500],
+            }).execute()
+            logger.info(
+                f"Promotion logged | learning_id={lid} | type={promotion_type} | "
+                f"to={promoted_to} | runs={len(source_runs)} | tasks={len(source_tasks)}"
+            )
+        except Exception as e:
+            logger.warning(f"Failed to write promotion log for learning {lid}: {e}")
 
     async def _create_rule_suggestion(self, learning: dict[str, Any]) -> None:
         """Create a pending rule suggestion from a promoted learning."""
@@ -687,6 +745,12 @@ class LearningProcessor:
                 "promoted_to": "KB_manual",
                 "promoted_at": datetime.now().isoformat(),
             }).eq("id", learning_id).execute()
+
+            # Fetch learning for log context
+            resp = self._client.table(TABLE).select("*").eq("id", learning_id).execute()
+            if resp.data:
+                await self._log_promotion(resp.data[0], promotion_type="manual", promoted_to="KB_manual")
+
             return True, "Learning promoted"
         except Exception as e:
             return False, str(e)

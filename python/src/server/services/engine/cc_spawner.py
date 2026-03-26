@@ -13,14 +13,15 @@ Usage:
 import asyncio
 import json
 import re
-import subprocess
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any
 
+from ...config.env_aliases import get_runner_env_allowlist
 from ...config.logfire_config import get_logger
+from .run_workspace import RunWorkspaceContext
+from .sandbox_provider import GitWorktreeProvider, get_provider_for_isolation
 
 logger = get_logger(__name__)
 
@@ -57,6 +58,35 @@ MODEL_OPUS = "claude-opus-4-6"
 MODEL_SONNET = "claude-sonnet-4-6"
 MODEL_HAIKU = "claude-haiku-4-5-20251001"
 MODEL_DEFAULT = MODEL_SONNET
+
+# Stderr signals that indicate the runner binary itself failed to start,
+# rather than the task failing during execution.
+_RUNNER_ERROR_SIGNALS = (
+    "binary not found",
+    "command not found",
+    "no such file or directory",
+    "exec format error",
+    "permission denied: ",
+)
+
+
+def is_runner_level_failure(result: CCExecutionResult) -> bool:
+    """Return True if the failure is at the runner binary level, not task-level.
+
+    Runner-level failures include: binary not found, permission denied on the
+    executable, and OS-level process creation errors. These are distinguished
+    from task-level failures (where the runner ran but the task itself failed)
+    by a combination of exit_code, short duration, and stderr content.
+    """
+    if result.success:
+        return False
+    if result.exit_code != -1:
+        return False
+    # Very short duration indicates the runner never started executing the task
+    if result.duration_seconds >= 5.0:
+        return False
+    stderr_lower = result.stderr.lower()
+    return any(signal in stderr_lower for signal in _RUNNER_ERROR_SIGNALS)
 
 
 # Regex patterns for structured output parsing
@@ -97,6 +127,7 @@ class CCSpawner:
         self.max_parallel = max_parallel
         self.worktree_base = worktree_base
         self._running: dict[str, asyncio.subprocess.Process] = {}
+        self._worktree_provider = GitWorktreeProvider(worktree_base=worktree_base)
 
     @property
     def running_count(self) -> int:
@@ -107,11 +138,11 @@ class CCSpawner:
         return self.running_count < self.max_parallel
 
     # ------------------------------------------------------------------
-    # Git worktree management
+    # Git worktree management (delegates to GitWorktreeProvider)
     # ------------------------------------------------------------------
 
     def _worktree_path(self, project_path: str, task_id: str) -> str:
-        return str(Path(project_path) / self.worktree_base / task_id)
+        return self._worktree_provider._worktree_path(project_path, task_id)
 
     def create_worktree(self, project_path: str, task_id: str) -> tuple[str | None, str | None]:
         """Create a git worktree for isolated task execution.
@@ -119,39 +150,11 @@ class CCSpawner:
         Returns:
             Tuple of (worktree_path, error_message).
         """
-        wt_path = self._worktree_path(project_path, task_id)
-        branch = f"task/{task_id}"
-
-        if Path(wt_path).exists():
-            logger.info(f"Worktree already exists | path={wt_path}")
-            return wt_path, None
-
-        Path(wt_path).parent.mkdir(parents=True, exist_ok=True)
-
-        result = subprocess.run(
-            ["git", "worktree", "add", "-b", branch, wt_path, "HEAD"],
-            capture_output=True,
-            text=True,
-            cwd=project_path,
-        )
-
-        if result.returncode != 0:
-            # Branch may already exist — retry without -b
-            if "already exists" in result.stderr:
-                result = subprocess.run(
-                    ["git", "worktree", "add", wt_path, branch],
-                    capture_output=True,
-                    text=True,
-                    cwd=project_path,
-                )
-
-            if result.returncode != 0:
-                err = f"Failed to create worktree: {result.stderr.strip()}"
-                logger.error(err)
-                return None, err
-
-        logger.info(f"Worktree created | path={wt_path} | branch={branch}")
-        return wt_path, None
+        try:
+            ctx = self._worktree_provider.acquire(task_id, project_path)
+            return ctx.workspace_path, None
+        except RuntimeError as exc:
+            return None, str(exc)
 
     def remove_worktree(self, project_path: str, task_id: str) -> tuple[bool, str | None]:
         """Remove a git worktree after task completion.
@@ -159,34 +162,7 @@ class CCSpawner:
         Returns:
             Tuple of (success, error_message).
         """
-        wt_path = self._worktree_path(project_path, task_id)
-        branch = f"task/{task_id}"
-
-        # Remove worktree via git
-        result = subprocess.run(
-            ["git", "worktree", "remove", wt_path, "--force"],
-            capture_output=True,
-            text=True,
-            cwd=project_path,
-        )
-
-        if result.returncode != 0:
-            logger.warning(f"Git worktree remove failed: {result.stderr.strip()}")
-            # Fallback: remove directory
-            import shutil
-
-            if Path(wt_path).exists():
-                shutil.rmtree(wt_path, ignore_errors=True)
-
-        # Clean up branch
-        subprocess.run(
-            ["git", "branch", "-D", branch],
-            capture_output=True,
-            text=True,
-            cwd=project_path,
-        )
-
-        logger.info(f"Worktree removed | path={wt_path}")
+        self._worktree_provider.release(task_id, project_path)
         return True, None
 
     # ------------------------------------------------------------------
@@ -251,7 +227,11 @@ class CCSpawner:
         config: ProjectConfig,
         timeout: int | None = None,
         task: dict[str, Any] | None = None,
+        runtime_metadata: dict[str, Any] | None = None,
         on_stream_event: StreamCallback | None = None,
+        token_profile: dict[str, Any] | None = None,
+        model_fallback_chain: list[str] | None = None,
+        workspace_context: RunWorkspaceContext | None = None,
     ) -> CCExecutionResult:
         """Spawn a Claude Code CLI session for a task.
 
@@ -261,70 +241,111 @@ class CCSpawner:
             config: Project configuration.
             timeout: Override default timeout in seconds.
             task: Task dict for model routing (complexity/priority fields).
+            runtime_metadata: Reserved for runner adapters that publish native stream telemetry.
             on_stream_event: Callback fired for each parsed JSON line from CC stdout.
+            token_profile: Optional profile dict with max_tokens/temperature_pct/model_hint
+                to inject as env vars into the subprocess.
+            model_fallback_chain: Ordered list of model names to try after the selected
+                model fails. When None, falls back to Opus once if a cheaper model was
+                selected (preserving legacy behaviour). Set to [] to disable fallback.
+            workspace_context: Optional run workspace context for persisting stdout/stderr
+                to log files keyed by execution_run_id.
 
         Returns:
             CCExecutionResult with parsed output.
         """
         selected_model = self.select_model(task=task, force_model=config.force_model)
+        provider = get_provider_for_isolation(config.isolation, worktree_base=self.worktree_base)
 
-        result = await self._spawn_with_model(
-            task_id=task_id,
-            prompt=prompt,
-            config=config,
-            model=selected_model,
-            timeout=timeout,
-            on_stream_event=on_stream_event,
-        )
-
-        # Fallback: if non-Opus model failed, retry with Opus
-        if not result.success and selected_model != MODEL_OPUS:
-            logger.warning(
-                f"Model {selected_model} failed, retrying with {MODEL_OPUS} | task_id={task_id}"
+        try:
+            sandbox_ctx = provider.acquire(task_id, config.project_path)
+        except RuntimeError as exc:
+            return CCExecutionResult(
+                success=False,
+                stdout="",
+                stderr=str(exc),
+                exit_code=-1,
+                duration_seconds=0,
             )
-            fallback_result = await self._spawn_with_model(
+
+        try:
+            result = await self._spawn_with_model(
                 task_id=task_id,
                 prompt=prompt,
                 config=config,
-                model=MODEL_OPUS,
+                cwd=sandbox_ctx.workspace_path,
+                model=selected_model,
                 timeout=timeout,
                 on_stream_event=on_stream_event,
+                token_profile=token_profile,
+                workspace_context=workspace_context,
             )
-            fallback_result.parsed["fallback_from"] = selected_model
-            fallback_result.parsed["fallback_to"] = MODEL_OPUS
-            return fallback_result
 
-        return result
+            if not result.success:
+                # Build the effective fallback list: explicit chain or legacy single-Opus retry
+                chain: list[str] = []
+                if model_fallback_chain is not None:
+                    chain = model_fallback_chain
+                elif selected_model != MODEL_OPUS:
+                    chain = [MODEL_OPUS]
+
+                attempted = {selected_model}
+                last_result = result
+                for fallback_model in chain:
+                    if fallback_model in attempted:
+                        continue
+                    attempted.add(fallback_model)
+                    logger.warning(
+                        f"Model {selected_model} failed, trying fallback {fallback_model} | task_id={task_id}"
+                    )
+                    last_result = await self._spawn_with_model(
+                        task_id=task_id,
+                        prompt=prompt,
+                        config=config,
+                        cwd=sandbox_ctx.workspace_path,
+                        model=fallback_model,
+                        timeout=timeout,
+                        on_stream_event=on_stream_event,
+                        token_profile=token_profile,
+                        workspace_context=workspace_context,
+                    )
+                    last_result.parsed["fallback_from"] = selected_model
+                    last_result.parsed["fallback_to"] = fallback_model
+                    if model_fallback_chain is not None:
+                        last_result.parsed["model_fallback_chain"] = model_fallback_chain
+                    if last_result.success:
+                        return last_result
+                return last_result
+
+            return result
+        finally:
+            # Release sandbox after all spawn attempts complete (success, failure, or exception)
+            provider.release(task_id, config.project_path)
 
     async def _spawn_with_model(
         self,
         task_id: str,
         prompt: str,
         config: ProjectConfig,
+        cwd: str,
         model: str,
         timeout: int | None = None,
         on_stream_event: StreamCallback | None = None,
+        token_profile: dict[str, Any] | None = None,
+        workspace_context: RunWorkspaceContext | None = None,
     ) -> CCExecutionResult:
         """Execute a CC spawn with a specific model.
 
         Reads stdout line-by-line for real-time streaming of CC JSON output.
         Each JSON line is parsed and forwarded via on_stream_event callback.
+
+        Args:
+            cwd: Working directory resolved by the sandbox provider.
+            workspace_context: Optional run workspace context. When provided,
+                stdout and stderr are written to log files in the workspace
+                directory after the process completes.
         """
         effective_timeout = timeout or self.default_timeout
-
-        # Determine working directory
-        cwd = config.project_path
-        if config.isolation == "git-worktree":
-            wt_path, err = self.create_worktree(config.project_path, task_id)
-            if err or not wt_path:
-                return CCExecutionResult(
-                    success=False,
-                    stdout="",
-                    stderr=err or "Failed to create worktree",
-                    exit_code=-1,
-                    duration_seconds=0,
-                )
-            cwd = wt_path
 
         command, stdin_prompt = self._build_command(prompt, model=model)
 
@@ -342,10 +363,41 @@ class CCSpawner:
 
         start_time = time.time()
 
+        # Build subprocess environment with allowlist filtering and optional token profile injection
+        import os as _os
+        allowlist = set(get_runner_env_allowlist())
+        base_env = dict(_os.environ)
+
+        # Filter inherited env to only allowlisted keys; always pass through non-sensitive system vars
+        # by keeping the full env but then separately injecting only allowlisted custom vars.
+        # The allowlist applies to explicitly injected vars, not the inherited system environment.
+        spawn_env = base_env
+        injected_env_keys: list[str] = []
+
+        if token_profile:
+            candidate_injections: dict[str, str] = {}
+            if "max_tokens" in token_profile:
+                candidate_injections["LEANKIT_RUNNER_MAX_TOKENS"] = str(token_profile["max_tokens"])
+            if "temperature_pct" in token_profile:
+                candidate_injections["LEANKIT_RUNNER_TEMPERATURE_PCT"] = str(token_profile["temperature_pct"])
+            if "model_hint" in token_profile:
+                candidate_injections["LEANKIT_RUNNER_MODEL_HINT"] = str(token_profile["model_hint"])
+
+            for key, value in candidate_injections.items():
+                if key in allowlist:
+                    spawn_env[key] = value
+                    injected_env_keys.append(key)
+                else:
+                    logger.warning(
+                        f"Runner env var blocked by allowlist | key={key} | task_id={task_id} | "
+                        f"allowlist={sorted(allowlist)}"
+                    )
+
         try:
             process = await asyncio.create_subprocess_shell(
                 command,
                 cwd=cwd,
+                env=spawn_env,
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
@@ -371,17 +423,34 @@ class CCSpawner:
 
                 # Wait for process to complete with timeout
                 await asyncio.wait_for(process.wait(), timeout=effective_timeout)
-                # Ensure stdout/stderr readers finish
-                await stdout_task
+                # Drain stdout with a bounded timeout — the pipe may not receive EOF
+                # immediately if child processes of the shell still hold it open
+                try:
+                    await asyncio.wait_for(stdout_task, timeout=30)
+                except TimeoutError:
+                    stdout_task.cancel()
+                    try:
+                        await stdout_task
+                    except asyncio.CancelledError:
+                        pass
                 stderr_text = await stderr_task
 
             except TimeoutError:
                 await self.kill(task_id)
+                # Drain remaining stdout after process kill; reader exits on EOF
+                try:
+                    await asyncio.wait_for(stdout_task, timeout=5)
+                except (TimeoutError, asyncio.CancelledError, Exception):
+                    stdout_task.cancel()
+                partial_stdout = "\n".join(stdout_lines)
                 duration = time.time() - start_time
-                logger.error(f"CC session timed out | task_id={task_id} | duration={duration:.1f}s")
+                logger.error(
+                    f"CC session timed out | task_id={task_id} | duration={duration:.1f}s | "
+                    f"partial_lines={len(stdout_lines)}"
+                )
                 return CCExecutionResult(
                     success=False,
-                    stdout="",
+                    stdout=partial_stdout,
                     stderr=f"Timed out after {effective_timeout}s",
                     exit_code=-1,
                     duration_seconds=duration,
@@ -395,12 +464,17 @@ class CCSpawner:
 
             parsed = self.parse_result(stdout_text)
             parsed["model_used"] = model
+            parsed["injected_env_keys"] = injected_env_keys
 
             logger.info(
                 f"CC session completed | task_id={task_id} | model={model} | "
                 f"exit_code={exit_code} | duration={duration:.1f}s | "
                 f"result={parsed.get('result', 'unknown')}"
             )
+
+            if workspace_context is not None:
+                from .run_workspace import RunWorkspaceManager
+                RunWorkspaceManager().write_logs(workspace_context, stdout_text, stderr_text)
 
             return CCExecutionResult(
                 success=success,
@@ -538,19 +612,32 @@ class CCSpawner:
                 "message": str(thinking)[:300],
             } if thinking else None
 
+        if line_type == "result":
+            return {
+                "event": "result",
+                "is_error": data.get("is_error", False),
+                "total_cost_usd": data.get("total_cost_usd"),
+                "usage": data.get("usage"),
+            }
+
         return None
 
-    async def kill(self, task_id: str) -> None:
-        """Force-kill a running CC process."""
+    def get_process(self, task_id: str) -> "asyncio.subprocess.Process | None":
+        """Return the subprocess handle for a running task, or None if not tracked."""
+        return self._running.get(task_id)
+
+    async def kill(self, task_id: str) -> bool:
+        """Force-kill a running CC process. Returns True if a process was killed."""
         process = self._running.pop(task_id, None)
         if process is None:
-            return
+            return False
         try:
             process.kill()
             await process.wait()
             logger.info(f"CC process killed | task_id={task_id}")
+            return True
         except ProcessLookupError:
-            pass
+            return False
 
     # ------------------------------------------------------------------
     # Output parsing
@@ -645,6 +732,35 @@ class CCSpawner:
                 parsed["code_review_findings"] = []
         elif "code_review_verdict" in parsed:
             parsed["code_review_findings"] = []
+
+        # Extract LLM token usage and cost from CC JSON result event.
+        # The result event appears as a JSON line with type="result" in the stdout stream.
+        for line in stdout.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                data = json.loads(line)
+            except (json.JSONDecodeError, ValueError):
+                continue
+            if not isinstance(data, dict) or data.get("type") != "result":
+                continue
+            if data.get("total_cost_usd") is not None:
+                parsed["llm_cost_usd"] = float(data["total_cost_usd"])
+            usage = data.get("usage")
+            if isinstance(usage, dict):
+                input_tok = usage.get("input_tokens", 0) or 0
+                output_tok = usage.get("output_tokens", 0) or 0
+                cache_creation = usage.get("cache_creation_input_tokens", 0) or 0
+                cache_read = usage.get("cache_read_input_tokens", 0) or 0
+                thinking_tok = usage.get("thinking_input_tokens", 0) or 0
+                total_tok = input_tok + output_tok + cache_creation + cache_read
+                parsed["llm_input_tokens"] = input_tok
+                parsed["llm_output_tokens"] = output_tok
+                parsed["llm_total_tokens"] = total_tok
+                if thinking_tok:
+                    parsed["llm_thinking_tokens"] = thinking_tok
+            break
 
         # If no structured block, try to extract a one-line summary from the
         # last non-empty line of stdout.

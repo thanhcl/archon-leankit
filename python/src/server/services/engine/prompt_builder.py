@@ -21,6 +21,7 @@ from typing import Any
 from ...config.logfire_config import get_logger
 from ..search.keyword_extractor import extract_keywords
 from .context_compressor import apply_token_budget, estimate_tokens
+from .task_boundaries import normalize_path_rules
 
 logger = get_logger(__name__)
 
@@ -37,7 +38,9 @@ _COMPACT_REPORT_TEMPLATE = """\
 ## Output (REQUIRED — structured)
 Before coding, output: TASK_ASSESSMENT: simple|complex / ESTIMATED_FILES: N / ESTIMATED_RISK: low|medium|high / ASSESSMENT_REASONING: one sentence
 Steps: 1) Assess 2) Research 3) Implement 4) Test 5) Run: `{build_command}`
+{execute_self_review_hint}
 Self-review: criteria met? security? backward compat? performance?
+{self_review_code_review_hint}
 Report block:
 SELF_REVIEW: PASS|NEEDS_ATTENTION
 REVIEW_CONFIDENCE: 0.0-1.0
@@ -92,6 +95,7 @@ class PromptBuilder:
         task: dict[str, Any],
         project: dict[str, Any] | None = None,
         build_command: str | None = None,
+        agent_definition: dict[str, Any] | None = None,
     ) -> tuple[str, dict[str, Any]]:
         """Build a unified execution prompt for the given task.
 
@@ -100,6 +104,11 @@ class PromptBuilder:
         - Limits and truncates code patterns
         - Uses compact boilerplate template
         - Enforces token budget with progressive shedding
+
+        Args:
+            agent_definition: Optional agent definition dict. When provided, its
+                prompt_template is injected as a role preamble before the task
+                requirements section.
 
         Returns:
             Tuple of (prompt_text, injection_stats) where injection_stats
@@ -111,9 +120,9 @@ class PromptBuilder:
         learnings = self._fetch_relevant_learnings(task)
 
         if self.compress:
-            prompt = self._render_compressed(task, project, kb_context, cmd, code_patterns, learnings)
+            prompt = self._render_compressed(task, project, kb_context, cmd, code_patterns, learnings, agent_definition)
         else:
-            prompt = self._render(task, project, kb_context, cmd, code_patterns, learnings)
+            prompt = self._render(task, project, kb_context, cmd, code_patterns, learnings, agent_definition)
 
         injection_stats = self._compute_injection_stats(prompt, kb_context, code_patterns, learnings)
         return prompt, injection_stats
@@ -281,6 +290,35 @@ class PromptBuilder:
         return "\n".join(lines)
 
     @staticmethod
+    def _format_agent_definition(agent_definition: dict[str, Any]) -> str | None:
+        """Render the agent role preamble from an agent definition.
+
+        Uses the definition's prompt_template if present, interpolating
+        {task_title} and {task_description} tokens. Falls back to a short
+        capabilities summary when no template is defined.
+        """
+        if not agent_definition:
+            return None
+
+        name = agent_definition.get("name") or ""
+        template = (agent_definition.get("prompt_template") or "").strip()
+        capabilities: list[str] = agent_definition.get("capabilities") or []
+
+        if not name and not template and not capabilities:
+            return None
+
+        lines: list[str] = [f"## Agent Role: {name}", ""] if name else ["## Agent Role", ""]
+
+        if template:
+            lines.append(template)
+        elif capabilities:
+            caps_str = ", ".join(capabilities)
+            lines.append(f"Specializations: {caps_str}")
+
+        lines.append("")
+        return "\n".join(lines)
+
+    @staticmethod
     def _format_acceptance_criteria(task: dict[str, Any]) -> str:
         criteria = task.get("acceptance_criteria") or []
         if not criteria:
@@ -293,6 +331,82 @@ class PromptBuilder:
                 text = str(item)
             lines.append(f"- [ ] {text}")
         return "\n".join(lines)
+
+    @staticmethod
+    def _compaction_hint(previous_stage: str, next_stage: str) -> str:
+        """Generate a context compaction hint at a stage transition boundary.
+
+        Suggests to the runner that when Claude Code compacts its context at this
+        boundary, it should preserve the key cross-stage artifacts. The hint is
+        advisory — the runner is free to include or omit it.
+        """
+        return (
+            f"<!-- COMPACTION HINT ({previous_stage} → {next_stage}): "
+            "If Claude Code compacts context here, preserve: "
+            "task_id, acceptance criteria, files modified, test results. -->"
+        )
+
+    @staticmethod
+    def _format_editing_boundaries(task: dict[str, Any]) -> str | None:
+        """Render task-level allowed/forbidden path guidance for the runner."""
+        allowed_paths = normalize_path_rules(task.get("allowed_paths"))
+        forbidden_paths = normalize_path_rules(task.get("forbidden_paths"))
+        if not allowed_paths and not forbidden_paths:
+            return None
+
+        lines = [
+            "## Editing Boundaries",
+            "Respect the path scope below. If the requested solution requires files outside this boundary, stop and report the conflict instead of editing them.",
+            "",
+        ]
+
+        if allowed_paths:
+            lines.append("Allowed paths:")
+            lines.extend(f"- `{rule}`" for rule in allowed_paths)
+            lines.append("")
+
+        if forbidden_paths:
+            lines.append("Forbidden paths:")
+            lines.extend(f"- `{rule}`" for rule in forbidden_paths)
+
+        return "\n".join(lines).rstrip()
+
+    @staticmethod
+    def _format_repo_guidance_packs(task: dict[str, Any]) -> str | None:
+        """Render repo-scoped guidance packs for runner execution."""
+        packs = task.get("repo_guidance_packs") or []
+        if not isinstance(packs, list) or not packs:
+            return None
+
+        lines: list[str] = [
+            "## Repository Guidance Packs",
+            "Apply these repo-specific implementation rules together with the task requirements and editing boundaries.",
+            "",
+        ]
+
+        rendered_any = False
+        for pack in packs:
+            if not isinstance(pack, dict):
+                continue
+
+            title = str(pack.get("title") or "").strip()
+            guidance = str(pack.get("guidance") or pack.get("text") or "").strip()
+            if not title or not guidance:
+                continue
+
+            rendered_any = True
+            lines.append(f"### {title}")
+            path_scope = normalize_path_rules(pack.get("path_scope"))
+            if path_scope:
+                lines.append("Path scope:")
+                lines.extend(f"- `{rule}`" for rule in path_scope)
+            lines.append(guidance)
+            lines.append("")
+
+        if not rendered_any:
+            return None
+
+        return "\n".join(lines).rstrip()
 
     def _format_retry_feedback(self, task: dict[str, Any]) -> str | None:
         """Format retry context with failure details, limited to MAX_RETRY_CONTEXT_TOKENS.
@@ -312,6 +426,10 @@ class PromptBuilder:
             error_msg = prev_result.get("summary") or prev_result.get("error")
             if error_msg:
                 sections.append(f"**What failed:** {error_msg}")
+            # Include structured run summary for session affinity (files_modified, tests_passed, etc.)
+            run_summary = prev_result.get("run_result_summary")
+            if run_summary and run_summary != error_msg:
+                sections.append(f"**Previous run:** {run_summary}")
             stderr = prev_result.get("stderr_preview")
             if stderr:
                 sections.append(f"**Error output:** {stderr[:300]}")
@@ -348,7 +466,24 @@ class PromptBuilder:
                 desc = (learning.get("description") or "")[:100]
                 sections.append(f"- {desc}")
 
-        # 5. Explicit "avoid repeating" instruction
+        # 5. Partial context from a previous timeout — give the retry a head start
+        partial_context = prev_result.get("partial_context") if isinstance(prev_result, dict) else None
+        if partial_context:
+            sections.append("")
+            sections.append("**## PREVIOUS_ATTEMPT — partial work context (continue, don't restart)**")
+            files_modified = partial_context.get("files_modified") or []
+            if files_modified:
+                files_list = ", ".join(files_modified[:5])
+                sections.append(f"Files modified before timeout: {files_list}")
+            partial_output = partial_context.get("partial_output")
+            if partial_output:
+                sections.append(f"Last agent message: {partial_output[:300]}")
+            reason = partial_context.get("reason")
+            if reason:
+                sections.append(f"Stopped because: {reason}")
+            sections.append("Pick up from where the previous attempt left off.")
+
+        # 6. Explicit "avoid repeating" instruction
         avoid_items = self._extract_avoid_items(prev_result, review, rejection)
         if avoid_items:
             sections.append("")
@@ -429,6 +564,7 @@ class PromptBuilder:
         build_command: str,
         code_patterns: list[dict[str, Any]] | None = None,
         learnings: list[dict[str, Any]] | None = None,
+        agent_definition: dict[str, Any] | None = None,
     ) -> str:
         """Render prompt with context compression applied.
 
@@ -491,11 +627,23 @@ class PromptBuilder:
         if retry_section:
             parts += [retry_section, ""]
 
+        agent_section = self._format_agent_definition(agent_definition)
+        if agent_section:
+            parts += [agent_section]
+
         parts += [
             "## Requirements",
             description,
             "",
         ]
+
+        boundary_section = self._format_editing_boundaries(task)
+        if boundary_section:
+            parts += [boundary_section, ""]
+
+        repo_guidance_section = self._format_repo_guidance_packs(task)
+        if repo_guidance_section:
+            parts += [repo_guidance_section, ""]
 
         if exec_prompt:
             parts += ["## Execution Strategy", exec_prompt, ""]
@@ -504,7 +652,11 @@ class PromptBuilder:
             "## Acceptance Criteria",
             self._format_acceptance_criteria(task),
             "",
-            _COMPACT_REPORT_TEMPLATE.format(build_command=build_command),
+            _COMPACT_REPORT_TEMPLATE.format(
+                build_command=build_command,
+                execute_self_review_hint=self._compaction_hint("execute", "self-review"),
+                self_review_code_review_hint=self._compaction_hint("self-review", "code-review"),
+            ),
         ]
 
         prompt = "\n".join(parts)
@@ -527,6 +679,7 @@ class PromptBuilder:
         build_command: str,
         code_patterns: list[dict[str, Any]] | None = None,
         learnings: list[dict[str, Any]] | None = None,
+        agent_definition: dict[str, Any] | None = None,
     ) -> str:
         title = task.get("title", "Untitled")
         priority = task.get("priority", "medium")
@@ -558,11 +711,23 @@ class PromptBuilder:
         if retry_section:
             parts += [retry_section, ""]
 
+        agent_section = self._format_agent_definition(agent_definition)
+        if agent_section:
+            parts += [agent_section]
+
         parts += [
             "## Requirements",
             description,
             "",
         ]
+
+        boundary_section = self._format_editing_boundaries(task)
+        if boundary_section:
+            parts += [boundary_section, ""]
+
+        repo_guidance_section = self._format_repo_guidance_packs(task)
+        if repo_guidance_section:
+            parts += [repo_guidance_section, ""]
 
         if exec_prompt:
             parts += ["## Execution Strategy", exec_prompt, ""]
@@ -585,12 +750,16 @@ class PromptBuilder:
             "4. Write tests for new functionality",
             f"5. Run: `{build_command}`",
             "",
+            self._compaction_hint("execute", "self-review"),
+            "",
             "## Self-Review (REQUIRED after implementation)",
             "Review your own changes before reporting:",
             "1. Check each acceptance criteria — all must pass",
             "2. Security scan: XSS, injection, auth bypass, key exposure",
             "3. Backward compatibility: existing APIs must not break",
             "4. Performance: no N+1 queries, no large allocations",
+            "",
+            self._compaction_hint("self-review", "code-review"),
             "",
             "## Learnings (REQUIRED in output)",
             "After completing this task, reflect on what you learned:",
