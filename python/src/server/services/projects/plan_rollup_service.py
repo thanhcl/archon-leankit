@@ -144,7 +144,7 @@ class PlanRollupService:
                 .maybe_single()
                 .execute()
             )
-            if not item_result.data:
+            if item_result is None or not item_result.data:
                 return False, {"error": f"Item {item_id} not found"}
 
             item = item_result.data
@@ -190,7 +190,7 @@ class PlanRollupService:
                 .maybe_single()
                 .execute()
             )
-            if not phase_result.data:
+            if phase_result is None or not phase_result.data:
                 return False, {"error": f"Phase {phase_id} not found in plan {plan_id}"}
 
             phase = phase_result.data
@@ -214,7 +214,7 @@ class PlanRollupService:
                 .maybe_single()
                 .execute()
             )
-            if not plan_result.data:
+            if plan_result is None or not plan_result.data:
                 return False, {"error": f"Plan {plan_id} not found"}
 
             plan = plan_result.data

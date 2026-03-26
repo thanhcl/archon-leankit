@@ -257,7 +257,7 @@ class EnginePolicyService:
         if active_only:
             query = query.eq("is_active", True)
         result = query.maybe_single().execute()
-        return result.data or None
+        return result.data if result is not None else None
 
     def _get_legacy_policy(self, project_id: str) -> dict[str, Any]:
         policy, _ = self._get_legacy_policy_with_sources(project_id)
@@ -283,7 +283,7 @@ class EnginePolicyService:
             .maybe_single()
             .execute()
         )
-        return result.data or None
+        return result.data if result is not None else None
 
     def _fetch_review_config(self) -> dict[str, Any]:
         result = (
@@ -293,7 +293,7 @@ class EnginePolicyService:
             .maybe_single()
             .execute()
         )
-        row = result.data or {}
+        row = result.data if result is not None else {}
         return _coerce_json_object(row.get("value"))
 
 

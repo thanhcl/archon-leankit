@@ -55,7 +55,7 @@ class PlanService:
                 .maybe_single()
                 .execute()
             )
-            if not result.data:
+            if result is None or not result.data:
                 return False, {"error": f"Plan {plan_id} not found"}
             return True, {"plan": result.data}
         except Exception as exc:
@@ -222,7 +222,7 @@ class PlanService:
                 .maybe_single()
                 .execute()
             )
-            if not result.data:
+            if result is None or not result.data:
                 return False, {"error": f"Item {item_id} not found"}
             return True, {"item": result.data}
         except Exception as exc:
@@ -419,7 +419,7 @@ class PlanService:
                 .maybe_single()
                 .execute()
             )
-            if not result.data:
+            if result is None or not result.data:
                 return False, {"error": f"Link {link_id} not found"}
             return True, {"link": result.data}
         except Exception as exc:
@@ -552,7 +552,7 @@ class PlanService:
                     .maybe_single()
                     .execute()
                 )
-                if not item_result.data:
+                if item_result is None or not item_result.data:
                     skipped += 1
                     continue
 

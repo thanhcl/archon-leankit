@@ -28,6 +28,8 @@ _DEPS_TABLE = "project_implementation_item_dependencies"
 _ITEM_KEY_RE = re.compile(r"^([A-Z]+-P\d+-\d+):\s*(.+)$")
 # Matches structured fields: - **Field**: value  or  * **Field**: value
 _FIELD_RE = re.compile(r"^[-*]\s+\*\*([^*]+)\*\*:\s*(.*)$")
+# Matches table-row fields: | **Field** | value |
+_TABLE_FIELD_RE = re.compile(r"^\|\s*\*\*([^*]+)\*\*\s*\|\s*(.*?)\s*\|?\s*$")
 
 _VALID_STATUSES = frozenset(
     {"planned", "ready", "in_progress", "blocked", "review", "done", "deferred", "cancelled"}
@@ -144,9 +146,10 @@ class PlanMarkdownParser:
                 reading_plan_desc = True
                 continue
 
-            # ── H2: phase ─────────────────────────────────────────────────
-            if stripped.startswith("## "):
-                raw_phase_title = stripped[3:].strip()
+            # ── H2 or H3: phase ──────────────────────────────────────────
+            if stripped.startswith("## ") or (stripped.startswith("### ") and not stripped.startswith("#### ")):
+                hdr_len = 4 if stripped.startswith("### ") else 3
+                raw_phase_title = stripped[hdr_len:].strip()
                 # Strip "Phase N:" prefix from display title
                 phase_display = re.sub(
                     r"^Phase\s+\d+:\s*", "", raw_phase_title, flags=re.IGNORECASE
@@ -160,9 +163,10 @@ class PlanMarkdownParser:
                 in_acceptance_criteria = False
                 continue
 
-            # ── H3: item (must match key pattern) ─────────────────────────
-            if stripped.startswith("### ") and current_phase is not None:
-                m = _ITEM_KEY_RE.match(stripped[4:].strip())
+            # ── H3/H4: item (must match key pattern) ────────────────────────
+            if (stripped.startswith("### ") or stripped.startswith("#### ")) and current_phase is not None:
+                hdr_len = 5 if stripped.startswith("#### ") else 4
+                m = _ITEM_KEY_RE.match(stripped[hdr_len:].strip())
                 if m:
                     current_item = ParsedItem(
                         item_key=m.group(1),
@@ -193,9 +197,12 @@ class PlanMarkdownParser:
 
             # ── Structured field: - **Key**: value ────────────────────────
             fm = _FIELD_RE.match(stripped)
+            if not fm:
+                # Also try table-row format: | **Key** | value |
+                fm = _TABLE_FIELD_RE.match(stripped)
             if fm:
                 fname = fm.group(1).strip().lower()
-                fval = fm.group(2).strip()
+                fval = fm.group(2).strip().strip('`').strip()
                 self._apply_field(current_item, fname, fval)
                 reading_item_desc = False
                 in_acceptance_criteria = False
@@ -234,7 +241,10 @@ class PlanMarkdownParser:
     def _apply_field(item: ParsedItem, name: str, value: str) -> None:
         """Apply a structured field value to a ParsedItem."""
         if name == "status":
-            norm = value.lower()
+            # Strip markdown formatting and dependency suffixes
+            # e.g. "`DONE`" → "done", "`BLOCKED` — depends on X" → "blocked"
+            norm = re.sub(r"[`*]", "", value).strip().lower()
+            norm = re.split(r"\s*[—–-]\s*", norm)[0].strip()
             norm = _STATUS_ALIASES.get(norm, norm)
             if norm in _VALID_STATUSES:
                 item.status = norm
@@ -344,7 +354,7 @@ class PlanImportService:
                 .maybe_single()
                 .execute()
             )
-            return result.data or None
+            return result.data if result is not None else None
 
         # Match by title under same project
         result = (
@@ -355,7 +365,7 @@ class PlanImportService:
             .maybe_single()
             .execute()
         )
-        return result.data or None
+        return result.data if result is not None else None
 
     # ── Private: initial atomic creation ─────────────────────────────────
 
