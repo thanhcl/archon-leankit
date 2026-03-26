@@ -14,6 +14,7 @@ import { NewProjectModal } from "../components/NewProjectModal";
 import { ProjectHeader } from "../components/ProjectHeader";
 import { ProjectList } from "../components/ProjectList";
 import { BootstrapPlansTab } from "../bootstrap/BootstrapPlansTab";
+import { PlansTab } from "../plans/PlansTab";
 import { DocsTab } from "../documents/DocsTab";
 import { projectKeys, useDeleteProject, useProjects, useUpdateProject } from "../hooks/useProjectQueries";
 import { KBTab } from "../kb/KBTab";
@@ -221,6 +222,7 @@ export function ProjectsView({ className = "", "data-id": dataId }: ProjectsView
                     { id: "tasks", label: "Tasks", icon: <ListTodo className="w-4 h-4" /> },
                     { id: "rules", label: "Rules", icon: <ScrollText className="w-4 h-4" /> },
                     { id: "kb", label: "KB", icon: <Book className="w-4 h-4" /> },
+                    { id: "plans", label: "Plans", icon: <GitBranchPlus className="w-4 h-4" /> },
                     { id: "bootstrap", label: "Bootstrap", icon: <GitBranchPlus className="w-4 h-4" /> },
                   ]}
                   activeSection={activeTab}
@@ -240,6 +242,7 @@ export function ProjectsView({ className = "", "data-id": dataId }: ProjectsView
                 {activeTab === "tasks" && <TasksTab projectId={selectedProject.id} />}
                 {activeTab === "rules" && <RulesTab projectId={selectedProject.id} />}
                 {activeTab === "kb" && <KBTab projectId={selectedProject.id} />}
+                {activeTab === "plans" && <PlansTab projectId={selectedProject.id} />}
                 {activeTab === "bootstrap" && <BootstrapPlansTab projectId={selectedProject.id} />}
               </div>
             </motion.div>
@@ -306,6 +309,7 @@ export function ProjectsView({ className = "", "data-id": dataId }: ProjectsView
                         { id: "tasks", label: "Tasks", icon: <ListTodo className="w-4 h-4" /> },
                         { id: "rules", label: "Rules", icon: <ScrollText className="w-4 h-4" /> },
                         { id: "kb", label: "KB", icon: <Book className="w-4 h-4" /> },
+                        { id: "plans", label: "Plans", icon: <GitBranchPlus className="w-4 h-4" /> },
                       ]}
                       activeSection={activeTab}
                       onSectionClick={(id) => setActiveTab(id as string)}
@@ -325,6 +329,7 @@ export function ProjectsView({ className = "", "data-id": dataId }: ProjectsView
                   {activeTab === "tasks" && <TasksTab projectId={selectedProject.id} />}
                   {activeTab === "rules" && <RulesTab projectId={selectedProject.id} />}
                   {activeTab === "kb" && <KBTab projectId={selectedProject.id} />}
+                  {activeTab === "plans" && <PlansTab projectId={selectedProject.id} />}
                 </div>
               </>
             )}
