@@ -102,14 +102,14 @@ _EST_RISK_RE = re.compile(r"ESTIMATED_RISK:\s*(low|medium|high)", re.IGNORECASE)
 _ASSESS_REASON_RE = re.compile(r"ASSESSMENT_REASONING:\s*(.+)", re.IGNORECASE)
 
 # Learnings pattern — captures JSON array
-_LEARNINGS_RE = re.compile(r"LEARNINGS:\s*(\[.*?\])", re.IGNORECASE | re.DOTALL)
+_LEARNINGS_RE = re.compile(r"LEARNINGS:\s*(\[.*\])", re.IGNORECASE)
 
 # Code patterns — captures JSON array
-_CODE_PATTERNS_RE = re.compile(r"CODE_PATTERNS:\s*(\[.*?\])", re.IGNORECASE | re.DOTALL)
+_CODE_PATTERNS_RE = re.compile(r"CODE_PATTERNS:\s*(\[.*\])", re.IGNORECASE)
 
 # Code review verdict and findings (from independent reviewer CC session)
 _CODE_REVIEW_VERDICT_RE = re.compile(r"CODE_REVIEW_VERDICT:\s*(APPROVE|REQUEST_CHANGES)", re.IGNORECASE)
-_CODE_REVIEW_FINDINGS_RE = re.compile(r"CODE_REVIEW_FINDINGS:\s*(\[.*?\])", re.IGNORECASE | re.DOTALL)
+_CODE_REVIEW_FINDINGS_RE = re.compile(r"CODE_REVIEW_FINDINGS:\s*(\[.*\])", re.IGNORECASE)
 
 
 class CCSpawner:

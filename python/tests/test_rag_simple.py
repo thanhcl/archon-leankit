@@ -14,7 +14,7 @@ import pytest
 os.environ.update({
     "SUPABASE_URL": "http://test.supabase.co",
     "SUPABASE_SERVICE_KEY": "test_key",
-    "OPENAI_API_KEY": "test_openai_key",
+    "OPENAI_API_KEY": "sk-test-openai-key",
     "USE_HYBRID_SEARCH": "false",
     "USE_RERANKING": "false",
     "USE_AGENTIC_RAG": "false",

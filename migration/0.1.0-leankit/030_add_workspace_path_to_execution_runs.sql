@@ -1,4 +1,4 @@
--- Migration: 028_add_workspace_path_to_execution_runs.sql
+-- Migration: 030_add_workspace_path_to_execution_runs.sql
 -- Purpose: Add workspace_path column to execution runs for direct path lookup.
 --
 -- The artifact_manifest (with log_paths and artifact_paths) is stored in the

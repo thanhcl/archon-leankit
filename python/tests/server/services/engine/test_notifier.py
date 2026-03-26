@@ -487,9 +487,9 @@ async def test_telegram_formatters_render_compact_review_and_error_text():
     review_text = notifier._format_telegram(notifier.event_log[0])
     failed_text = notifier._format_telegram(notifier.event_log[1])
 
-    assert "Task ready for review: `task-001`" in review_text
+    assert "Task ready for review: *task-001*" in review_text
     assert "Summary: Ready for owner review" in review_text
-    assert "Task failed: `task-002`" in failed_text
+    assert "Task failed: *task-002*" in failed_text
     assert "Reason: Timeout while running tests" in failed_text
 
 

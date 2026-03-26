@@ -1,4 +1,4 @@
--- Migration: 027_add_pipeline_steps_to_tasks.sql
+-- Migration: 029_add_pipeline_steps_to_tasks.sql
 -- Purpose: Add pipeline_steps field to archon_tasks for multi-step sequential execution.
 --
 -- pipeline_steps is a JSONB array of {stage, prompt_template, checkpoint} objects.

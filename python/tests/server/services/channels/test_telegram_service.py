@@ -14,6 +14,7 @@ def test_handle_message_records_external_request():
         approval_service=approvals,
         external_request_service=external,
     )
+    service.webhook_secret = None
 
     ok, result = __import__("asyncio").run(
         service.handle_webhook(
@@ -46,6 +47,7 @@ def test_handle_callback_query_decides_approval():
         approval_service=approvals,
         external_request_service=external,
     )
+    service.webhook_secret = None
     service._answer_callback_query = AsyncMock()
 
     ok, result = __import__("asyncio").run(
@@ -96,6 +98,7 @@ def test_handle_batch_callback_query_decides_multiple_approvals():
         approval_service=approvals,
         external_request_service=external,
     )
+    service.webhook_secret = None
     service._answer_callback_query = AsyncMock()
 
     ok, result = __import__("asyncio").run(
@@ -140,6 +143,7 @@ def test_handle_threshold_batch_callback_query_decides_multiple_approvals():
         approval_service=approvals,
         external_request_service=MagicMock(),
     )
+    service.webhook_secret = None
     service._answer_callback_query = AsyncMock()
 
     ok, result = __import__("asyncio").run(

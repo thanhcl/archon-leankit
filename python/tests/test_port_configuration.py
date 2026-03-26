@@ -148,6 +148,7 @@ class TestPortConfiguration:
         os.environ.pop("PORT", None)
         os.environ.pop("ARCHON_MCP_PORT", None)
         os.environ.pop("LEANKIT_CONTROL_PLANE_MCP_PORT", None)
+        os.environ.pop("OPENAI_API_KEY", None)
 
         with pytest.raises(
             ConfigurationError, match=r"LEANKIT_CONTROL_PLANE_MCP_PORT, ARCHON_MCP_PORT, or PORT"

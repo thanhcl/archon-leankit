@@ -486,9 +486,9 @@ class TestPromptBuilderPatterns:
         )
 
         task = {"id": "t-1", "title": "Test task", "project_id": "proj-001"}
-        prompt = await builder.build(task)
+        prompt, stats = await builder.build(task)
 
-        assert "Expert Code Patterns" in prompt
+        assert "Code Patterns (project library)" in prompt
         assert "PKCS11 Session Management" in prompt
         assert "CODE_PATTERNS:" in prompt
 
@@ -501,9 +501,9 @@ class TestPromptBuilderPatterns:
         )
 
         task = {"id": "t-1", "title": "Test task"}
-        prompt = await builder.build(task)
+        prompt, stats = await builder.build(task)
 
         # Should still have CODE_PATTERNS output section
         assert "CODE_PATTERNS:" in prompt
         # Should NOT have the injection section
-        assert "Expert Code Patterns (from project library)" not in prompt
+        assert "Code Patterns (project library)" not in prompt

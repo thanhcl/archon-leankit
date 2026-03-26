@@ -182,33 +182,30 @@ class TestTaskServiceOptimization:
             "updated_at": "2024-01-01"
         }]
         
-        # Setup mock chain
+        # Setup mock chain: select() -> not_.in_() -> or_() -> order() -> order() -> execute()
         mock_table = Mock()
-        mock_select = Mock()
-        mock_or = Mock()
-        mock_order1 = Mock()
-        mock_order2 = Mock()
-        
-        mock_order2.execute.return_value = mock_response
-        mock_order1.order.return_value = mock_order2
-        mock_or.order.return_value = mock_order1
-        mock_select.neq().or_.return_value = mock_or
-        mock_table.select.return_value = mock_select
+        mock_query = Mock()
+        mock_query.not_ = Mock()
+        mock_query.not_.in_.return_value = mock_query
+        mock_query.or_.return_value = mock_query
+        mock_query.order.return_value = mock_query
+        mock_query.execute.return_value = mock_response
+        mock_table.select.return_value = mock_query
         mock_client.table.return_value = mock_table
-        
+
         service = TaskService(mock_client)
         success, result = service.list_tasks()
-        
+
         assert success
         assert "sources" in result["tasks"][0]
         assert "code_examples" in result["tasks"][0]
-    
+
     @patch('src.server.utils.get_supabase_client')
     def test_list_tasks_exclude_large_fields(self, mock_supabase):
         """Test excluding large fields returns counts instead."""
         mock_client = Mock()
         mock_supabase.return_value = mock_client
-        
+
         mock_response = Mock()
         mock_response.data = [{
             "id": "task-1",
@@ -224,24 +221,21 @@ class TestTaskServiceOptimization:
             "created_at": "2024-01-01",
             "updated_at": "2024-01-01"
         }]
-        
-        # Setup mock chain
+
+        # Setup mock chain: select() -> not_.in_() -> or_() -> order() -> order() -> execute()
         mock_table = Mock()
-        mock_select = Mock()
-        mock_or = Mock()
-        mock_order1 = Mock()
-        mock_order2 = Mock()
-        
-        mock_order2.execute.return_value = mock_response
-        mock_order1.order.return_value = mock_order2
-        mock_or.order.return_value = mock_order1
-        mock_select.neq().or_.return_value = mock_or
-        mock_table.select.return_value = mock_select
+        mock_query = Mock()
+        mock_query.not_ = Mock()
+        mock_query.not_.in_.return_value = mock_query
+        mock_query.or_.return_value = mock_query
+        mock_query.order.return_value = mock_query
+        mock_query.execute.return_value = mock_response
+        mock_table.select.return_value = mock_query
         mock_client.table.return_value = mock_table
-        
+
         service = TaskService(mock_client)
         success, result = service.list_tasks(exclude_large_fields=True)
-        
+
         assert success
         task = result["tasks"][0]
         assert "sources" not in task

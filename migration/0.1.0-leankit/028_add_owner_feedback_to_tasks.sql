@@ -1,4 +1,4 @@
--- Migration: 027_add_owner_feedback_to_tasks
+-- Migration: 028_add_owner_feedback_to_tasks
 -- Purpose: Add owner feedback fields to archon_tasks for structured
 --          post-completion quality capture: rating, notes, and improvement tags.
 
@@ -15,5 +15,5 @@ CREATE INDEX IF NOT EXISTS idx_archon_tasks_owner_rating ON archon_tasks(owner_r
 
 -- Record migration
 INSERT INTO archon_migrations (version, migration_name)
-VALUES ('0.1.0-leankit', '027_add_owner_feedback_to_tasks')
+VALUES ('0.1.0-leankit', '028_add_owner_feedback_to_tasks')
 ON CONFLICT (version, migration_name) DO NOTHING;

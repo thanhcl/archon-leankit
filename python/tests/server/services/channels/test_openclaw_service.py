@@ -9,6 +9,7 @@ def test_handle_ingest_records_openclaw_external_request():
     external = MagicMock()
     external.create_request = AsyncMock(return_value=(True, {"request": {"id": "ext-open-001"}}))
     service = OpenClawChannelService(external_request_service=external)
+    service.ingest_secret = None
 
     ok, result = __import__("asyncio").run(
         service.handle_ingest(
@@ -84,6 +85,7 @@ def test_handle_status_query_returns_snapshots():
     approvals.list_requests.return_value = (True, {"approvals": [{"id": "apr-2", "status": "pending"}]})
 
     service = OpenClawChannelService(external_request_service=external, approval_request_service=approvals)
+    service.ingest_secret = None
 
     ok, result = __import__("asyncio").run(
         service.handle_ingest(
@@ -113,6 +115,7 @@ def test_handle_approval_action_decides_approval():
     approvals.decide_request = AsyncMock(return_value=(True, {"approval": {"id": "apr-9", "status": "approved"}}))
 
     service = OpenClawChannelService(external_request_service=external, approval_request_service=approvals)
+    service.ingest_secret = None
 
     ok, result = __import__("asyncio").run(
         service.handle_ingest(
@@ -163,6 +166,7 @@ def test_handle_architect_request_returns_structured_plan():
         approval_request_service=approvals,
         architect_request_service=architect,
     )
+    service.ingest_secret = None
     service._load_sequence_history = MagicMock(
         return_value=[
             {
@@ -235,6 +239,7 @@ def test_handle_architect_request_passes_clarification_answers_into_sequence_con
         approval_request_service=MagicMock(),
         architect_request_service=architect,
     )
+    service.ingest_secret = None
     service._load_sequence_history = MagicMock(
         return_value=[
             {
@@ -339,6 +344,7 @@ def test_handle_ingest_returns_deduplicated_status_when_request_already_exists()
         )
     )
     service = OpenClawChannelService(external_request_service=external)
+    service.ingest_secret = None
 
     ok, result = __import__("asyncio").run(
         service.handle_ingest(
@@ -432,6 +438,7 @@ def test_handle_ingest_rejects_conflicting_sequence_step_type():
     external.create_request = AsyncMock()
 
     service = OpenClawChannelService(external_request_service=external)
+    service.ingest_secret = None
 
     ok, result = __import__("asyncio").run(
         service.handle_ingest(
@@ -473,6 +480,7 @@ def test_handle_ingest_attaches_sequence_snapshot_to_payload():
     external.create_request = AsyncMock(return_value=(True, {"request": {"id": "ext-open-006"}}))
 
     service = OpenClawChannelService(external_request_service=external)
+    service.ingest_secret = None
 
     ok, result = __import__("asyncio").run(
         service.handle_ingest(
