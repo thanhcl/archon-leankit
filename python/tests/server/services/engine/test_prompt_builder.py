@@ -869,6 +869,90 @@ async def test_locked_contract_absent_when_architect_review_has_no_locked_contra
 
 
 @pytest.mark.asyncio
+async def test_formal_contract_criteria_preferred_over_mirror():
+    """H4-R1: When _formal_contract_criteria is present, it takes priority over
+    architect_review.locked_contract (the JSONB mirror)."""
+    task = _make_task(
+        architect_review={
+            "locked_contract": [
+                {"criterion": "Mirror criterion", "threshold": "mirror-threshold"},
+            ]
+        }
+    )
+    # Inject formal criteria (as task_engine would after loading from DB)
+    task["_formal_contract_criteria"] = [
+        {"criterion": "Formal criterion from DB", "threshold": "formal-threshold"},
+    ]
+    builder = PromptBuilder(rag_service=FakeRAGService(), compress=True)
+    prompt, _ = await builder.build(task)
+
+    assert "## Locked Contract" in prompt
+    assert "Formal criterion from DB" in prompt
+    assert "formal-threshold" in prompt
+    # Mirror criterion should NOT appear when formal criteria exist
+    assert "Mirror criterion" not in prompt
+
+
+@pytest.mark.asyncio
+async def test_formal_contract_criteria_without_architect_review():
+    """H4-R1: Execute prompt includes contract criteria even when
+    architect_review is absent, as long as _formal_contract_criteria is set."""
+    task = _make_task(architect_review=None)
+    task["_formal_contract_criteria"] = [
+        {"criterion": "Auth endpoint returns JWT", "threshold": "HTTP 200 with valid JWT"},
+    ]
+    builder = PromptBuilder(rag_service=FakeRAGService(), compress=True)
+    prompt, _ = await builder.build(task)
+
+    assert "## Locked Contract" in prompt
+    assert "Auth endpoint returns JWT" in prompt
+
+
+@pytest.mark.asyncio
+async def test_formal_contract_criteria_without_architect_review_legacy():
+    """H4-R1: Legacy (uncompressed) prompt also works with formal criteria only."""
+    task = _make_task(architect_review=None)
+    task["_formal_contract_criteria"] = [
+        {"criterion": "DB migration is reversible", "threshold": "Rollback succeeds"},
+    ]
+    builder = PromptBuilder(rag_service=FakeRAGService(), compress=False)
+    prompt, _ = await builder.build(task)
+
+    assert "## Locked Contract" in prompt
+    assert "DB migration is reversible" in prompt
+
+
+@pytest.mark.asyncio
+async def test_mirror_fallback_when_no_formal_criteria():
+    """H4-R1: When _formal_contract_criteria is absent or empty, falls back
+    to architect_review.locked_contract (preserving backward compatibility)."""
+    task = _make_task(
+        architect_review={
+            "locked_contract": [
+                {"criterion": "Fallback mirror criterion", "threshold": "mirror-pass"},
+            ]
+        }
+    )
+    builder = PromptBuilder(rag_service=FakeRAGService(), compress=True)
+    prompt, _ = await builder.build(task)
+
+    assert "## Locked Contract" in prompt
+    assert "Fallback mirror criterion" in prompt
+
+
+@pytest.mark.asyncio
+async def test_no_contract_section_when_both_absent():
+    """H4-R1: No Locked Contract section when neither formal criteria nor
+    architect_review.locked_contract exist."""
+    task = _make_task(architect_review=None)
+    # No _formal_contract_criteria either
+    builder = PromptBuilder(rag_service=FakeRAGService(), compress=True)
+    prompt, _ = await builder.build(task)
+
+    assert "## Locked Contract" not in prompt
+
+
+@pytest.mark.asyncio
 async def test_execute_prompt_does_not_request_contract_proposal():
     """Execute prompt must NOT ask the agent to produce a CONTRACT_PROPOSAL artifact."""
     builder = PromptBuilder(rag_service=FakeRAGService(), compress=True)

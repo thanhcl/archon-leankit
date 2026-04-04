@@ -3028,8 +3028,17 @@ class TaskEngine:
                     f"No review feedback for retry | task_id={state.task_id} | retry={retry_count}"
                 )
 
+        # Load formal contract criteria from archon_task_contracts and inject
+        # into task dict so the execute-stage prompt builder can reference it.
+        # The mirror field (architect_review.locked_contract) is preserved as
+        # a fallback.  (H4-R1: execute path must be formal-contract-first.)
+        task_for_prompt = state.full_task
+        formal_criteria = self._load_formal_contract_criteria(state.full_task)
+        if formal_criteria:
+            task_for_prompt = {**state.full_task, "_formal_contract_criteria": formal_criteria}
+
         state.prompt, state.injection_stats = await self.prompt_builder.build(
-            task=state.full_task,
+            task=task_for_prompt,
             build_command=self.project_config.build_command,
             review_feedback=review_feedback,
         )

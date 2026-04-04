@@ -365,15 +365,22 @@ class PromptBuilder:
 
     @staticmethod
     def _format_locked_contract(task: dict[str, Any]) -> str | None:
-        """Render locked contract criteria from architect review as execution context.
+        """Render locked contract criteria as execution context.
 
-        Injects the already-locked revision so the execute agent works against
-        it rather than proposing a new contract.
+        Prefers formal contract criteria from ``_formal_contract_criteria``
+        (loaded from archon_task_contracts via current_contract_id).  Falls
+        back to the JSONB mirror at ``architect_review.locked_contract`` when
+        no formal criteria are available.  (H4-R1: formal-contract-first.)
         """
-        architect_review = task.get("architect_review")
-        if not isinstance(architect_review, dict):
-            return None
-        locked_contract = architect_review.get("locked_contract")
+        # 1. Prefer formal contract criteria (DB-sourced via current_contract_id)
+        locked_contract = task.get("_formal_contract_criteria")
+
+        # 2. Fallback to JSONB mirror on architect_review
+        if not isinstance(locked_contract, list) or not locked_contract:
+            architect_review = task.get("architect_review")
+            if isinstance(architect_review, dict):
+                locked_contract = architect_review.get("locked_contract")
+
         if not isinstance(locked_contract, list) or not locked_contract:
             return None
 
