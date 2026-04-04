@@ -21,7 +21,7 @@ from typing import Any
 from ...config.env_aliases import get_runner_env_allowlist
 from ...config.logfire_config import get_logger
 from .run_workspace import RunWorkspaceContext
-from .sandbox_provider import GitWorktreeProvider, get_provider_for_isolation
+from .sandbox_provider import GitWorktreeProvider, SandboxContext, get_provider_for_isolation
 
 logger = get_logger(__name__)
 
@@ -290,6 +290,8 @@ class CCSpawner:
         stage: str | None = None,
         retry_count: int = 0,
         previous_model: str | None = None,
+        manage_sandbox: bool = True,
+        sandbox_ctx: SandboxContext | None = None,
     ) -> CCExecutionResult:
         """Spawn a Claude Code CLI session for a task.
 
@@ -312,6 +314,12 @@ class CCSpawner:
                 When provided, review stages enforce minimum model tiers.
             retry_count: Number of previous failed attempts for this task.
             previous_model: Model used in the previous attempt (for retry escalation).
+            manage_sandbox: When True (default), spawn() acquires and releases
+                the sandbox provider internally (legacy behaviour).  When False,
+                the caller owns sandbox lifecycle — ``sandbox_ctx`` must be
+                provided and the caller is responsible for calling
+                ``provider.release()`` after validation and merge.
+            sandbox_ctx: Pre-acquired SandboxContext when ``manage_sandbox=False``.
 
         Returns:
             CCExecutionResult with parsed output.
@@ -323,18 +331,29 @@ class CCSpawner:
             retry_count=retry_count,
             previous_model=previous_model,
         )
-        provider = get_provider_for_isolation(config.isolation, worktree_base=self.worktree_base)
 
-        try:
-            sandbox_ctx = provider.acquire(task_id, config.project_path)
-        except RuntimeError as exc:
-            return CCExecutionResult(
-                success=False,
-                stdout="",
-                stderr=str(exc),
-                exit_code=-1,
-                duration_seconds=0,
-            )
+        if manage_sandbox:
+            provider = get_provider_for_isolation(config.isolation, worktree_base=self.worktree_base)
+            try:
+                sandbox_ctx = provider.acquire(task_id, config.project_path)
+            except RuntimeError as exc:
+                return CCExecutionResult(
+                    success=False,
+                    stdout="",
+                    stderr=str(exc),
+                    exit_code=-1,
+                    duration_seconds=0,
+                )
+        else:
+            provider = None
+            if sandbox_ctx is None:
+                return CCExecutionResult(
+                    success=False,
+                    stdout="",
+                    stderr="manage_sandbox=False but no sandbox_ctx provided",
+                    exit_code=-1,
+                    duration_seconds=0,
+                )
 
         try:
             result = await self._spawn_with_model(
@@ -387,8 +406,10 @@ class CCSpawner:
 
             return result
         finally:
-            # Release sandbox after all spawn attempts complete (success, failure, or exception)
-            provider.release(task_id, config.project_path)
+            # Only release sandbox here if spawn() owns the lifecycle (legacy mode).
+            # When manage_sandbox=False, the pipeline owns release timing.
+            if manage_sandbox and provider is not None:
+                provider.release(task_id, config.project_path)
 
     async def _spawn_with_model(
         self,

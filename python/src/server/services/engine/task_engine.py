@@ -60,6 +60,7 @@ from .architect_reviewer import (
 from .bug_task_creator import BugTaskCreator
 from .capacity_tracker import GlobalCapacityTracker, SharedAgentPool
 from .cc_spawner import MODEL_SONNET, CCExecutionResult, CCSpawner, ProjectConfig, is_runner_level_failure
+from .sandbox_provider import SandboxContext, get_provider_for_isolation
 from .codex_runner import CodexRunnerAdapter
 from .evaluator_templates import (
     build_contract_aware_evaluator,
@@ -126,6 +127,8 @@ class TaskExecutionState:
     injection_stats: dict[str, Any] | None = None
     boundary_snapshot: dict[str, str] | None = None
     boundary_snapshot_error: str | None = None
+    sandbox_workspace_path: str | None = None
+    sandbox_provider: Any | None = None
     runner: ExecutionRunner | None = None
     runner_key: str = DEFAULT_RUNNER_KEY
     routing_reason: str | None = None
@@ -893,8 +896,15 @@ class TaskEngine:
         task: dict[str, Any],
         before_snapshot: dict[str, str] | None,
         snapshot_error: str | None = None,
+        cwd: str | None = None,
     ) -> dict[str, Any]:
-        """Build boundary validation metadata for one task execution."""
+        """Build boundary validation metadata for one task execution.
+
+        Args:
+            cwd: When provided, ``git status`` runs in this directory instead
+                of ``self.project_config.project_path``.  Used to detect
+                changes inside a worktree before it is released.
+        """
         if not task_has_boundary_rules(task):
             return validate_task_boundaries(task, [])
 
@@ -905,7 +915,9 @@ class TaskEngine:
             return validation
 
         try:
-            changed_files = await self._collect_changed_files_since(before_snapshot or {})
+            changed_files = await self._collect_changed_files_since(
+                before_snapshot or {}, cwd=cwd,
+            )
         except Exception as exc:
             validation = validate_task_boundaries(task, [])
             validation["status"] = "unavailable"
@@ -2555,7 +2567,9 @@ class TaskEngine:
             self._stage_lifecycle_restore,
             self._stage_runner_execute,
             self._stage_changed_file_validation,
+            self._stage_worktree_merge,
             self._stage_artifact_capture,
+            self._stage_sandbox_release,
         )
 
     @staticmethod
@@ -2711,7 +2725,9 @@ class TaskEngine:
             self._stage_lifecycle_restore,
             self._stage_runner_execute,
             self._stage_changed_file_validation,
+            self._stage_worktree_merge,
             self._stage_artifact_capture,
+            self._stage_sandbox_release,
             self._stage_notifier_publish,
         )
 
@@ -2719,7 +2735,9 @@ class TaskEngine:
         """Return post-run stages shared by `_execute_task` and `_on_cc_complete`."""
         return (
             self._stage_changed_file_validation,
+            self._stage_worktree_merge,
             self._stage_artifact_capture,
+            self._stage_sandbox_release,
             self._stage_notifier_publish,
         )
 
@@ -3076,7 +3094,16 @@ class TaskEngine:
         return state
 
     async def _stage_boundary_injection(self, state: TaskExecutionState) -> TaskExecutionState:
-        """Capture the pre-run workspace snapshot used for boundary validation."""
+        """Capture the pre-run workspace snapshot used for boundary validation.
+
+        When the task runs in a worktree, the snapshot must run against the
+        worktree path (not the repo root) so the after-snapshot in
+        _stage_changed_file_validation can diff correctly.  However, the
+        worktree is not yet created at this point in the pipeline — the
+        pre-snapshot is taken on the repo root and the workspace path is
+        recorded later by _stage_workspace_acquire.  The after-snapshot
+        uses ``state.sandbox_workspace_path`` when available.
+        """
         if state.full_task is None or not task_has_boundary_rules(state.full_task):
             return state
 
@@ -3087,8 +3114,29 @@ class TaskEngine:
         return state
 
     async def _stage_workspace_acquire(self, state: TaskExecutionState) -> TaskExecutionState:
-        """Resolve runner, token profile, runtime metadata, and execution-run tracking."""
+        """Resolve runner, token profile, runtime metadata, and execution-run tracking.
+
+        Also acquires the sandbox provider (worktree or shared directory) so
+        the workspace is available before the runner executes.  The sandbox is
+        NOT released here — ``_stage_sandbox_release`` handles that AFTER
+        boundary validation and worktree merge.
+        """
         if state.full_task is None or state.effective_project_config is None:
+            return state
+
+        # Acquire sandbox early — workspace must exist before runner executes.
+        # Pipeline owns the lifecycle: release happens in _stage_sandbox_release.
+        isolation = state.effective_project_config.isolation
+        provider = get_provider_for_isolation(isolation)
+        try:
+            sandbox_ctx = provider.acquire(state.task_id, state.effective_project_config.project_path)
+            state.sandbox_workspace_path = sandbox_ctx.workspace_path
+            state.sandbox_provider = provider
+        except RuntimeError as exc:
+            logger.error(f"Sandbox acquire failed | task_id={state.task_id} | error={exc}")
+            state.final_result = CCExecutionResult(
+                success=False, stdout="", stderr=str(exc), exit_code=-1, duration_seconds=0,
+            )
             return state
 
         try:
@@ -3266,6 +3314,23 @@ class TaskEngine:
             "agent_id": state.task_id,
             "stage": "execute",
         }
+        # Build sandbox context for the runner.  When the pipeline acquired
+        # the sandbox earlier (_stage_workspace_acquire), we pass it through
+        # so spawn() skips its own acquire/release cycle.
+        sandbox_ctx: SandboxContext | None = None
+        manage_sandbox = True
+        if state.sandbox_workspace_path and state.sandbox_provider:
+            sandbox_ctx = SandboxContext(
+                workspace_path=state.sandbox_workspace_path,
+                provider_name=getattr(state.sandbox_provider, "provider_name", "unknown"),
+            )
+            manage_sandbox = False
+
+        spawn_kwargs: dict[str, Any] = {}
+        if not manage_sandbox:
+            spawn_kwargs["manage_sandbox"] = False
+            spawn_kwargs["sandbox_ctx"] = sandbox_ctx
+
         state.runner_result = await state.runner.spawn(
             task_id=state.task_id,
             prompt=state.prompt,
@@ -3276,6 +3341,7 @@ class TaskEngine:
             token_profile=state.token_profile,
             model_fallback_chain=state.model_fallback_chain,
             workspace_context=state.run_workspace_ctx,
+            **spawn_kwargs,
         )
 
         if is_runner_level_failure(state.runner_result) and not state.abort_reasons:
@@ -3302,6 +3368,7 @@ class TaskEngine:
                     token_profile=state.token_profile,
                     model_fallback_chain=state.model_fallback_chain,
                     workspace_context=state.run_workspace_ctx,
+                    **spawn_kwargs,
                 )
                 state.runner_fallback_decisions.append(
                     {
@@ -3368,7 +3435,13 @@ class TaskEngine:
         return state
 
     async def _stage_changed_file_validation(self, state: TaskExecutionState) -> TaskExecutionState:
-        """Load the latest task payload and compute changed-file boundary validation."""
+        """Load the latest task payload and compute changed-file boundary validation.
+
+        When the task ran in a worktree, the after-snapshot must target the
+        worktree path so ``git status`` sees the runner's file modifications.
+        The worktree is still alive at this point because
+        ``_stage_sandbox_release`` runs AFTER this stage.
+        """
         if state.runner_result is None:
             return state
 
@@ -3378,7 +3451,114 @@ class TaskEngine:
             state.current_task,
             before_snapshot=state.boundary_snapshot,
             snapshot_error=state.boundary_snapshot_error,
+            cwd=state.sandbox_workspace_path,
         )
+        return state
+
+    async def _stage_worktree_merge(self, state: TaskExecutionState) -> TaskExecutionState:
+        """Merge worktree changes back to the main branch before release.
+
+        When the task ran in a git-worktree sandbox and produced changes that
+        passed boundary validation, merge the worktree branch into the current
+        branch so changes are preserved on the main checkout.  If boundary
+        validation found violations, skip the merge — the changes are
+        intentionally discarded.
+
+        This stage MUST run AFTER ``_stage_changed_file_validation`` and
+        BEFORE ``_stage_sandbox_release``.
+        """
+        if state.sandbox_provider is None or state.sandbox_workspace_path is None:
+            return state
+
+        provider_name = getattr(state.sandbox_provider, "provider_name", "")
+        if provider_name != "git-worktree":
+            return state  # nothing to merge for shared-directory provider
+
+        boundary = state.boundary_validation or {}
+        boundary_status = boundary.get("status", "")
+        changed_files = boundary.get("changed_files", [])
+
+        if not changed_files:
+            logger.info(f"Worktree merge skipped — no changed files | task_id={state.task_id}")
+            return state
+
+        if boundary_status == "violation":
+            logger.warning(
+                f"Worktree merge skipped — boundary violations detected | "
+                f"task_id={state.task_id} | violations={boundary.get('violations', [])}"
+            )
+            return state
+
+        # Commit changes in worktree, then merge branch into main checkout
+        import subprocess
+        wt_path = state.sandbox_workspace_path
+        branch = f"task/{state.task_id}"
+        project_path = state.effective_project_config.project_path if state.effective_project_config else ""
+
+        # Stage and commit in worktree
+        commit_result = subprocess.run(
+            ["git", "add", "-A"],
+            capture_output=True, text=True, cwd=wt_path,
+        )
+        if commit_result.returncode != 0:
+            logger.warning(f"Worktree git add failed | task_id={state.task_id} | err={commit_result.stderr[:200]}")
+            return state
+
+        commit_result = subprocess.run(
+            ["git", "commit", "-m", f"task/{state.task_id}: automated execution commit"],
+            capture_output=True, text=True, cwd=wt_path,
+        )
+        if commit_result.returncode != 0:
+            if "nothing to commit" in commit_result.stdout.lower() or "nothing to commit" in commit_result.stderr.lower():
+                logger.info(f"Worktree nothing to commit | task_id={state.task_id}")
+            else:
+                logger.warning(f"Worktree commit failed | task_id={state.task_id} | err={commit_result.stderr[:200]}")
+            return state
+
+        # Merge worktree branch into main checkout
+        merge_result = subprocess.run(
+            ["git", "merge", branch, "--no-edit"],
+            capture_output=True, text=True, cwd=project_path,
+        )
+        if merge_result.returncode != 0:
+            logger.error(
+                f"Worktree merge failed | task_id={state.task_id} | "
+                f"branch={branch} | err={merge_result.stderr[:200]}"
+            )
+            # Abort the failed merge to leave main clean
+            subprocess.run(["git", "merge", "--abort"], capture_output=True, text=True, cwd=project_path)
+        else:
+            logger.info(f"Worktree merged successfully | task_id={state.task_id} | branch={branch}")
+            if state.run_metadata is None:
+                state.run_metadata = {}
+            state.run_metadata["worktree_merged"] = True
+            state.run_metadata["worktree_branch"] = branch
+
+        return state
+
+    async def _stage_sandbox_release(self, state: TaskExecutionState) -> TaskExecutionState:
+        """Release the sandbox provider (worktree or shared directory).
+
+        Must run AFTER ``_stage_worktree_merge`` and ``_stage_artifact_capture``
+        so that all post-execution processing has access to the workspace.
+        """
+        if state.sandbox_provider is None:
+            return state
+
+        project_path = (
+            state.effective_project_config.project_path
+            if state.effective_project_config
+            else ""
+        )
+        try:
+            state.sandbox_provider.release(state.task_id, project_path)
+            logger.info(f"Sandbox released by pipeline | task_id={state.task_id}")
+        except Exception as exc:
+            logger.warning(f"Sandbox release failed | task_id={state.task_id} | error={exc}")
+        finally:
+            state.sandbox_provider = None
+            state.sandbox_workspace_path = None
+
         return state
 
     async def _stage_artifact_capture(self, state: TaskExecutionState) -> TaskExecutionState:
