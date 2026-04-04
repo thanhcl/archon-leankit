@@ -7,6 +7,7 @@ This module decouples TaskEngine from any one concrete coding runtime.
 from __future__ import annotations
 
 import asyncio
+import os
 from collections.abc import Callable
 from typing import Any, Protocol, runtime_checkable
 
@@ -14,6 +15,21 @@ from .cc_spawner import MODEL_SONNET, CCExecutionResult, CCSpawner, ProjectConfi
 from .run_workspace import RunWorkspaceContext
 
 DEFAULT_RUNNER_KEY = "claude-code-cli"
+CODEX_DEFAULT_RUNNER_KEY = "codex-cli"
+
+
+def _env_enabled(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes"}
+
+
+def get_engine_default_runner_key() -> str:
+    """Return the runtime default runner, respecting global kill switches."""
+    disable_claude = _env_enabled("LEANKIT_ENGINE_DISABLE_CLAUDE_CODE")
+    disable_codex = _env_enabled("LEANKIT_ENGINE_DISABLE_CODEX")
+
+    if disable_claude and not disable_codex:
+        return CODEX_DEFAULT_RUNNER_KEY
+    return DEFAULT_RUNNER_KEY
 
 
 @runtime_checkable
@@ -45,6 +61,7 @@ class ExecutionRunner(Protocol):
         token_profile: dict[str, Any] | None = None,
         model_fallback_chain: list[str] | None = None,
         workspace_context: RunWorkspaceContext | None = None,
+        **kwargs: Any,
     ) -> CCExecutionResult: ...
 
     async def kill(self, task_id: str) -> bool: ...
@@ -91,6 +108,7 @@ class ClaudeCodeRunnerAdapter:
         token_profile: dict[str, Any] | None = None,
         model_fallback_chain: list[str] | None = None,
         workspace_context: RunWorkspaceContext | None = None,
+        **kwargs: Any,
     ) -> CCExecutionResult:
         return await self._spawner.spawn(
             task_id=task_id,
@@ -103,6 +121,7 @@ class ClaudeCodeRunnerAdapter:
             token_profile=token_profile,
             model_fallback_chain=model_fallback_chain,
             workspace_context=workspace_context,
+            **kwargs,
         )
 
     def get_process(self, task_id: str) -> asyncio.subprocess.Process | None:

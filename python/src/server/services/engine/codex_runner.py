@@ -11,6 +11,7 @@ from typing import Any
 from ...config.logfire_config import get_logger
 from .cc_spawner import CCExecutionResult, CCSpawner, ProjectConfig
 from .codex_hook_publisher import CodexHookPublisher
+from .run_workspace import RunWorkspaceContext
 
 logger = get_logger(__name__)
 
@@ -53,6 +54,10 @@ class CodexRunnerAdapter:
     def has_capacity(self) -> bool:
         return self.running_count < self.max_parallel
 
+    def get_process(self, task_id: str) -> asyncio.subprocess.Process | None:
+        """Expose the live subprocess handle for watchdog liveness checks."""
+        return self._running.get(task_id)
+
     def select_model(
         self,
         task: dict[str, Any] | None = None,
@@ -88,6 +93,8 @@ class CodexRunnerAdapter:
         on_stream_event: Any = None,
         token_profile: dict[str, Any] | None = None,
         model_fallback_chain: list[str] | None = None,
+        workspace_context: RunWorkspaceContext | None = None,
+        **kwargs: Any,
     ) -> CCExecutionResult:
         effective_timeout = timeout or self.default_timeout
         selected_model = self.select_model(task=task, force_model=config.force_model)
@@ -206,42 +213,92 @@ class CodexRunnerAdapter:
     ) -> None:
         if not process.stdout:
             return
+        buffer = bytearray()
+        chunk_size = 65536
+        max_line_buffer = 4 * 1024 * 1024
 
         while True:
-            try:
-                line_bytes = await process.stdout.readline()
-            except (ValueError, asyncio.LimitOverrunError):
-                # Codex can emit very long JSON lines that exceed readline buffer
-                # Skip the oversized line and continue reading
-                continue
-            if not line_bytes:
+            chunk = await process.stdout.read(chunk_size)
+            if not chunk:
+                if buffer:
+                    await self._consume_stream_line(
+                        bytes(buffer).decode(errors="replace"),
+                        task_id=task_id,
+                        transcript_lines=transcript_lines,
+                        runtime_metadata=runtime_metadata,
+                        model=model,
+                        on_stream_event=on_stream_event,
+                    )
                 break
 
-            line = line_bytes.decode().rstrip("\n")
-            if not line.strip():
-                continue
+            buffer.extend(chunk)
+            while True:
+                newline_index = buffer.find(b"\n")
+                if newline_index == -1:
+                    break
 
-            parsed_event = self.parse_stream_line(line)
-            if parsed_event:
-                message = parsed_event.get("message")
-                if isinstance(message, str) and message.strip():
-                    transcript_lines.append(message)
-
-                self._publish_hook_event(
+                line_bytes = bytes(buffer[:newline_index])
+                del buffer[: newline_index + 1]
+                await self._consume_stream_line(
+                    line_bytes.decode(errors="replace"),
                     task_id=task_id,
-                    stream_event=parsed_event,
-                    raw_line=line,
+                    transcript_lines=transcript_lines,
                     runtime_metadata=runtime_metadata,
                     model=model,
+                    on_stream_event=on_stream_event,
                 )
 
-                if on_stream_event:
-                    result = on_stream_event(task_id, parsed_event)
-                    if asyncio.iscoroutine(result):
-                        await result
-                continue
+            if len(buffer) > max_line_buffer:
+                logger.warning(
+                    "Codex stdout line exceeded %s bytes without newline | task_id=%s | truncating for liveness",
+                    max_line_buffer,
+                    task_id,
+                )
+                await self._consume_stream_line(
+                    bytes(buffer).decode(errors="replace"),
+                    task_id=task_id,
+                    transcript_lines=transcript_lines,
+                    runtime_metadata=runtime_metadata,
+                    model=model,
+                    on_stream_event=on_stream_event,
+                )
+                buffer.clear()
 
-            transcript_lines.append(line)
+    async def _consume_stream_line(
+        self,
+        line: str,
+        *,
+        task_id: str,
+        transcript_lines: list[str],
+        runtime_metadata: dict[str, Any],
+        model: str,
+        on_stream_event: Any,
+    ) -> None:
+        normalized = line.rstrip("\n")
+        if not normalized.strip():
+            return
+
+        parsed_event = self.parse_stream_line(normalized)
+        if parsed_event:
+            message = parsed_event.get("message")
+            if isinstance(message, str) and message.strip():
+                transcript_lines.append(message)
+
+            self._publish_hook_event(
+                task_id=task_id,
+                stream_event=parsed_event,
+                raw_line=normalized,
+                runtime_metadata=runtime_metadata,
+                model=model,
+            )
+
+            if on_stream_event:
+                result = on_stream_event(task_id, parsed_event)
+                if asyncio.iscoroutine(result):
+                    await result
+            return
+
+        transcript_lines.append(normalized)
 
     def _publish_hook_event(
         self,
@@ -328,14 +385,24 @@ class CodexRunnerAdapter:
 
         return parsed
 
-    async def kill(self, task_id: str) -> bool:
+    async def kill(self, task_id: str, grace_seconds: int = 10) -> bool:
+        """Gracefully terminate a running Codex process.
+
+        Sends SIGTERM first, waits up to grace_seconds for clean exit,
+        then falls back to SIGKILL. Adopted from CCS signal-forwarder pattern.
+        """
         process = self._running.pop(task_id, None)
         if process is None:
             return False
         try:
-            process.kill()
-            await process.wait()
-            logger.info(f"Codex process killed | task_id={task_id}")
+            process.terminate()  # SIGTERM
+            try:
+                await asyncio.wait_for(process.wait(), timeout=grace_seconds)
+                logger.info(f"Codex process terminated gracefully | task_id={task_id}")
+            except TimeoutError:
+                process.kill()  # SIGKILL after grace period
+                await process.wait()
+                logger.info(f"Codex process killed after {grace_seconds}s grace | task_id={task_id}")
             return True
         except ProcessLookupError:
             return False
