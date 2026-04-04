@@ -590,7 +590,10 @@ async def test_injection_stats_structure():
     """Injection stats dict has all required keys."""
     builder = PromptBuilder(rag_service=FakeRAGService(), compress=True)
     _, stats = await builder.build(_make_task())
-    assert set(stats.keys()) == {"learnings", "patterns", "kb_chunks", "tokens"}
+    assert {"learnings", "patterns", "kb_chunks", "tokens"}.issubset(set(stats.keys()))
+    # New fields added by adoption gaps: prompt_token_breakdown, guidance_pack_hash
+    assert "prompt_token_breakdown" in stats
+    assert "guidance_pack_hash" in stats
 
 
 # -- Retry failure context enrichment tests --
@@ -803,3 +806,73 @@ async def test_compaction_hints_in_legacy_prompt():
     assert "acceptance criteria" in prompt
     assert "files modified" in prompt
     assert "test results" in prompt
+
+
+# -- Locked contract injection tests --
+
+
+@pytest.mark.asyncio
+async def test_locked_contract_injected_when_architect_review_present():
+    """Compressed prompt includes Locked Contract section when architect_review has locked_contract."""
+    task = _make_task(
+        architect_review={
+            "locked_contract": [
+                {"criterion": "POST /login returns 200 on valid credentials", "threshold": "HTTP 200 with JWT"},
+                {"criterion": "Invalid credentials return 401", "threshold": "HTTP 401 with error body"},
+            ]
+        }
+    )
+    builder = PromptBuilder(rag_service=FakeRAGService(), compress=True)
+    prompt, _ = await builder.build(task)
+
+    assert "## Locked Contract" in prompt
+    assert "POST /login returns 200 on valid credentials" in prompt
+    assert "HTTP 200 with JWT" in prompt
+    assert "Invalid credentials return 401" in prompt
+    assert "Do not propose a new contract" in prompt
+
+
+@pytest.mark.asyncio
+async def test_locked_contract_injected_in_legacy_prompt():
+    """Legacy (uncompressed) prompt also includes Locked Contract section."""
+    task = _make_task(
+        architect_review={
+            "locked_contract": [
+                {"criterion": "Database writes are atomic", "threshold": "Rollback on partial failure"},
+            ]
+        }
+    )
+    builder = PromptBuilder(rag_service=FakeRAGService(), compress=False)
+    prompt, _ = await builder.build(task)
+
+    assert "## Locked Contract" in prompt
+    assert "Database writes are atomic" in prompt
+    assert "Rollback on partial failure" in prompt
+
+
+@pytest.mark.asyncio
+async def test_locked_contract_absent_when_no_architect_review():
+    """Prompt omits Locked Contract section when no architect_review is present."""
+    builder = PromptBuilder(rag_service=FakeRAGService(), compress=True)
+    prompt, _ = await builder.build(_make_task(architect_review=None))
+
+    assert "## Locked Contract" not in prompt
+
+
+@pytest.mark.asyncio
+async def test_locked_contract_absent_when_architect_review_has_no_locked_contract():
+    """Prompt omits Locked Contract section when architect_review has no locked_contract key."""
+    builder = PromptBuilder(rag_service=FakeRAGService(), compress=True)
+    prompt, _ = await builder.build(_make_task(architect_review={"verdict": "APPROVE_CONTRACT"}))
+
+    assert "## Locked Contract" not in prompt
+
+
+@pytest.mark.asyncio
+async def test_execute_prompt_does_not_request_contract_proposal():
+    """Execute prompt must NOT ask the agent to produce a CONTRACT_PROPOSAL artifact."""
+    builder = PromptBuilder(rag_service=FakeRAGService(), compress=True)
+    prompt, _ = await builder.build(_make_task())
+
+    assert "CONTRACT_PROPOSAL" not in prompt
+    assert "Contract Proposal (Required Output)" not in prompt

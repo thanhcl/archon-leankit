@@ -80,6 +80,7 @@ _DEFAULT_POLICY: dict[str, Any] = {
         },
         "stalled_warning_seconds": 300,
         "stalled_kill_seconds": 600,
+        "guidance_pack_budget_tokens": None,
     },
 }
 

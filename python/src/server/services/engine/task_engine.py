@@ -243,6 +243,7 @@ class TaskEngine:
             task_service=self.task_service,
             lifecycle_service=self.lifecycle_service,
             notifier=self.notifier,
+            execution_run_service=self.execution_run_service,
         )
         self.task_decomposer = TaskDecomposer()
 
@@ -1695,6 +1696,32 @@ class TaskEngine:
                 reason=reason,
             )
             await self.notifier.on_task_failed(task_id, reason, runtime=runtime)
+
+            # Emit recovery event for observability (non-fatal)
+            try:
+                retry_strategy = "model_escalation"
+                if self.project_id:
+                    policy = self.engine_policy_service.get_active_policy(self.project_id)
+                    if policy:
+                        capacity = policy.get("capacity_policy") or {}
+                        retry_strategy = capacity.get("retry_strategy") or "model_escalation"
+
+                await self.notifier.emit(
+                    "execution.recovery_attempted",
+                    task_id=task_id,
+                    data={
+                        "task_id": task_id,
+                        "project_id": task.get("project_id"),
+                        "strategy": retry_strategy,
+                        "attempt_number": retry_count + 1,
+                        "max_retries": max_retries,
+                        "original_error": reason[:300],
+                        "outcome": "retry_scheduled",
+                    },
+                )
+            except Exception:
+                pass  # recovery event is advisory, must not block retry
+
             asyncio.create_task(self._schedule_retry(task_id, retry_count, reason))
         elif self._escalation_enabled:
             escalation_reason = f"Max retries ({max_retries}) exhausted: {reason[:300]}"
@@ -3011,8 +3038,32 @@ class TaskEngine:
             f"learnings={state.injection_stats['learnings']} | "
             f"patterns={state.injection_stats['patterns']} | "
             f"kb_chunks={state.injection_stats['kb_chunks']} | "
-            f"tokens={state.injection_stats['tokens']}"
+            f"tokens={state.injection_stats['tokens']} | "
+            f"guidance_hash={state.injection_stats.get('guidance_pack_hash', '')}"
         )
+
+        # Guidance pack token budget check
+        if state.policy:
+            capacity = state.policy.get("capacity_policy") or {}
+            budget = capacity.get("guidance_pack_budget_tokens")
+            if isinstance(budget, int) and budget > 0:
+                pack_tokens = state.injection_stats.get("tokens", 0)
+                if pack_tokens > budget:
+                    logger.warning(
+                        f"Guidance pack exceeds token budget | task_id={state.task_id} | "
+                        f"pack_tokens={pack_tokens} | budget={budget}"
+                    )
+                    await self.notifier.emit(
+                        "health.guidance_pack_over_budget",
+                        task_id=state.task_id,
+                        data={
+                            "task_id": state.task_id,
+                            "pack_tokens": pack_tokens,
+                            "budget_tokens": budget,
+                            "project_id": state.project_id,
+                        },
+                    )
+
         return state
 
     async def _stage_boundary_injection(self, state: TaskExecutionState) -> TaskExecutionState:
@@ -3337,6 +3388,10 @@ class TaskEngine:
         }
         if state.injection_stats:
             state.execution_result["injection"] = state.injection_stats
+            # Store token breakdown in run metadata for analytics
+            breakdown = state.injection_stats.get("prompt_token_breakdown")
+            if breakdown:
+                state.run_metadata["prompt_token_breakdown"] = breakdown
         if state.runner_result.stderr:
             state.execution_result["stderr_preview"] = state.runner_result.stderr[:1000]
         if state.runner_result.stdout:

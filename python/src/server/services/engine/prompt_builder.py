@@ -16,6 +16,7 @@ Usage:
     prompt = await builder.build(task)
 """
 
+import hashlib
 from typing import Any
 
 from ...config.logfire_config import get_logger
@@ -96,6 +97,7 @@ class PromptBuilder:
         project: dict[str, Any] | None = None,
         build_command: str | None = None,
         agent_definition: dict[str, Any] | None = None,
+        review_feedback: dict[str, Any] | None = None,
     ) -> tuple[str, dict[str, Any]]:
         """Build a unified execution prompt for the given task.
 
@@ -109,6 +111,8 @@ class PromptBuilder:
             agent_definition: Optional agent definition dict. When provided, its
                 prompt_template is injected as a role preamble before the task
                 requirements section.
+            review_feedback: Optional structured feedback from archon_review_feedback.
+                When provided, enhances retry context with per-criterion scores.
 
         Returns:
             Tuple of (prompt_text, injection_stats) where injection_stats
@@ -120,9 +124,9 @@ class PromptBuilder:
         learnings = self._fetch_relevant_learnings(task)
 
         if self.compress:
-            prompt = self._render_compressed(task, project, kb_context, cmd, code_patterns, learnings, agent_definition)
+            prompt = self._render_compressed(task, project, kb_context, cmd, code_patterns, learnings, agent_definition, review_feedback=review_feedback)
         else:
-            prompt = self._render(task, project, kb_context, cmd, code_patterns, learnings, agent_definition)
+            prompt = self._render(task, project, kb_context, cmd, code_patterns, learnings, agent_definition, review_feedback=review_feedback)
 
         injection_stats = self._compute_injection_stats(prompt, kb_context, code_patterns, learnings)
         return prompt, injection_stats
@@ -142,12 +146,25 @@ class PromptBuilder:
             parts.append(self._format_learnings(learnings))
         if code_patterns:
             parts.append(self._format_code_patterns(code_patterns))
-        injection_tokens = estimate_tokens("".join(parts)) if parts else 0
+        guidance_text = "".join(parts) if parts else ""
+        injection_tokens = estimate_tokens(guidance_text) if guidance_text else 0
+        total_prompt_tokens = estimate_tokens(prompt) if prompt else 0
+        task_context_tokens = total_prompt_tokens - injection_tokens
+
+        # Guidance pack hash for versioning — correlate pack changes with success rate
+        guidance_hash = hashlib.md5(guidance_text.encode()).hexdigest()[:12] if guidance_text else ""
+
         return {
             "learnings": len(learnings),
             "patterns": len(code_patterns),
             "kb_chunks": len(kb_chunks),
             "tokens": injection_tokens,
+            "guidance_pack_hash": guidance_hash,
+            "prompt_token_breakdown": {
+                "guidance_pack_tokens": injection_tokens,
+                "task_context_tokens": max(0, task_context_tokens),
+                "total_prompt_tokens": total_prompt_tokens,
+            },
         }
 
     # ------------------------------------------------------------------
@@ -347,6 +364,37 @@ class PromptBuilder:
         )
 
     @staticmethod
+    def _format_locked_contract(task: dict[str, Any]) -> str | None:
+        """Render locked contract criteria from architect review as execution context.
+
+        Injects the already-locked revision so the execute agent works against
+        it rather than proposing a new contract.
+        """
+        architect_review = task.get("architect_review")
+        if not isinstance(architect_review, dict):
+            return None
+        locked_contract = architect_review.get("locked_contract")
+        if not isinstance(locked_contract, list) or not locked_contract:
+            return None
+
+        lines = [
+            "## Locked Contract",
+            "Execute against the following locked criteria. Do not propose a new contract.",
+            "",
+        ]
+        for i, criterion in enumerate(locked_contract, 1):
+            if not isinstance(criterion, dict):
+                continue
+            text = criterion.get("criterion", "")
+            threshold = criterion.get("threshold", "")
+            line = f"{i}. {text}"
+            if threshold:
+                line += f" — pass condition: {threshold}"
+            lines.append(line)
+
+        return "\n".join(lines)
+
+    @staticmethod
     def _format_editing_boundaries(task: dict[str, Any]) -> str | None:
         """Render task-level allowed/forbidden path guidance for the runner."""
         allowed_paths = normalize_path_rules(task.get("allowed_paths"))
@@ -408,25 +456,105 @@ class PromptBuilder:
 
         return "\n".join(lines).rstrip()
 
-    def _format_retry_feedback(self, task: dict[str, Any]) -> str | None:
+    @staticmethod
+    def _classify_retry_direction(
+        feedback: dict[str, Any] | None,
+        rejection_reason: str | None,
+    ) -> str:
+        """Classify the retry direction based on review feedback and rejection reason.
+
+        Returns "pivot" when the overall approach should change; "refine" otherwise.
+        Pivot triggers: score < 3.0, or pivot/rethink/rewrite keywords in feedback or rejection.
+        """
+        _pivot_keywords = {"pivot", "rethink", "rewrite", "redesign", "fundamental"}
+
+        if feedback is not None:
+            score = feedback.get("overall_score")
+            if score is not None and float(score) < 3.0:
+                return "pivot"
+            direction = (feedback.get("suggested_retry_direction") or "").lower()
+            if any(kw in direction for kw in _pivot_keywords):
+                return "pivot"
+
+        if rejection_reason:
+            rejection_lower = rejection_reason.lower()
+            if any(kw in rejection_lower for kw in _pivot_keywords):
+                return "pivot"
+
+        return "refine"
+
+    @staticmethod
+    def _format_structured_feedback(feedback: dict[str, Any]) -> str:
+        """Render structured review feedback as a human-readable retry context block."""
+        lines: list[str] = []
+        score = feedback.get("overall_score")
+        verdict = feedback.get("verdict", "changes-requested")
+        reviewer = feedback.get("reviewer_identity", "reviewer")
+        direction = feedback.get("suggested_retry_direction") or ""
+
+        lines.append(f"**Review score:** {score}/10 | **Verdict:** {verdict} | **Reviewer:** {reviewer}")
+
+        findings = feedback.get("findings") or []
+        if findings:
+            lines.append("")
+            lines.append("**Per-criterion scores:**")
+            for f in findings:
+                if not isinstance(f, dict):
+                    continue
+                criterion = f.get("criterion", "?")
+                f_score = f.get("score", 0)
+                passed = f.get("passed", False)
+                details = f.get("details", "")
+                evidence = f.get("evidence", "")
+                marker = "✓" if passed else "✗"
+                line = f"  {marker} {criterion}: {int(f_score)}/10"
+                if details:
+                    line += f" — {details}"
+                if not passed and evidence:
+                    line += f" ({evidence})"
+                lines.append(line)
+
+        if direction:
+            lines.append("")
+            lines.append(f"**Suggested focus:** {direction}")
+
+        return "\n".join(lines)
+
+    def _format_retry_feedback(
+        self,
+        task: dict[str, Any],
+        review_feedback: dict[str, Any] | None = None,
+    ) -> str | None:
         """Format retry context with failure details, limited to MAX_RETRY_CONTEXT_TOKENS.
 
-        Includes: previous execution result, architect feedback, rejection reason,
-        relevant failure learnings, and an explicit "avoid repeating" instruction.
+        Includes: structured review feedback (when available), previous execution result,
+        architect feedback, rejection reason, relevant failure learnings, and an explicit
+        "avoid repeating" instruction.
         """
         retry_count = task.get("retry_count") or 0
         if retry_count == 0:
             return None
 
-        sections: list[str] = [f"## Previous Attempt Failed (attempt {retry_count})", ""]
+        rejection = task.get("rejection_reason")
+        direction = self._classify_retry_direction(review_feedback, rejection)
+        sections: list[str] = [
+            f"## Previous Attempt Failed (attempt {retry_count}) — {direction.upper()}",
+            "",
+        ]
 
-        # 1. Extract failure details from execution_result
+        # 1. Structured review feedback (primary source — replaces ad-hoc architect_review field)
+        if review_feedback is not None:
+            sections.append(self._format_structured_feedback(review_feedback))
+            sections.append("")
+        else:
+            sections.append(f"_Retry attempt {retry_count} — no structured feedback available._")
+
+        # 2. Extract failure details from execution_result
         prev_result = task.get("execution_result")
         if isinstance(prev_result, dict):
             error_msg = prev_result.get("summary") or prev_result.get("error")
             if error_msg:
                 sections.append(f"**What failed:** {error_msg}")
-            # Include structured run summary for session affinity (files_modified, tests_passed, etc.)
             run_summary = prev_result.get("run_result_summary")
             if run_summary and run_summary != error_msg:
                 sections.append(f"**Previous run:** {run_summary}")
@@ -436,7 +564,6 @@ class PromptBuilder:
             result_status = prev_result.get("result", "")
             if result_status:
                 sections.append(f"**Result status:** {result_status}")
-            # Extract findings if available
             findings = prev_result.get("review_findings") or prev_result.get("findings")
             if isinstance(findings, list) and findings:
                 critical = [f for f in findings if isinstance(f, dict) and f.get("severity") == "critical"]
@@ -445,20 +572,20 @@ class PromptBuilder:
                     for f in critical[:3]:
                         sections.append(f"- {f.get('description', '')[:100]}")
 
-        # 2. Architect feedback
-        review = task.get("architect_review")
-        if isinstance(review, dict):
-            feedback = review.get("feedback") or review.get("comments")
-            if feedback:
-                sections.append(f"**Architect feedback:** {feedback}")
+        # 3. Architect feedback (fallback when no structured feedback)
+        if review_feedback is None:
+            review = task.get("architect_review")
+            if isinstance(review, dict):
+                feedback = review.get("feedback") or review.get("comments")
+                if feedback:
+                    sections.append(f"**Architect feedback:** {feedback}")
 
-        # 3. Rejection reason
-        rejection = task.get("rejection_reason")
+        # 4. Rejection reason
         if rejection:
             sections.append(f"**Rejection reason:** {rejection}")
 
-        # 4. Fetch failure-relevant learnings from same task type/keywords
-        failure_learnings = self._fetch_failure_learnings(task, prev_result)
+        # 5. Fetch failure-relevant learnings from same task type/keywords
+        failure_learnings = self._fetch_failure_learnings(task, prev_result if isinstance(prev_result, dict) else None)
         if failure_learnings:
             sections.append("")
             sections.append("**Relevant learnings from similar past failures:**")
@@ -466,7 +593,7 @@ class PromptBuilder:
                 desc = (learning.get("description") or "")[:100]
                 sections.append(f"- {desc}")
 
-        # 5. Partial context from a previous timeout — give the retry a head start
+        # 6. Partial context from a previous timeout — give the retry a head start
         partial_context = prev_result.get("partial_context") if isinstance(prev_result, dict) else None
         if partial_context:
             sections.append("")
@@ -483,16 +610,16 @@ class PromptBuilder:
                 sections.append(f"Stopped because: {reason}")
             sections.append("Pick up from where the previous attempt left off.")
 
-        # 6. Explicit "avoid repeating" instruction
-        avoid_items = self._extract_avoid_items(prev_result, review, rejection)
+        # 7. Explicit "avoid repeating" instruction
+        review = task.get("architect_review") if isinstance(task.get("architect_review"), dict) else None
+        avoid_items = self._extract_avoid_items(
+            prev_result if isinstance(prev_result, dict) else None, review, rejection
+        )
         if avoid_items:
             sections.append("")
             sections.append("**Avoid repeating:**")
             for item in avoid_items[:3]:
                 sections.append(f"- {item}")
-
-        if len(sections) <= 2:
-            sections.append(f"_Retry attempt {retry_count} — no structured feedback available._")
 
         # Enforce 300-token budget
         full_text = "\n".join(sections)
@@ -565,6 +692,7 @@ class PromptBuilder:
         code_patterns: list[dict[str, Any]] | None = None,
         learnings: list[dict[str, Any]] | None = None,
         agent_definition: dict[str, Any] | None = None,
+        review_feedback: dict[str, Any] | None = None,
     ) -> str:
         """Render prompt with context compression applied.
 
@@ -623,7 +751,7 @@ class PromptBuilder:
         if patterns_section:
             parts += [patterns_section, ""]
 
-        retry_section = self._format_retry_feedback(task)
+        retry_section = self._format_retry_feedback(task, review_feedback=review_feedback)
         if retry_section:
             parts += [retry_section, ""]
 
@@ -652,6 +780,13 @@ class PromptBuilder:
             "## Acceptance Criteria",
             self._format_acceptance_criteria(task),
             "",
+        ]
+
+        locked_contract_section = self._format_locked_contract(task)
+        if locked_contract_section:
+            parts += [locked_contract_section, ""]
+
+        parts += [
             _COMPACT_REPORT_TEMPLATE.format(
                 build_command=build_command,
                 execute_self_review_hint=self._compaction_hint("execute", "self-review"),
@@ -680,6 +815,7 @@ class PromptBuilder:
         code_patterns: list[dict[str, Any]] | None = None,
         learnings: list[dict[str, Any]] | None = None,
         agent_definition: dict[str, Any] | None = None,
+        review_feedback: dict[str, Any] | None = None,
     ) -> str:
         title = task.get("title", "Untitled")
         priority = task.get("priority", "medium")
@@ -707,7 +843,7 @@ class PromptBuilder:
         if patterns_section:
             parts += ["", patterns_section]
 
-        retry_section = self._format_retry_feedback(task)
+        retry_section = self._format_retry_feedback(task, review_feedback=review_feedback)
         if retry_section:
             parts += [retry_section, ""]
 
@@ -736,6 +872,13 @@ class PromptBuilder:
             "## Acceptance Criteria",
             self._format_acceptance_criteria(task),
             "",
+        ]
+
+        locked_contract_section = self._format_locked_contract(task)
+        if locked_contract_section:
+            parts += [locked_contract_section, ""]
+
+        parts += [
             "## Task Assessment (REQUIRED — output BEFORE implementation)",
             "Assess the task scope before writing any code:",
             "TASK_ASSESSMENT: simple|complex",

@@ -37,10 +37,11 @@ _TERMINAL_STATUSES = {"done", "cancelled", "failed"}
 class CoordinatorService:
     """Manages parent-child task coordination."""
 
-    def __init__(self, task_service, lifecycle_service=None, notifier=None):
+    def __init__(self, task_service, lifecycle_service=None, notifier=None, execution_run_service=None):
         self.task_service = task_service
         self.lifecycle_service = lifecycle_service
         self.notifier = notifier
+        self.execution_run_service = execution_run_service
 
     async def create_coordinator_children(
         self,
@@ -163,12 +164,13 @@ class CoordinatorService:
         if not children:
             return False, {"reason": "no_children"}
 
-        summary = {
+        summary: dict[str, Any] = {
             "total": len(children),
             "done": 0,
             "failed": 0,
             "cancelled": 0,
             "in_progress": 0,
+            "total_cost_usd": 0.0,
         }
 
         for child in children:
@@ -181,6 +183,24 @@ class CoordinatorService:
                 summary["cancelled"] += 1
             elif status not in _TERMINAL_STATUSES:
                 summary["in_progress"] += 1
+
+        # Cost rollup: aggregate child run costs
+        if self.execution_run_service:
+            for child in children:
+                child_id = child.get("id")
+                if not child_id:
+                    continue
+                try:
+                    ok, runs_result = self.execution_run_service.list_runs(
+                        task_id=child_id, limit=50,
+                    )
+                    if ok:
+                        for run in runs_result.get("runs", []):
+                            cost = run.get("cost_usd") or 0.0
+                            summary["total_cost_usd"] += float(cost)
+                except Exception:
+                    pass
+            summary["total_cost_usd"] = round(summary["total_cost_usd"], 4)
 
         all_terminal = summary["in_progress"] == 0
         if not all_terminal:
