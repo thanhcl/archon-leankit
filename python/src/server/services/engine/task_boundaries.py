@@ -37,6 +37,24 @@ def task_has_boundary_rules(task: dict[str, Any]) -> bool:
     )
 
 
+def _matches_any_allowed(path: str, allowed_paths: list[str]) -> bool:
+    """Check whether *path* is permitted by any rule in *allowed_paths*.
+
+    Supports two matching modes:
+    - **Directory prefix**: rules ending with ``/`` match any file under
+      that directory (e.g. ``tests/engine/`` allows ``tests/engine/test_foo.py``).
+    - **Glob pattern**: all other rules are matched via ``fnmatch``.
+    """
+    for rule in allowed_paths:
+        if rule.endswith("/"):
+            if path.startswith(rule) or path == rule.rstrip("/"):
+                return True
+        else:
+            if fnmatch.fnmatch(path, rule) or path == rule:
+                return True
+    return False
+
+
 def validate_task_boundaries(task: dict[str, Any], changed_files: list[str]) -> dict[str, Any]:
     """Validate changed files against configured allowed/forbidden path rules."""
     allowed_paths = normalize_path_rules(task.get("allowed_paths"))
@@ -72,7 +90,7 @@ def validate_task_boundaries(task: dict[str, Any], changed_files: list[str]) -> 
                     "matched_rule": forbidden_rule,
                 })
 
-        if allowed_paths and not any(fnmatch.fnmatch(path, allowed_rule) for allowed_rule in allowed_paths):
+        if allowed_paths and not _matches_any_allowed(path, allowed_paths):
             violations.append({
                 "path": path,
                 "rule_type": "outside-allowed",
