@@ -510,9 +510,34 @@ class CCSpawner:
         # Per-spawn CLAUDE_CONFIG_DIR isolation: create a temporary config
         # directory so concurrent CC processes don't share session state.
         # Adopted from CCS instance-manager pattern.
+        #
+        # IMPORTANT: The temp config dir must inherit auth credentials from
+        # the real config dir (~/.claude or CLAUDE_CONFIG_DIR).  Without this,
+        # CC CLI sees an empty config dir and reports "Not logged in".
+        # We symlink the auth-related files rather than copying secrets.
         config_dir: Path | None = None
         try:
             config_dir = Path(tempfile.mkdtemp(prefix=f"leankit-cc-{task_id[:8]}-"))
+
+            # Inherit auth credentials from the real config directory
+            real_config_dir = Path(_os.environ.get("CLAUDE_CONFIG_DIR", "")) or Path.home() / ".claude"
+            if real_config_dir.is_dir():
+                # Symlink auth-related files so CC CLI can authenticate
+                auth_files = [
+                    ".credentials.json", "credentials.json",
+                    ".oauth_token", "oauth_token",
+                    "settings.json", "settings.local.json",
+                    "statsig", "statsig_metadata",
+                ]
+                for auth_file in auth_files:
+                    src = real_config_dir / auth_file
+                    if src.exists():
+                        dst = config_dir / auth_file
+                        try:
+                            dst.symlink_to(src)
+                        except OSError:
+                            pass  # Non-fatal: some files may not be symlinkable
+
             spawn_env["CLAUDE_CONFIG_DIR"] = str(config_dir)
             logger.debug(f"Per-spawn config dir created | task_id={task_id} | config_dir={config_dir}")
         except OSError as exc:
