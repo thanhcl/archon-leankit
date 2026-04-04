@@ -30,8 +30,17 @@ PATTERN_PROMOTE_CONFIDENCE = 0.9
 PATTERN_PROMOTE_USAGE = 3
 PATTERN_CONFIDENCE_INCREMENT = 0.05
 
-VALID_TYPES = {"error", "correction", "best_practice", "knowledge_gap"}
+VALID_TYPES = {
+    "error", "correction", "best_practice", "knowledge_gap",
+    # GStack-inspired reflection types (adopted 2026-04-04)
+    "pitfall", "operational", "tool", "architecture_insight",
+}
 VALID_AREAS = {"frontend", "backend", "infra", "tests", "config", "security", "database"}
+
+# Confidence decay: observed/inferred learnings lose 1 point per DECAY_PERIOD_DAYS
+DECAY_PERIOD_DAYS = 30
+# Learnings with decayed confidence below this threshold are excluded from injection
+CONFIDENCE_FLOOR = 2
 VALID_CATEGORIES = {"security", "error-handling", "testing", "architecture", "performance", "api-design"}
 
 
@@ -54,6 +63,36 @@ def _code_pattern_key(pattern: dict[str, Any]) -> str:
     language = pattern.get("language", "java")
     name = re.sub(r"[^a-z0-9]+", "-", pattern.get("pattern_name", "").lower().strip())[:60]
     return f"{category}.{language}.{name}".rstrip("-")
+
+
+def _effective_confidence(learning: dict[str, Any], now: datetime | None = None) -> int:
+    """Compute confidence with time decay for observed/inferred learnings.
+
+    Adopted from GStack's operational self-improvement pattern:
+    - observed/inferred sources lose 1 confidence point per 30 days
+    - user_stated learnings never decay (explicit user knowledge)
+    - Floors at 0 (never negative)
+    """
+    now = now or datetime.now()
+    base_confidence = learning.get("confidence", 5)
+    source = learning.get("source", "observed")
+
+    if source == "user_stated":
+        return base_confidence
+
+    created = learning.get("created_at") or learning.get("last_seen")
+    if not created:
+        return base_confidence
+
+    if isinstance(created, str):
+        try:
+            created = datetime.fromisoformat(created.replace("Z", "+00:00")).replace(tzinfo=None)
+        except (ValueError, TypeError):
+            return base_confidence
+
+    age_days = max(0, (now - created).days)
+    decay = age_days // DECAY_PERIOD_DAYS
+    return max(0, base_confidence - decay)
 
 
 def _keyword_overlap(a: str, b: str) -> float:
@@ -124,7 +163,13 @@ class LearningProcessor:
         learning: dict[str, Any],
         execution_run_id: str | None = None,
     ) -> str | None:
-        """Store a new learning."""
+        """Store a new learning.
+
+        Supports extended fields from structured reflection:
+        - confidence (int 1-10): how certain the agent is about this learning
+        - source (str): observed | inferred | user_stated
+        - files (list[str]): file paths referenced by this learning
+        """
         try:
             data = {
                 "project_id": task.get("project_id"),
@@ -138,6 +183,10 @@ class LearningProcessor:
                 "related_tasks": [task["id"]] if task.get("id") else [],
                 "source_run_ids": [execution_run_id] if execution_run_id else [],
                 "status": "pending",
+                # Extended fields from structured reflection
+                "confidence": learning.get("confidence", 5),
+                "source": learning.get("source", "observed"),
+                "files": learning.get("files", []),
             }
 
             resp = self._client.table(TABLE).insert(data).execute()
@@ -601,9 +650,10 @@ class LearningProcessor:
     ) -> list[dict[str, Any]]:
         """Fetch relevant learnings for prompt injection.
 
-        Queries pending/promoted learnings for the project, optionally
-        filtered by keyword overlap with the current task title.
-        Returns top learnings ordered by recurrence_count descending.
+        Queries pending/promoted learnings for the project, applies confidence
+        decay (observed/inferred lose 1 point per 30 days), filters out stale
+        entries below CONFIDENCE_FLOOR, and returns top learnings sorted by
+        effective confidence then recurrence count.
         """
         try:
             query = (
@@ -620,6 +670,17 @@ class LearningProcessor:
             if not results:
                 return []
 
+            now = datetime.now()
+
+            # Apply confidence decay and filter stale learnings
+            alive = []
+            for learning in results:
+                eff_conf = _effective_confidence(learning, now)
+                if eff_conf >= CONFIDENCE_FLOOR:
+                    learning["effective_confidence"] = eff_conf
+                    alive.append(learning)
+            results = alive
+
             # Filter by keyword overlap if task keywords provided
             if task_keywords:
                 task_words = {w.lower() for w in task_keywords if len(w) > 2}
@@ -629,8 +690,15 @@ class LearningProcessor:
                         desc_words = set(_normalize(learning.get("description", "")).split())
                         overlap = len(task_words & desc_words)
                         scored.append((overlap, learning))
-                    # Sort by overlap desc, then by recurrence_count desc
-                    scored.sort(key=lambda x: (x[0], x[1].get("recurrence_count", 0)), reverse=True)
+                    # Sort by overlap desc, then effective confidence, then recurrence
+                    scored.sort(
+                        key=lambda x: (
+                            x[0],
+                            x[1].get("effective_confidence", 5),
+                            x[1].get("recurrence_count", 0),
+                        ),
+                        reverse=True,
+                    )
                     results = [item for _, item in scored]
 
             return results[:limit]

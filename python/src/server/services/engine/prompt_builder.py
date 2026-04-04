@@ -227,25 +227,37 @@ class PromptBuilder:
 
     @staticmethod
     def _format_learnings(learnings: list[dict[str, Any]]) -> str:
-        """Format learnings as compact one-liners with severity icons."""
+        """Format learnings as compact one-liners with severity icons.
+
+        Includes effective confidence and source when available (from
+        structured reflection). Shows recurrence count for recurring patterns.
+        """
         if not learnings:
             return ""
         severity_icons = {
-            "error": "\u274c",           # red X
-            "correction": "\u26a0\ufe0f",  # warning
-            "best_practice": "\u2705",    # check
-            "knowledge_gap": "\U0001f4a1",  # lightbulb
+            "error": "\u274c",              # red X
+            "correction": "\u26a0\ufe0f",     # warning
+            "best_practice": "\u2705",       # check
+            "knowledge_gap": "\U0001f4a1",   # lightbulb
+            # GStack-inspired reflection types
+            "pitfall": "\U0001f6a7",         # construction
+            "operational": "\u2699\ufe0f",    # gear
+            "tool": "\U0001f527",            # wrench
+            "architecture_insight": "\U0001f3d7\ufe0f",  # building construction
         }
-        lines: list[str] = ["## Relevant Learnings from Previous Tasks", ""]
+        lines: list[str] = ["## Relevant Learnings from Previous Runs", ""]
         for learning in learnings:
             ltype = learning.get("type", "knowledge_gap")
             icon = severity_icons.get(ltype, "\U0001f4a1")
             desc = (learning.get("description") or "")[:150]
             area = learning.get("area", "")
             recurrence = learning.get("recurrence_count", 1)
+            eff_conf = learning.get("effective_confidence")
+
             area_tag = f" [{area}]" if area else ""
             recurrence_tag = f" ({recurrence}x)" if recurrence > 1 else ""
-            lines.append(f"- {icon}{area_tag}{recurrence_tag} {desc}")
+            conf_tag = f" conf={eff_conf}/10" if eff_conf is not None else ""
+            lines.append(f"- {icon}{area_tag}{recurrence_tag}{conf_tag} {desc}")
         lines.append("")
         return "\n".join(lines)
 
@@ -911,20 +923,36 @@ class PromptBuilder:
             "",
             self._compaction_hint("self-review", "code-review"),
             "",
-            "## Learnings (REQUIRED in output)",
-            "After completing this task, reflect on what you learned:",
-            "- What errors did you encounter and fix?",
-            "- What patterns did you discover?",
-            "- What knowledge was missing that would have helped?",
-            "- What should future tasks in this area know?",
+            "## Structured Reflection (REQUIRED before reporting completion)",
+            "",
+            "Before reporting results, answer each question. For every YES,",
+            "record a structured learning. Skip questions with no finding.",
+            "",
+            "1. **Unexpected failures:** Did any command, tool call, or API",
+            "   fail unexpectedly? What was the root cause?",
+            "2. **Backtracking:** Did you try an approach that didn't work",
+            "   and had to change direction? What was wrong with the first",
+            "   approach and why did the alternative succeed?",
+            "3. **Project quirks:** Did you discover a project-specific",
+            "   behavior (build order, env vars, timing, auth, config)?",
+            "4. **Time sinks:** Did anything take longer than expected",
+            "   because of a missing flag, config, or undocumented behavior?",
+            "5. **Contract/schema gaps:** Did you hit a runtime mismatch",
+            "   that the type system did not catch? (schema drift, missing",
+            "   field, enum mismatch)",
+            "6. **Guidance gaps:** Was the guidance pack missing, outdated,",
+            "   or incorrect about anything? What should it say instead?",
+            "",
+            "**Quality gate:** Only log findings that would save a future",
+            "run >= 5 minutes. Do not log one-time transient errors or",
+            "obvious things.",
             "",
             "## Code Patterns (REQUIRED in output)",
-            "After completing this task, extract reusable expert-level code patterns:",
+            "Extract reusable expert-level code patterns:",
             "- Patterns that solve common problems elegantly",
             "- Error handling approaches worth standardizing",
             "- Security patterns that should be replicated",
             "- Testing patterns that ensure quality",
-            "- Architecture patterns for similar future tasks",
             "",
             "## Report (REQUIRED — structured output)",
             "SELF_REVIEW: PASS|NEEDS_ATTENTION",
@@ -935,9 +963,12 @@ class PromptBuilder:
             "TESTS_ADDED: {count}",
             "SUMMARY: {description}",
             "LEARNINGS: [",
-            '  {"type":"error|correction|best_practice|knowledge_gap",',
-            '   "description":"concise description",',
+            '  {"type":"error|correction|best_practice|knowledge_gap|pitfall|operational|tool|architecture_insight",',
+            '   "description":"concise one-sentence description",',
             '   "area":"frontend|backend|infra|tests|config|security|database",',
+            '   "confidence": 1-10,',
+            '   "source":"observed|inferred|user_stated",',
+            '   "files":["path/to/relevant/file.py"],',
             '   "suggested_rule":"optional rule for CLAUDE.md"}',
             "]",
             "If no learnings, output: LEARNINGS: []",
@@ -948,7 +979,7 @@ class PromptBuilder:
             '   "code_example":"the actual code (keep concise, 5-30 lines)",',
             '   "context":"when and why to use this pattern",',
             '   "anti_pattern":"what NOT to do instead (optional)",',
-            '   "source_files":["file1.java","file2.java"]}',
+            '   "source_files":["file1.py","file2.py"]}',
             "]",
             "If no patterns, output: CODE_PATTERNS: []",
         ]
