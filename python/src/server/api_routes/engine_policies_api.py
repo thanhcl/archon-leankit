@@ -169,6 +169,7 @@ _VALID_PROFILE_NAMES = {"simple_bugfix", "standard_feature", "complex_architectu
 _VALID_WORKTREE_MODES = {"shared", "isolated", "per-task"}
 _VALID_REVIEW_MODES = {"self-review", "api", "multi-perspective"}
 _VALID_COLLABORATION_MODES = {"auto", "review", "approve"}
+_VALID_REVIEW_PROVIDERS = {"anthropic", "openai", "google"}
 
 
 def _validate_model_routing(model_routing: dict[str, Any]) -> None:
@@ -338,10 +339,39 @@ def _validate_review_policy(review_policy: dict[str, Any]) -> None:
 
     review_mode = review_policy.get("review_mode")
     if review_mode is not None and review_mode not in _VALID_REVIEW_MODES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"review_policy.review_mode must be one of {sorted(_VALID_REVIEW_MODES)}, got '{review_mode}'",
+            )
+
+    provider = review_policy.get("provider")
+    if provider is not None and provider not in _VALID_REVIEW_PROVIDERS:
         raise HTTPException(
             status_code=400,
-            detail=f"review_policy.review_mode must be one of {sorted(_VALID_REVIEW_MODES)}, got '{review_mode}'",
+            detail=f"review_policy.provider must be one of {sorted(_VALID_REVIEW_PROVIDERS)}, got '{provider}'",
         )
+
+    model = review_policy.get("model")
+    if model is not None and (not isinstance(model, str) or not model.strip()):
+        raise HTTPException(status_code=400, detail="review_policy.model must be a non-empty string")
+
+    for field in ("temperature", "confidence_approve_threshold", "confidence_retry_threshold"):
+        value = review_policy.get(field)
+        if value is not None and not isinstance(value, (int, float)):
+            raise HTTPException(status_code=400, detail=f"review_policy.{field} must be a number")
+
+    max_tokens = review_policy.get("max_tokens")
+    if max_tokens is not None and (not isinstance(max_tokens, int) or max_tokens < 1):
+        raise HTTPException(status_code=400, detail="review_policy.max_tokens must be an integer >= 1")
+
+    timeout = review_policy.get("timeout")
+    if timeout is not None and (not isinstance(timeout, int) or timeout < 1):
+        raise HTTPException(status_code=400, detail="review_policy.timeout must be an integer >= 1")
+
+    for field in ("security_override_to_api", "api_fallback_to_self_review", "independent_review_enabled"):
+        value = review_policy.get(field)
+        if value is not None and not isinstance(value, bool):
+            raise HTTPException(status_code=400, detail=f"review_policy.{field} must be a boolean")
 
 
 def _validate_capacity_policy(capacity_policy: dict[str, Any]) -> None:

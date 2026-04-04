@@ -1,6 +1,14 @@
-"""Tests for start_engine runtime configuration resolution."""
+"""Tests for start_engine runtime and review configuration resolution."""
 
-from start_engine import resolve_engine_runtime_config
+import json
+from unittest.mock import MagicMock, patch
+
+from start_engine import (
+    ReviewConfig,
+    _coerce_review_config_payload,
+    fetch_review_config,
+    resolve_engine_runtime_config,
+)
 
 
 def test_resolve_engine_runtime_config_prefers_platform_aliases():
@@ -39,3 +47,45 @@ def test_resolve_engine_runtime_config_falls_back_to_legacy_names():
     assert config["default_max_parallel"] == 5
     assert config["max_parallel_global"] == 12
     assert config["task_timeout"] == 2000
+
+
+def test_coerce_review_config_payload_uses_api_values():
+    config = _coerce_review_config_payload(
+        {
+            "review_mode": "api",
+            "provider": "anthropic",
+            "model": "claude-opus-4-6",
+            "timeout": 90,
+        }
+    )
+
+    assert isinstance(config, ReviewConfig)
+    assert config.review_mode == "api"
+    assert config.provider == "anthropic"
+    assert config.model == "claude-opus-4-6"
+    assert config.timeout == 90
+
+
+def test_fetch_review_config_returns_defaults_on_error():
+    with patch("start_engine.urlopen", side_effect=RuntimeError("boom")):
+        config = fetch_review_config("http://archon")
+
+    assert config == ReviewConfig()
+
+
+def test_fetch_review_config_reads_control_plane_payload():
+    response = MagicMock()
+    response.read.return_value = json.dumps(
+        {
+            "review_mode": "api",
+            "provider": "anthropic",
+            "model": "claude-opus-4-6",
+        }
+    ).encode()
+
+    with patch("start_engine.urlopen", return_value=response):
+        config = fetch_review_config("http://archon")
+
+    assert config.review_mode == "api"
+    assert config.provider == "anthropic"
+    assert config.model == "claude-opus-4-6"

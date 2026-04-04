@@ -26,6 +26,7 @@ from urllib.request import Request, urlopen
 sys.path.insert(0, os.path.dirname(__file__))
 
 from src.server.config.env_aliases import get_control_plane_url, get_env_value
+from src.server.services.engine.architect_reviewer import ReviewConfig
 from src.server.services.engine.capacity_tracker import GlobalCapacityTracker, SharedAgentPool
 from src.server.services.engine.task_engine import TaskEngine
 
@@ -163,6 +164,57 @@ def fetch_agent_pools(archon_api: str) -> dict:
         return {}
 
 
+def _coerce_review_config_payload(payload: object) -> ReviewConfig:
+    """Normalize API payload into a ReviewConfig dataclass."""
+    if not isinstance(payload, dict):
+        return ReviewConfig()
+
+    kwargs: dict[str, object] = {}
+
+    for field_name in ("review_mode", "provider", "model"):
+        value = payload.get(field_name)
+        if isinstance(value, str):
+            kwargs[field_name] = value
+
+    for field_name in ("temperature", "confidence_approve_threshold", "confidence_retry_threshold"):
+        value = payload.get(field_name)
+        if isinstance(value, (int, float)):
+            kwargs[field_name] = float(value)
+
+    for field_name in ("max_tokens", "timeout"):
+        value = payload.get(field_name)
+        if isinstance(value, int) and value > 0:
+            kwargs[field_name] = value
+
+    for field_name in (
+        "security_override_to_api",
+        "api_fallback_to_self_review",
+        "independent_review_enabled",
+    ):
+        value = payload.get(field_name)
+        if isinstance(value, bool):
+            kwargs[field_name] = value
+
+    return ReviewConfig(**kwargs)
+
+
+def fetch_review_config(archon_api: str) -> ReviewConfig:
+    """Fetch global architect-review configuration from the control plane."""
+    try:
+        url = f"{archon_api}/api/engine/review-config"
+        resp = urlopen(Request(url), timeout=5)
+        data = json.loads(resp.read())
+        config = _coerce_review_config_payload(data)
+        print(
+            "[engine] Review config: "
+            f"mode={config.review_mode} provider={config.provider} model={config.model or '<provider-default>'}"
+        )
+        return config
+    except Exception as e:
+        print(f"  [warn] Could not fetch review config, using defaults: {e}")
+        return ReviewConfig()
+
+
 def fetch_project_capacity_policies(archon_api: str, project_ids: list[str]) -> dict[str, dict]:
     """Fetch capacity_policy for each project from its engine policy.
 
@@ -256,6 +308,7 @@ async def main() -> None:
     print(f"[engine] Global parallel limit: {max_parallel_global} | Default per-project: {default_max_parallel}")
 
     global_tracker = GlobalCapacityTracker(max_global=max_parallel_global)
+    review_config = fetch_review_config(archon_api)
 
     # Load shared agent pools from configuration
     pool_configs_data = fetch_agent_pools(archon_api)
@@ -287,6 +340,7 @@ async def main() -> None:
             max_parallel=per_project_limit,
             default_timeout=task_timeout,
             shutdown_grace=60,
+            review_config=review_config,
             global_tracker=global_tracker,
             agent_pool=agent_pool,
         )

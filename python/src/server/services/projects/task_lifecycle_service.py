@@ -173,6 +173,62 @@ class TaskLifecycleService:
             if not is_valid:
                 return False, {"error": error_msg}
 
+            # For contract-managed tasks: enforce locked contract before approved → assigned.
+            # Tasks without current_contract_id are not contract-managed and pass through freely.
+            if current_status == "approved" and new_status == "assigned":
+                contract_id = task.get("current_contract_id")
+                if contract_id:
+                    from .task_service import TaskService
+                    ts = TaskService(self.supabase_client)
+                    ok_c, contract_res = ts.get_contract(contract_id)
+                    if not ok_c:
+                        return False, {
+                            "error": "Current contract not found. Lock the contract before assigning.",
+                            "contract_gate": True,
+                            "contract_id": contract_id,
+                            "contract_status": "missing",
+                            "blocked_transition": "approved → assigned",
+                        }
+                    if not contract_res["contract"].get("locked_at"):
+                        return False, {
+                            "error": (
+                                "Contract must be locked before a contract-managed task can be assigned "
+                                "(approved → assigned)."
+                            ),
+                            "contract_gate": True,
+                            "contract_id": contract_id,
+                            "contract_status": "unlocked",
+                            "blocked_transition": "approved → assigned",
+                        }
+
+            # For contract-managed tasks: enforce locked contract before leaving proposed.
+            # Tasks without current_contract_id are not contract-managed and pass through freely.
+            if current_status == "proposed" and new_status in ("approved", "assigned", "executing"):
+                contract_id = task.get("current_contract_id")
+                if contract_id:
+                    from .task_service import TaskService
+                    ts = TaskService(self.supabase_client)
+                    ok_c, contract_res = ts.get_contract(contract_id)
+                    if not ok_c:
+                        return False, {
+                            "error": "Current contract not found. Lock the contract before proceeding.",
+                            "contract_gate": True,
+                            "contract_id": contract_id,
+                            "contract_status": "missing",
+                            "blocked_transition": f"proposed → {new_status}",
+                        }
+                    if not contract_res["contract"].get("locked_at"):
+                        return False, {
+                            "error": (
+                                "Contract must be locked before a contract-managed task can leave "
+                                f"proposed state (proposed → {new_status})."
+                            ),
+                            "contract_gate": True,
+                            "contract_id": contract_id,
+                            "contract_status": "unlocked",
+                            "blocked_transition": f"proposed → {new_status}",
+                        }
+
             # Build state history entry
             history_entry = {
                 "from_status": current_status,

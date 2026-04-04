@@ -374,6 +374,7 @@ class ExecutionRunResponse(BaseModel):
     model: str | None = None
     retry_index: int = 0
     finished_at: str | None = None
+    heartbeat_at: str | None = None
     duration_seconds: float | None = None
     token_input: int | None = None
     token_output: int | None = None
@@ -957,6 +958,7 @@ class CreateExecutionRunRequest(BaseModel):
     retry_index: int = 0
     started_at: str | None = None
     finished_at: str | None = None
+    heartbeat_at: str | None = None
     duration_seconds: float | None = None
     token_input: int | None = None
     token_output: int | None = None
@@ -981,6 +983,7 @@ class UpdateExecutionRunRequest(BaseModel):
     retry_index: int | None = None
     started_at: str | None = None
     finished_at: str | None = None
+    heartbeat_at: str | None = None
     duration_seconds: float | None = None
     token_input: int | None = None
     token_output: int | None = None
@@ -1776,6 +1779,41 @@ class MigrationHistoryResponse(BaseModel):
     migrations: list[MigrationRecord]
     total_count: int
     current_version: str
+
+
+# ── Review Feedback ─────────────────────────────────────────────────────
+
+
+class ReviewFeedbackFinding(BaseModel):
+    """Per-criterion finding from a review stage."""
+
+    criterion: str
+    score: float = Field(ge=0.0, le=10.0)
+    passed: bool
+    details: str | None = None
+    evidence: str | None = None
+
+
+class ReviewFeedbackResponse(BaseModel):
+    """Structured feedback artifact written after architect-review or code-review rejection."""
+
+    id: str
+    task_id: str
+    run_id: str | None = None
+    contract_revision: int | None = None
+    findings: list[dict[str, Any]] = Field(default_factory=list)
+    overall_score: float | None = None
+    verdict: str
+    suggested_retry_direction: str | None = None
+    reviewer_identity: str
+    created_at: str
+
+
+class ReviewFeedbackListResponse(BaseModel):
+    """Paginated list of review feedback records."""
+
+    feedback: list[ReviewFeedbackResponse] = Field(default_factory=list)
+    total_count: int = 0
 
 
 # ── Validation Helpers ─────────────────────────────────────────────────

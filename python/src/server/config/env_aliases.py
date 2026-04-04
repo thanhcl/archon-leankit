@@ -226,6 +226,24 @@ def get_runner_token_profiles_path(env: Mapping[str, str] | None = None) -> str 
 
 _DEFAULT_RUNNER_ENV_ALLOWLIST = "MAX_THINKING_TOKENS,CLAUDE_AUTOCOMPACT_PCT_OVERRIDE,CLAUDE_CODE_SUBAGENT_MODEL"
 
+# Prefixes stripped from the inherited environment before spawning runner subprocesses.
+# This prevents the engine's own API keys from leaking into runner sessions and is a
+# prerequisite for per-project credential isolation.  Adopted from CCS (Claude Code Switch)
+# environment filtering pattern — see docs/design/what-we-adopt-from-ccs.md.
+_RUNNER_ENV_STRIPPED_PREFIXES = ("ANTHROPIC_", "OPENAI_")
+
+
+def get_runner_env_stripped_prefixes(env: Mapping[str, str] | None = None) -> tuple[str, ...]:
+    """Return the tuple of env var prefixes that must be stripped from inherited env
+    before spawning runner subprocesses.
+
+    Can be overridden via LEANKIT_RUNNER_ENV_STRIPPED_PREFIXES (comma-separated).
+    """
+    value = get_env_value("LEANKIT_RUNNER_ENV_STRIPPED_PREFIXES", env=env)
+    if value is None:
+        return _RUNNER_ENV_STRIPPED_PREFIXES
+    return tuple(item.strip().upper() for item in value.split(",") if item.strip())
+
 
 def get_runner_env_allowlist(env: Mapping[str, str] | None = None) -> list[str]:
     """Resolve the allowlist of env var names that may be injected into runner subprocesses.

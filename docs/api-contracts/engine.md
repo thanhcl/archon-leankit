@@ -132,6 +132,13 @@ Relevant keys for policy normalization:
 Get the current runner capability matrix and default runner baseline used by the
 task engine.
 
+Runtime note:
+
+- `default_runner` is environment-sensitive and reflects any global runner kill
+  switches such as `LEANKIT_ENGINE_DISABLE_CLAUDE_CODE` or
+  `LEANKIT_ENGINE_DISABLE_CODEX`
+- disabled runners are omitted from the `runners` array
+
 ### Response Example
 
 ```json

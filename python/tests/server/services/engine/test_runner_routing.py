@@ -17,6 +17,7 @@ from src.server.services.engine.runner_routing import (
     check_approval_required,
     classify_architect_risk,
     get_runner_capabilities,
+    get_runtime_default_runner_key,
     resolve_collaboration_mode,
     resolve_runner_selection,
     select_token_profile,
@@ -28,6 +29,15 @@ def test_get_runner_capabilities_includes_claude_and_codex():
     runner_keys = {item["runner_key"] for item in capabilities}
     assert DEFAULT_RUNNER_KEY in runner_keys
     assert CODEX_RUNNER_KEY in runner_keys
+
+
+def test_get_runner_capabilities_hides_claude_when_disabled(monkeypatch):
+    monkeypatch.setenv("LEANKIT_ENGINE_DISABLE_CLAUDE_CODE", "true")
+    capabilities = get_runner_capabilities()
+    runner_keys = {item["runner_key"] for item in capabilities}
+    assert DEFAULT_RUNNER_KEY not in runner_keys
+    assert CODEX_RUNNER_KEY in runner_keys
+    assert get_runtime_default_runner_key() == CODEX_RUNNER_KEY
 
 
 def test_explicit_runner_override_wins():
@@ -91,6 +101,28 @@ def test_policy_falls_back_to_default_when_codex_missing():
         default_runner_key=DEFAULT_RUNNER_KEY,
     )
     assert selection.runner_key == DEFAULT_RUNNER_KEY
+
+
+def test_disable_claude_forces_codex_for_high_risk_workload(monkeypatch):
+    monkeypatch.setenv("LEANKIT_ENGINE_DISABLE_CLAUDE_CODE", "true")
+    selection = resolve_runner_selection(
+        {"priority": "critical", "complexity": "complex", "tags": ["security"]},
+        available_runner_keys={DEFAULT_RUNNER_KEY, CODEX_RUNNER_KEY},
+        default_runner_key=CODEX_RUNNER_KEY,
+    )
+    assert selection.runner_key == CODEX_RUNNER_KEY
+    assert selection.reason in {"policy:claude-high-risk", "default:engine-default-runner"}
+
+
+def test_disable_claude_ignores_explicit_claude_override(monkeypatch):
+    monkeypatch.setenv("LEANKIT_ENGINE_DISABLE_CLAUDE_CODE", "true")
+    selection = resolve_runner_selection(
+        {"runner_key": DEFAULT_RUNNER_KEY, "task_type": "feature"},
+        available_runner_keys={DEFAULT_RUNNER_KEY, CODEX_RUNNER_KEY},
+        default_runner_key=CODEX_RUNNER_KEY,
+    )
+    assert selection.runner_key == CODEX_RUNNER_KEY
+    assert selection.source in {"policy", "default"}
 
 
 # ---------------------------------------------------------------------------

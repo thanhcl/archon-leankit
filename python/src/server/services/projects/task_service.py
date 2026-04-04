@@ -331,6 +331,16 @@ class TaskService:
             if response.data:
                 task = response.data[0]
 
+                # Auto-create contract draft for tasks entering proposed status
+                if task_status in ("proposed", "approved"):
+                    try:
+                        self.bootstrap_contract_draft(task)
+                    except Exception as bootstrap_err:
+                        logger.warning(
+                            f"Contract bootstrap failed | task_id={task.get('id')} | error={bootstrap_err}",
+                            exc_info=True,
+                        )
+
                 return True, {
                     "task": {
                         "id": task["id"],
@@ -630,6 +640,300 @@ class TaskService:
         except Exception as e:
             logger.error(f"Error getting task: {e}")
             return False, {"error": f"Error getting task: {str(e)}"}
+
+    # ── Contract CRUD ──────────────────────────────────────────────────
+
+    def get_contract(self, contract_id: str) -> tuple[bool, dict[str, Any]]:
+        """Fetch a task contract record by ID from archon_task_contracts."""
+        try:
+            response = (
+                self.supabase_client.table("archon_task_contracts")
+                .select("*")
+                .eq("id", contract_id)
+                .execute()
+            )
+            if not response.data:
+                return False, {"error": f"Contract {contract_id} not found"}
+            return True, {"contract": response.data[0]}
+        except Exception as e:
+            logger.error(f"Error fetching contract {contract_id}: {e}", exc_info=True)
+            return False, {"error": f"Error fetching contract: {str(e)}"}
+
+    def create_contract(
+        self,
+        task_id: str,
+        objective: str,
+        in_scope_paths: list[str] | None = None,
+        acceptance_criteria: list[dict[str, Any]] | None = None,
+        evidence_requirements: list[dict[str, Any]] | None = None,
+        negotiated_by: str | None = None,
+        source_stage: str | None = None,
+        source_type: str | None = None,
+        negotiation_status: str = "draft",
+    ) -> tuple[bool, dict[str, Any]]:
+        """Create a new contract revision for a task.
+
+        Auto-increments version based on existing contracts.
+        Sets current_contract_id on the task.
+        """
+        try:
+            existing = (
+                self.supabase_client.table("archon_task_contracts")
+                .select("version")
+                .eq("task_id", task_id)
+                .order("version", desc=True)
+                .limit(1)
+                .execute()
+            )
+            next_version = (existing.data[0]["version"] + 1) if existing.data else 1
+
+            contract_data: dict[str, Any] = {
+                "task_id": task_id,
+                "version": next_version,
+                "objective": objective,
+                "in_scope_paths": in_scope_paths or [],
+                "acceptance_criteria": acceptance_criteria or [],
+                "evidence_requirements": evidence_requirements or [],
+                "negotiated_by": negotiated_by,
+                "negotiation_status": negotiation_status,
+                "source_stage": source_stage,
+                "source_type": source_type,
+            }
+
+            response = (
+                self.supabase_client.table("archon_task_contracts")
+                .insert(contract_data)
+                .execute()
+            )
+            if not response.data:
+                return False, {"error": "Failed to create contract"}
+
+            contract = response.data[0]
+
+            # Set as current contract on the task
+            self.supabase_client.table("archon_tasks").update(
+                {"current_contract_id": contract["id"]}
+            ).eq("id", task_id).execute()
+
+            return True, {"contract": contract}
+        except Exception as e:
+            logger.error(f"Error creating contract for task {task_id}: {e}")
+            return False, {"error": f"Error creating contract: {str(e)}"}
+
+    def update_contract(
+        self,
+        contract_id: str,
+        update_fields: dict[str, Any],
+    ) -> tuple[bool, dict[str, Any]]:
+        """Update a draft/negotiating contract. Locked contracts cannot be updated."""
+        try:
+            existing = (
+                self.supabase_client.table("archon_task_contracts")
+                .select("*")
+                .eq("id", contract_id)
+                .execute()
+            )
+            if not existing.data:
+                return False, {"error": f"Contract {contract_id} not found"}
+            if existing.data[0].get("locked_at"):
+                return False, {"error": "Cannot update a locked contract"}
+
+            response = (
+                self.supabase_client.table("archon_task_contracts")
+                .update(update_fields)
+                .eq("id", contract_id)
+                .execute()
+            )
+            if not response.data:
+                return False, {"error": "Failed to update contract"}
+            return True, {"contract": response.data[0]}
+        except Exception as e:
+            logger.error(f"Error updating contract {contract_id}: {e}")
+            return False, {"error": f"Error updating contract: {str(e)}"}
+
+    def lock_contract(self, contract_id: str, locked_by: str | None = None) -> tuple[bool, dict[str, Any]]:
+        """Lock a contract immutably. One active locked revision per task cycle."""
+        try:
+            existing = (
+                self.supabase_client.table("archon_task_contracts")
+                .select("id, task_id, locked_at, negotiation_status")
+                .eq("id", contract_id)
+                .execute()
+            )
+            if not existing.data:
+                return False, {"error": f"Contract {contract_id} not found"}
+            contract = existing.data[0]
+            if contract.get("locked_at"):
+                return False, {"error": "Contract is already locked"}
+
+            from datetime import datetime, timezone
+            now = datetime.now(timezone.utc).isoformat()
+
+            response = (
+                self.supabase_client.table("archon_task_contracts")
+                .update({
+                    "locked_at": now,
+                    "locked_by": locked_by or "system",
+                    "negotiation_status": "locked",
+                })
+                .eq("id", contract_id)
+                .execute()
+            )
+            if not response.data:
+                return False, {"error": "Failed to lock contract"}
+            return True, {"contract": response.data[0]}
+        except Exception as e:
+            logger.error(f"Error locking contract {contract_id}: {e}")
+            return False, {"error": f"Error locking contract: {str(e)}"}
+
+    def supersede_contract(self, contract_id: str) -> tuple[bool, dict[str, Any]]:
+        """Mark a contract as superseded (used when AC change on retry/re-plan)."""
+        try:
+            response = (
+                self.supabase_client.table("archon_task_contracts")
+                .update({"negotiation_status": "superseded"})
+                .eq("id", contract_id)
+                .execute()
+            )
+            if not response.data:
+                return False, {"error": f"Contract {contract_id} not found"}
+            return True, {"contract": response.data[0]}
+        except Exception as e:
+            logger.error(f"Error superseding contract {contract_id}: {e}")
+            return False, {"error": f"Error superseding contract: {str(e)}"}
+
+    def bootstrap_contract_draft(self, task: dict[str, Any]) -> None:
+        """Auto-create a v1 draft contract from task input when no contract exists.
+
+        AC source priority:
+        1. plan_item acceptance criteria (if plan_item_id set)
+        2. task acceptance_criteria field
+        3. structured extraction from task description
+
+        Called when a task is created with status "proposed" or transitions to "proposed".
+        """
+        import re
+
+        task_id = task.get("id")
+        if not task_id:
+            return
+        if task.get("current_contract_id"):
+            return  # already has a contract
+
+        ac_list: list[dict[str, Any]] = []
+        source_type = "description_extraction"
+
+        # Priority 1: plan item acceptance criteria
+        plan_item_id = task.get("plan_item_id")
+        if plan_item_id:
+            try:
+                pi_resp = (
+                    self.supabase_client.table("project_implementation_items")
+                    .select("description")
+                    .eq("id", plan_item_id)
+                    .maybe_single()
+                    .execute()
+                )
+                if pi_resp and pi_resp.data:
+                    desc = pi_resp.data.get("description") or ""
+                    ac_list = self._parse_ac_bullets(desc)
+                    if ac_list:
+                        source_type = "plan_item"
+            except Exception as e:
+                logger.warning(f"Failed to fetch plan item {plan_item_id}: {e}")
+
+        # Priority 2: task acceptance_criteria field
+        if not ac_list:
+            raw_ac = task.get("acceptance_criteria") or []
+            if isinstance(raw_ac, list) and raw_ac:
+                ac_list = [
+                    {"name": str(c.get("name", c.get("description", "")))[:100],
+                     "description": str(c.get("description", c.get("name", "")))}
+                    for c in raw_ac if isinstance(c, dict)
+                ]
+                if ac_list:
+                    source_type = "task_field"
+
+        # Priority 3: extract from description
+        if not ac_list:
+            desc = task.get("description") or ""
+            ac_list = self._parse_ac_bullets(desc)
+
+        objective = (task.get("title") or "Untitled task").strip()
+        in_scope_paths: list[str] = task.get("allowed_paths") or []
+
+        ok, result = self.create_contract(
+            task_id=task_id,
+            objective=objective,
+            in_scope_paths=in_scope_paths,
+            acceptance_criteria=ac_list,
+            negotiated_by="system",
+            source_stage="proposed",
+            source_type=source_type,
+            negotiation_status="draft",
+        )
+        if not ok:
+            logger.warning(f"Contract bootstrap failed | task_id={task_id} | error={result.get('error')}")
+            return
+
+        contract = result["contract"]
+        contract_id = contract["id"]
+        logger.info(f"Contract draft auto-created | task_id={task_id} | source={source_type}")
+
+        # Immediately negotiate (adversarial enrichment) and lock the contract
+        # so the lifecycle gate allows proposed → approved without chicken-and-egg.
+        # This replaces the _stage_contract_negotiation pipeline stage for the
+        # initial contract — the pipeline stage still runs but skips already-locked
+        # contracts (idempotent).
+        try:
+            from ..engine.review_prompts import enrich_contract_adversarially
+            proposed_criteria = [
+                {
+                    "criterion": c.get("description") or c.get("name") or "",
+                    "threshold": c.get("threshold") or "",
+                    "category": c.get("category") or "functional",
+                }
+                for c in ac_list
+                if c.get("description") or c.get("name")
+            ]
+            enriched = enrich_contract_adversarially(task, proposed_criteria)
+            db_enriched = [
+                {
+                    "name": c.get("criterion", "")[:100],
+                    "description": c.get("criterion", ""),
+                    "threshold": c.get("threshold") or "",
+                    "category": c.get("category", "functional"),
+                    "added_by": c.get("added_by"),
+                }
+                for c in enriched
+            ]
+            self.update_contract(contract_id, {
+                "acceptance_criteria": db_enriched,
+                "negotiation_status": "negotiated",
+                "source_stage": "pre-execute",
+                "negotiated_by": "system",
+            })
+            self.lock_contract(contract_id, locked_by="system")
+            added = len(enriched) - len(proposed_criteria)
+            logger.info(
+                f"Contract negotiated+locked at bootstrap | task_id={task_id} | "
+                f"criteria={len(enriched)} | added={added}"
+            )
+        except Exception as neg_err:
+            logger.warning(
+                f"Contract negotiate+lock failed at bootstrap | task_id={task_id} | error={neg_err}",
+                exc_info=True,
+            )
+
+    @staticmethod
+    def _parse_ac_bullets(text: str) -> list[dict[str, Any]]:
+        """Extract bullet-point acceptance criteria from markdown text."""
+        import re
+        bullets = re.findall(r"^[\s]*[-*]\s+(.+)$", text, re.MULTILINE)
+        return [
+            {"name": b.strip()[:100], "description": b.strip()}
+            for b in bullets if len(b.strip()) > 5
+        ]
 
     def submit_feedback(
         self,

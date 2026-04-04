@@ -4,7 +4,7 @@ Uses a lightweight FastAPI app with only the engine router to avoid
 importing the full server (which needs crawl4ai and other heavy deps).
 """
 
-from datetime import UTC
+from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -156,6 +156,18 @@ class TestReviewConfig:
         assert data["independent_review_enabled"] is True
         assert data["confidence_approve_threshold"] == 0.8
 
+    def test_get_parses_json_string_payload(self, engine_client):
+        stored = '{"review_mode":"api","provider":"anthropic","model":"claude-opus-4-6"}'
+        with patch("src.server.api_routes.engine_api.credential_service") as mock_cred:
+            mock_cred.get_credential = AsyncMock(return_value=stored)
+            resp = engine_client.get("/api/engine/review-config")
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["review_mode"] == "api"
+        assert data["provider"] == "anthropic"
+        assert data["model"] == "claude-opus-4-6"
+
     def test_update_independent_review_toggle(self, engine_client):
         with patch("src.server.api_routes.engine_api.credential_service") as mock_cred:
             mock_cred.get_credential = AsyncMock(return_value=None)
@@ -213,6 +225,17 @@ class TestConcurrencyConfig:
         assert "max_parallel_default" in data
         assert "max_parallel_global" in data
 
+    def test_get_parses_json_string_payload(self, engine_client):
+        stored = '{"max_parallel_default":5,"max_parallel_global":12}'
+        with patch("src.server.api_routes.engine_api.credential_service") as mock_cred:
+            mock_cred.get_credential = AsyncMock(return_value=stored)
+            resp = engine_client.get("/api/engine/concurrency-config")
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["max_parallel_default"] == 5
+        assert data["max_parallel_global"] == 12
+
     def test_update_valid(self, engine_client):
         with patch("src.server.api_routes.engine_api.credential_service") as mock_cred:
             mock_cred.get_credential = AsyncMock(return_value=None)
@@ -267,6 +290,17 @@ class TestRunnerCapabilities:
         assert data["default_runner"] == "claude-code-cli"
         runner_keys = {runner["runner_key"] for runner in data["runners"]}
         assert "claude-code-cli" in runner_keys
+        assert "codex-cli" in runner_keys
+
+    def test_hides_claude_and_switches_default_when_claude_disabled(self, engine_client):
+        with patch.dict("os.environ", {"LEANKIT_ENGINE_DISABLE_CLAUDE_CODE": "true"}, clear=False):
+            resp = engine_client.get("/api/engine/runner-capabilities")
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["default_runner"] == "codex-cli"
+        runner_keys = {runner["runner_key"] for runner in data["runners"]}
+        assert "claude-code-cli" not in runner_keys
         assert "codex-cli" in runner_keys
 
 
@@ -380,6 +414,37 @@ class TestEngineHealth:
         mock_run_svc.list_runs.return_value = (True, {
             "runs": [{"id": "run-fresh-1", "started_at": fresh_started}]
         })
+
+        with patch("src.server.api_routes.engine_api.TaskService", return_value=mock_task_svc), \
+             patch("src.server.api_routes.engine_api.ProjectService", return_value=mock_project_svc), \
+             patch("src.server.api_routes.engine_api.CostBudgetService", return_value=mock_budget_svc), \
+             patch("src.server.api_routes.engine_api.ExecutionRunService", return_value=mock_run_svc), \
+             patch("src.server.api_routes.engine_api.credential_service") as mock_cred:
+            mock_cred.get_credential = AsyncMock(return_value=None)
+            resp = engine_client.get("/api/engine/health")
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["pid_watchdog"]["status"] == "ok"
+        assert data["pid_watchdog"]["orphaned_run_ids"] == []
+
+    def test_health_prefers_heartbeat_over_started_at_for_orphan_detection(self, engine_client):
+        mock_task_svc, mock_project_svc, mock_budget_svc, mock_run_svc = self._make_mocks(
+            executing_tasks=[{"id": "t1", "project_id": "proj-1"}],
+        )
+        fresh_heartbeat = datetime.now(UTC).isoformat()
+        mock_run_svc.list_runs.return_value = (
+            True,
+            {
+                "runs": [
+                    {
+                        "id": "run-fresh-heartbeat",
+                        "started_at": "2020-01-01T00:00:00Z",
+                        "heartbeat_at": fresh_heartbeat,
+                    }
+                ]
+            },
+        )
 
         with patch("src.server.api_routes.engine_api.TaskService", return_value=mock_task_svc), \
              patch("src.server.api_routes.engine_api.ProjectService", return_value=mock_project_svc), \

@@ -94,7 +94,7 @@ class TestPidWatchdog:
         engine._execution_tasks = {"task-001": running_task}
         try:
             await engine._check_pid_liveness()
-            engine.execution_run_service.list_runs.assert_not_called()
+            engine.execution_run_service.update_run.assert_not_called()
         finally:
             running_task.cancel()
             try:
@@ -222,6 +222,70 @@ class TestPidWatchdog:
                 await running_task
             except asyncio.CancelledError:
                 pass
+
+    @pytest.mark.asyncio
+    async def test_watchdog_resolves_dead_process_from_codex_runner(self):
+        """The watchdog must inspect the actual runner adapter, not just the legacy default spawner."""
+        engine = _setup_engine()
+        engine.spawner.get_process.return_value = None
+
+        codex_runner = MagicMock()
+        mock_process = MagicMock()
+        mock_process.returncode = 137
+        mock_process.pid = 777
+        codex_runner.get_process = MagicMock(return_value=mock_process)
+        engine.runner_adapters["codex-cli"] = codex_runner
+
+        hang_event = asyncio.Event()
+
+        async def hanging_task():
+            await hang_event.wait()
+
+        exec_task = asyncio.create_task(hanging_task())
+        engine._execution_tasks = {"task-001": exec_task}
+        engine.execution_run_service.list_runs.return_value = (
+            True,
+            {"runs": [{"id": "run-001"}]},
+        )
+
+        await engine._check_pid_liveness()
+
+        assert "task-001" not in engine._execution_tasks
+        engine.execution_run_service.update_run.assert_called()
+        hang_event.set()
+        try:
+            await exec_task
+        except (asyncio.CancelledError, Exception):
+            pass
+
+    @pytest.mark.asyncio
+    async def test_watchdog_reconciles_stale_untracked_execute_run(self):
+        """Running execute runs that fall out of local tracking must still be force-failed."""
+        engine = _setup_engine(default_timeout=300)
+        engine.project_id = "proj-001"
+        stale_heartbeat = (datetime.now() - timedelta(minutes=10)).isoformat() + "Z"
+        engine.execution_run_service.list_runs.return_value = (
+            True,
+            {
+                "runs": [
+                    {
+                        "id": "run-orphan",
+                        "task_id": "task-001",
+                        "stage": "execute",
+                        "status": "running",
+                        "heartbeat_at": stale_heartbeat,
+                        "started_at": stale_heartbeat,
+                    }
+                ]
+            },
+        )
+
+        await engine._check_pid_liveness()
+
+        engine.execution_run_service.update_run.assert_called()
+        update_call = engine.execution_run_service.update_run.call_args
+        assert update_call[0][0] == "run-orphan"
+        assert update_call[0][1]["status"] == "failed"
 
 
 class TestStartupOrphanRecovery:

@@ -79,6 +79,31 @@ class TestCreateRun:
         assert ok is False
         assert "Invalid execution run status" in result["error"]
 
+    @pytest.mark.asyncio
+    async def test_creates_run_with_metadata_heartbeat_fallback_when_column_missing(self):
+        client = _mock_client(insert_data=[_make_run(metadata={"heartbeat_at": "2026-03-20T00:00:00Z"})])
+        insert = client.table.return_value.insert
+        first_response = MagicMock()
+        first_response.execute.side_effect = Exception(
+            "{'code': 'PGRST204', 'message': \"Could not find the 'heartbeat_at' column of 'archon_execution_runs' in the schema cache\"}"
+        )
+        second_response = MagicMock()
+        second_execute = MagicMock()
+        second_execute.data = [_make_run(metadata={"heartbeat_at": "2026-03-20T00:00:00Z"})]
+        second_response.execute.return_value = second_execute
+        insert.side_effect = [first_response, second_response]
+
+        service = ExecutionRunService(supabase_client=client)
+        ok, result = await service.create_run(
+            task_id="task-001",
+            project_id="proj-001",
+            started_at="2026-03-20T00:00:00Z",
+            heartbeat_at="2026-03-20T00:00:00Z",
+        )
+
+        assert ok is True
+        assert result["run"]["heartbeat_at"] == "2026-03-20T00:00:00Z"
+
 
 class TestListRuns:
     def test_lists_runs(self):
@@ -167,6 +192,22 @@ class TestUpdateRun:
         assert update_payload["thinking_tokens"] == 1200
         assert update_payload["cost_usd"] == 0.0450
 
+    @pytest.mark.asyncio
+    async def test_updates_run_heartbeat(self):
+        updated_run = _make_run(
+            status="running",
+            heartbeat_at="2026-03-20T00:15:00Z",
+        )
+        client = _mock_client(update_data=[updated_run])
+        service = ExecutionRunService(supabase_client=client)
+
+        ok, result = await service.update_run("run-001", {"heartbeat_at": "2026-03-20T00:15:00Z"})
+
+        assert ok is True
+        assert result["run"]["heartbeat_at"] == "2026-03-20T00:15:00Z"
+        update_payload = client.table.return_value.update.call_args[0][0]
+        assert update_payload["heartbeat_at"] == "2026-03-20T00:15:00Z"
+
 
 class TestCreateRunWithLLMMetrics:
     @pytest.mark.asyncio
@@ -212,3 +253,14 @@ class TestCreateRunWithLLMMetrics:
         insert_payload = client.table.return_value.insert.call_args[0][0]
         assert "total_tokens" not in insert_payload
         assert "thinking_tokens" not in insert_payload
+
+    @pytest.mark.asyncio
+    async def test_creates_run_with_heartbeat_defaults_to_started_at(self):
+        client = _mock_client(insert_data=[_make_run(heartbeat_at="2026-03-20T00:00:00Z")])
+        service = ExecutionRunService(supabase_client=client)
+
+        await service.create_run(task_id="task-001", project_id="proj-001", started_at="2026-03-20T00:00:00Z")
+
+        insert_payload = client.table.return_value.insert.call_args[0][0]
+        assert insert_payload["started_at"] == "2026-03-20T00:00:00Z"
+        assert insert_payload["heartbeat_at"] == "2026-03-20T00:00:00Z"

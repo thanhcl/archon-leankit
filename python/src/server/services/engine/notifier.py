@@ -112,6 +112,8 @@ EVENT_EXTERNAL_REQUEST_CREATED = "external_request_created"
 EVENT_EXTERNAL_REQUEST_MATERIALIZED = "external_request_materialized"
 EVENT_APPROVAL_REQUESTED = "approval_requested"
 EVENT_APPROVAL_DECIDED = "approval_decided"
+EVENT_TASK_CONTRACT_GATE_BLOCKED = "task_contract_gate_blocked"
+EVENT_REVIEW_FEEDBACK_WRITTEN = "review_feedback_written"
 
 _CRITICAL_EVENTS = frozenset({
     EVENT_TASK_ESCALATED,
@@ -477,6 +479,20 @@ class Notifier:
                 "actor_display": approval.get("actor_display"),
             },
             is_critical=True,
+        )
+
+    async def on_review_feedback_written(self, task_id: str, payload: dict[str, Any]) -> None:
+        """Emit when review feedback is persisted to archon_review_feedback."""
+        await self.emit(
+            EVENT_REVIEW_FEEDBACK_WRITTEN,
+            task_id,
+            {
+                "verdict": payload.get("verdict"),
+                "reviewer_identity": payload.get("reviewer_identity"),
+                "overall_score": payload.get("overall_score"),
+                "stage": payload.get("stage"),
+                "contract_revision": payload.get("contract_revision"),
+            },
         )
 
     async def on_approval_decided(self, approval: dict[str, Any], decision: str) -> None:

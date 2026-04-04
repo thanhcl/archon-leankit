@@ -966,16 +966,20 @@ async def get_task_subtasks(task_id: str):
 
 @router.put("/tasks/{task_id}")
 async def update_task(task_id: str, request: UpdateTaskRequest):
-    """Update a task."""
+    """Update a task. Status changes must use POST /api/tasks/{task_id}/transition."""
     try:
+        if request.status is not None:
+            raise HTTPException(
+                status_code=422,
+                detail="Use POST /api/tasks/{task_id}/transition to change task status.",
+            )
+
         # Build update fields dictionary
         update_fields = {}
         if request.title is not None:
             update_fields["title"] = request.title
         if request.description is not None:
             update_fields["description"] = request.description
-        if request.status is not None:
-            update_fields["status"] = request.status
         if request.assignee is not None:
             update_fields["assignee"] = request.assignee
         if request.task_order is not None:

@@ -24,6 +24,32 @@ class ExecutionRunService:
     def __init__(self, supabase_client=None):
         self.supabase_client = supabase_client or get_supabase_client()
 
+    @staticmethod
+    def _is_missing_heartbeat_column_error(error: Exception | str) -> bool:
+        message = str(error)
+        return "heartbeat_at" in message and "archon_execution_runs" in message
+
+    @staticmethod
+    def _normalize_run_record(run: dict[str, Any]) -> dict[str, Any]:
+        normalized = dict(run)
+        if normalized.get("heartbeat_at") is None:
+            metadata = normalized.get("metadata")
+            if isinstance(metadata, dict):
+                fallback = metadata.get("heartbeat_at")
+                if isinstance(fallback, str) and fallback.strip():
+                    normalized["heartbeat_at"] = fallback
+        return normalized
+
+    def _merge_metadata_heartbeat(
+        self,
+        metadata: dict[str, Any] | None,
+        heartbeat_at: str | None,
+    ) -> dict[str, Any]:
+        merged = dict(metadata or {})
+        if heartbeat_at:
+            merged["heartbeat_at"] = heartbeat_at
+        return merged
+
     def validate_status(self, status: str) -> tuple[bool, str]:
         if status not in self.VALID_STATUSES:
             return (
@@ -52,6 +78,7 @@ class ExecutionRunService:
         retry_index: int = 0,
         started_at: str | None = None,
         finished_at: str | None = None,
+        heartbeat_at: str | None = None,
         duration_seconds: float | None = None,
         token_input: int | None = None,
         token_output: int | None = None,
@@ -86,6 +113,7 @@ class ExecutionRunService:
                 "stage": stage,
                 "retry_index": retry_index,
                 "started_at": started_at or now,
+                "heartbeat_at": heartbeat_at or started_at or now,
                 "metadata": metadata or {},
                 "created_at": now,
                 "updated_at": now,
@@ -110,10 +138,21 @@ class ExecutionRunService:
                 if value is not None:
                     run_data[key] = value
 
-            response = self.supabase_client.table("archon_execution_runs").insert(run_data).execute()
+            try:
+                response = self.supabase_client.table("archon_execution_runs").insert(run_data).execute()
+            except Exception as e:
+                if not self._is_missing_heartbeat_column_error(e):
+                    raise
+                fallback_data = dict(run_data)
+                heartbeat_value = fallback_data.pop("heartbeat_at", None)
+                fallback_data["metadata"] = self._merge_metadata_heartbeat(
+                    fallback_data.get("metadata"),
+                    heartbeat_value,
+                )
+                response = self.supabase_client.table("archon_execution_runs").insert(fallback_data).execute()
 
             if response.data:
-                return True, {"run": response.data[0]}
+                return True, {"run": self._normalize_run_record(response.data[0])}
 
             return False, {"error": "Failed to create execution run"}
         except Exception as e:
@@ -130,7 +169,7 @@ class ExecutionRunService:
                 .execute()
             )
             if response.data:
-                return True, {"run": response.data[0]}
+                return True, {"run": self._normalize_run_record(response.data[0])}
             return False, {"error": f"Execution run {run_id} not found"}
         except Exception as e:
             logger.error(f"Error fetching execution run {run_id}: {e}", exc_info=True)
@@ -172,7 +211,7 @@ class ExecutionRunService:
                 filters_applied.append(f"stage={stage}")
 
             response = query.order("started_at", desc=True).limit(limit).execute()
-            runs = response.data or []
+            runs = [self._normalize_run_record(run) for run in (response.data or [])]
             if bootstrap_plan_id:
                 runs = [run for run in runs if self._matches_bootstrap_plan_id(run, bootstrap_plan_id)]
             return True, {
@@ -218,15 +257,34 @@ class ExecutionRunService:
             update_payload = dict(update_fields)
             update_payload["updated_at"] = datetime.now().isoformat()
 
-            response = (
-                self.supabase_client.table("archon_execution_runs")
-                .update(update_payload)
-                .eq("id", run_id)
-                .execute()
-            )
+            try:
+                response = (
+                    self.supabase_client.table("archon_execution_runs")
+                    .update(update_payload)
+                    .eq("id", run_id)
+                    .execute()
+                )
+            except Exception as e:
+                if not self._is_missing_heartbeat_column_error(e):
+                    raise
+                heartbeat_value = update_payload.pop("heartbeat_at", None)
+                ok_existing, existing = self.get_run(run_id)
+                existing_metadata = {}
+                if ok_existing:
+                    current_run = existing.get("run") or {}
+                    metadata = current_run.get("metadata")
+                    if isinstance(metadata, dict):
+                        existing_metadata = metadata
+                update_payload["metadata"] = self._merge_metadata_heartbeat(existing_metadata, heartbeat_value)
+                response = (
+                    self.supabase_client.table("archon_execution_runs")
+                    .update(update_payload)
+                    .eq("id", run_id)
+                    .execute()
+                )
 
             if response.data:
-                return True, {"run": response.data[0]}
+                return True, {"run": self._normalize_run_record(response.data[0])}
             return False, {"error": f"Execution run {run_id} not found"}
         except Exception as e:
             logger.error(f"Error updating execution run {run_id}: {e}", exc_info=True)

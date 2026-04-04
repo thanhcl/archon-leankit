@@ -11,6 +11,9 @@ from src.server.services.projects.task_lifecycle_service import (
     TaskLifecycleService,
 )
 
+# Patch target for TaskService used inside execute_transition's lazy import
+_TS_PATCH = "src.server.services.projects.task_service.TaskService"
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -244,6 +247,84 @@ class TestOnHoldFromAllActiveStates:
         is_valid, error = service.validate_transition(state, "on-hold", reason=None)
         assert is_valid is False, f"Transition {state} → on-hold without reason should fail"
         assert "requires a reason" in error
+
+
+# ---------------------------------------------------------------------------
+# Tests: contract gate on approved → assigned
+# ---------------------------------------------------------------------------
+
+
+class TestContractGateOnApprovedToAssigned:
+    """approved → assigned must be blocked when the contract is not locked."""
+
+    @pytest.mark.asyncio
+    async def test_passes_when_no_contract(self):
+        """Task without a contract passes the gate (not contract-managed)."""
+        task = _make_task(status="approved", current_contract_id=None)
+        updated_task = _make_task(status="assigned")
+        client = _mock_client(select_data=[task], update_data=[updated_task])
+        service = TaskLifecycleService(supabase_client=client)
+
+        ok, result = await service.execute_transition("task-001", "assigned", changed_by="task-engine")
+
+        assert ok is True
+
+    @pytest.mark.asyncio
+    async def test_blocked_when_contract_unlocked(self):
+        """Task with an unlocked contract must be blocked at approved → assigned."""
+        from unittest.mock import patch
+
+        task = _make_task(status="approved", current_contract_id="contract-001")
+        client = _mock_client(select_data=[task])
+        service = TaskLifecycleService(supabase_client=client)
+
+        unlocked_contract = {"id": "contract-001", "locked_at": None}
+        with patch(
+            _TS_PATCH
+        ) as MockTS:
+            MockTS.return_value.get_contract.return_value = (True, {"contract": unlocked_contract})
+            ok, result = await service.execute_transition("task-001", "assigned", changed_by="task-engine")
+
+        assert ok is False
+        assert result.get("contract_gate") is True
+        assert result.get("contract_id") == "contract-001"
+        assert result.get("contract_status") == "unlocked"
+        assert result.get("blocked_transition") == "approved → assigned"
+        assert "locked" in result["error"].lower()
+
+    @pytest.mark.asyncio
+    async def test_blocked_when_contract_missing(self):
+        """Task referencing a missing contract must be blocked."""
+        from unittest.mock import patch
+
+        task = _make_task(status="approved", current_contract_id="contract-999")
+        client = _mock_client(select_data=[task])
+        service = TaskLifecycleService(supabase_client=client)
+
+        with patch(_TS_PATCH) as MockTS:
+            MockTS.return_value.get_contract.return_value = (False, {"error": "not found"})
+            ok, result = await service.execute_transition("task-001", "assigned", changed_by="task-engine")
+
+        assert ok is False
+        assert result.get("contract_gate") is True
+        assert result.get("contract_status") == "missing"
+
+    @pytest.mark.asyncio
+    async def test_passes_when_contract_locked(self):
+        """Task with a locked contract proceeds normally."""
+        from unittest.mock import patch
+
+        task = _make_task(status="approved", current_contract_id="contract-001")
+        updated_task = _make_task(status="assigned")
+        client = _mock_client(select_data=[task], update_data=[updated_task])
+        service = TaskLifecycleService(supabase_client=client)
+
+        locked_contract = {"id": "contract-001", "locked_at": "2026-01-01T00:00:00"}
+        with patch(_TS_PATCH) as MockTS:
+            MockTS.return_value.get_contract.return_value = (True, {"contract": locked_contract})
+            ok, result = await service.execute_transition("task-001", "assigned", changed_by="task-engine")
+
+        assert ok is True
 
 
 class TestOnHoldResume:
@@ -592,3 +673,137 @@ class TestContinueAfterClarification:
         )
 
         assert ok is True, f"continue should succeed from state '{state}'"
+
+
+# ---------------------------------------------------------------------------
+# Tests: H2-1 — contract gate only fires for contract-managed tasks
+# ---------------------------------------------------------------------------
+
+
+def _make_contract_service_mock(locked: bool | None, found: bool = True):
+    """Return a mock TaskService whose get_contract behaves as specified."""
+    ts_mock = MagicMock()
+    if not found:
+        ts_mock.get_contract.return_value = (False, {"error": "not found"})
+    else:
+        contract_data: dict = {"id": "contract-001"}
+        if locked:
+            contract_data["locked_at"] = "2026-01-01T00:00:00"
+        else:
+            contract_data["locked_at"] = None
+        ts_mock.get_contract.return_value = (True, {"contract": contract_data})
+    return ts_mock
+
+
+class TestContractGateProposedToApproved:
+    """H2-1: contract lock gate must only apply to contract-managed tasks."""
+
+    @pytest.mark.asyncio
+    async def test_no_contract_id_allows_proposed_to_approved(self):
+        """Tasks without current_contract_id must pass proposed → approved freely."""
+        task = _make_task(status="proposed")  # no current_contract_id
+        updated_task = _make_task(status="approved")
+        client = _mock_client(select_data=[task], update_data=[updated_task])
+        service = TaskLifecycleService(supabase_client=client)
+
+        ok, result = await service.execute_transition(
+            "task-001", "approved", changed_by="Owner"
+        )
+
+        assert ok is True, f"Non-contract task must be allowed through; got: {result}"
+        assert result["transition"]["to"] == "approved"
+
+    @pytest.mark.asyncio
+    async def test_contract_locked_allows_proposed_to_approved(self):
+        """Contract-managed task with a locked contract must pass proposed → approved."""
+        import unittest.mock as um
+
+        task = _make_task(status="proposed", current_contract_id="contract-001")
+        updated_task = _make_task(status="approved")
+        client = _mock_client(select_data=[task], update_data=[updated_task])
+        service = TaskLifecycleService(supabase_client=client)
+
+        ts_mock = _make_contract_service_mock(locked=True)
+        with um.patch(_TS_PATCH, return_value=ts_mock):
+            ok, result = await service.execute_transition(
+                "task-001", "approved", changed_by="Owner"
+            )
+
+        assert ok is True, f"Locked-contract task must proceed; got: {result}"
+        assert result["transition"]["to"] == "approved"
+
+    @pytest.mark.asyncio
+    async def test_contract_unlocked_blocks_proposed_to_approved(self):
+        """Contract-managed task with unlocked contract must be blocked from proposed → approved."""
+        import unittest.mock as um
+
+        task = _make_task(status="proposed", current_contract_id="contract-001")
+        client = _mock_client(select_data=[task])
+        service = TaskLifecycleService(supabase_client=client)
+
+        ts_mock = _make_contract_service_mock(locked=False)
+        with um.patch(_TS_PATCH, return_value=ts_mock):
+            ok, result = await service.execute_transition(
+                "task-001", "approved", changed_by="Owner"
+            )
+
+        assert ok is False
+        assert "contract-managed" in result["error"]
+        assert "locked" in result["error"].lower()
+
+    @pytest.mark.asyncio
+    async def test_contract_not_found_blocks_proposed_to_approved(self):
+        """Missing contract record must block proposed → approved for contract-managed tasks."""
+        import unittest.mock as um
+
+        task = _make_task(status="proposed", current_contract_id="contract-999")
+        client = _mock_client(select_data=[task])
+        service = TaskLifecycleService(supabase_client=client)
+
+        ts_mock = _make_contract_service_mock(locked=False, found=False)
+        with um.patch(_TS_PATCH, return_value=ts_mock):
+            ok, result = await service.execute_transition(
+                "task-001", "approved", changed_by="Owner"
+            )
+
+        assert ok is False
+        assert "not found" in result["error"].lower()
+
+    @pytest.mark.asyncio
+    async def test_contract_unlocked_blocks_proposed_to_assigned(self):
+        """Unlocked contract blocks proposed → assigned (gate applies to assigned target too)."""
+        import unittest.mock as um
+
+        task = _make_task(status="proposed", current_contract_id="contract-001")
+        client = _mock_client(select_data=[task])
+        service = TaskLifecycleService(supabase_client=client)
+
+        ts_mock = _make_contract_service_mock(locked=False)
+        with um.patch.object(
+            service, "validate_transition", return_value=(True, "")
+        ), um.patch(_TS_PATCH, return_value=ts_mock):
+            ok, result = await service.execute_transition(
+                "task-001", "assigned", changed_by="Owner"
+            )
+
+        assert ok is False
+        assert "contract-managed" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_error_message_is_deterministic(self):
+        """Rejection message must include both source and target status names."""
+        import unittest.mock as um
+
+        task = _make_task(status="proposed", current_contract_id="contract-001")
+        client = _mock_client(select_data=[task])
+        service = TaskLifecycleService(supabase_client=client)
+
+        ts_mock = _make_contract_service_mock(locked=False)
+        with um.patch(_TS_PATCH, return_value=ts_mock):
+            ok, result = await service.execute_transition(
+                "task-001", "approved", changed_by="Owner"
+            )
+
+        assert ok is False
+        assert "approved" in result["error"]
+        assert "proposed" in result["error"]

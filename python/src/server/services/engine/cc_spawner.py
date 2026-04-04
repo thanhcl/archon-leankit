@@ -12,13 +12,17 @@ Usage:
 
 import asyncio
 import json
+import os as _os
 import re
+import shutil
+import tempfile
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
-from ...config.env_aliases import get_runner_env_allowlist
+from ...config.env_aliases import get_runner_env_allowlist, get_runner_env_stripped_prefixes
 from ...config.logfire_config import get_logger
 from .run_workspace import RunWorkspaceContext
 from .sandbox_provider import GitWorktreeProvider, SandboxContext, get_provider_for_isolation
@@ -452,14 +456,35 @@ class CCSpawner:
 
         start_time = time.time()
 
-        # Build subprocess environment with allowlist filtering and optional token profile injection
-        import os as _os
+        # Build subprocess environment with:
+        #  1. Inherited env stripped of ANTHROPIC_*/OPENAI_* prefixes (CCS adoption)
+        #  2. Explicit re-injection of the intended API key
+        #  3. Allowlist-filtered token profile vars
+        #  4. Per-spawn CLAUDE_CONFIG_DIR isolation (CCS adoption)
         allowlist = set(get_runner_env_allowlist())
+        stripped_prefixes = get_runner_env_stripped_prefixes()
+
         base_env = dict(_os.environ)
 
-        # Filter inherited env to only allowlisted keys; always pass through non-sensitive system vars
-        # by keeping the full env but then separately injecting only allowlisted custom vars.
-        # The allowlist applies to explicitly injected vars, not the inherited system environment.
+        # Strip inherited keys that match stripped prefixes to prevent engine
+        # credentials from leaking into runner sessions.
+        stripped_keys: list[str] = []
+        for key in list(base_env.keys()):
+            if any(key.startswith(prefix) for prefix in stripped_prefixes):
+                stripped_keys.append(key)
+                del base_env[key]
+
+        # Re-inject the API key explicitly so runners can authenticate.
+        # This makes the injection path explicit rather than implicitly inherited.
+        api_key = _os.environ.get("ANTHROPIC_API_KEY")
+        if api_key:
+            base_env["ANTHROPIC_API_KEY"] = api_key
+
+        if stripped_keys:
+            logger.debug(
+                f"Runner env stripped | task_id={task_id} | stripped={sorted(stripped_keys)}"
+            )
+
         spawn_env = base_env
         injected_env_keys: list[str] = []
 
@@ -481,6 +506,17 @@ class CCSpawner:
                         f"Runner env var blocked by allowlist | key={key} | task_id={task_id} | "
                         f"allowlist={sorted(allowlist)}"
                     )
+
+        # Per-spawn CLAUDE_CONFIG_DIR isolation: create a temporary config
+        # directory so concurrent CC processes don't share session state.
+        # Adopted from CCS instance-manager pattern.
+        config_dir: Path | None = None
+        try:
+            config_dir = Path(tempfile.mkdtemp(prefix=f"leankit-cc-{task_id[:8]}-"))
+            spawn_env["CLAUDE_CONFIG_DIR"] = str(config_dir)
+            logger.debug(f"Per-spawn config dir created | task_id={task_id} | config_dir={config_dir}")
+        except OSError as exc:
+            logger.warning(f"Failed to create per-spawn config dir, using inherited | task_id={task_id} | error={exc}")
 
         try:
             process = await asyncio.create_subprocess_shell(
@@ -586,6 +622,13 @@ class CCSpawner:
             )
         finally:
             self._running.pop(task_id, None)
+            # Cleanup per-spawn config directory
+            if config_dir is not None:
+                try:
+                    shutil.rmtree(config_dir, ignore_errors=True)
+                    logger.debug(f"Per-spawn config dir cleaned up | task_id={task_id}")
+                except OSError:
+                    pass
 
     async def _stream_stdout(
         self,
@@ -715,15 +758,27 @@ class CCSpawner:
         """Return the subprocess handle for a running task, or None if not tracked."""
         return self._running.get(task_id)
 
-    async def kill(self, task_id: str) -> bool:
-        """Force-kill a running CC process. Returns True if a process was killed."""
+    async def kill(self, task_id: str, grace_seconds: int = 10) -> bool:
+        """Gracefully terminate a running CC process.
+
+        Sends SIGTERM first, waits up to grace_seconds for clean exit,
+        then falls back to SIGKILL. Adopted from CCS signal-forwarder pattern
+        — see docs/design/what-we-adopt-from-ccs.md.
+
+        Returns True if a process was killed.
+        """
         process = self._running.pop(task_id, None)
         if process is None:
             return False
         try:
-            process.kill()
-            await process.wait()
-            logger.info(f"CC process killed | task_id={task_id}")
+            process.terminate()  # SIGTERM — allows CC to save partial state
+            try:
+                await asyncio.wait_for(process.wait(), timeout=grace_seconds)
+                logger.info(f"CC process terminated gracefully | task_id={task_id}")
+            except TimeoutError:
+                process.kill()  # SIGKILL — force after grace period
+                await process.wait()
+                logger.info(f"CC process killed after {grace_seconds}s grace | task_id={task_id}")
             return True
         except ProcessLookupError:
             return False

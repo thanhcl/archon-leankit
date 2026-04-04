@@ -397,13 +397,46 @@ def register_task_tools(mcp: FastMCP):
                             suggestion="Provide task_id to update"
                         )
 
+                    # Status changes must go through the lifecycle transition endpoint
+                    if status is not None:
+                        transition_response = await client.post(
+                            urljoin(api_url, f"/api/tasks/{task_id}/transition"),
+                            json={"new_status": status, "changed_by": "MCP-agent"},
+                        )
+                        if transition_response.status_code == 200:
+                            result = transition_response.json()
+                            task = result.get("task")
+                            if task:
+                                task = optimize_task_response(task)
+                            return json.dumps({
+                                "success": True,
+                                "task": task,
+                                "transition": result.get("transition"),
+                                "message": result.get("message", "Task status updated via transition"),
+                            })
+                        elif transition_response.status_code == 404:
+                            return MCPErrorFormatter.format_error(
+                                error_type="not_found",
+                                message=f"Task {task_id} not found",
+                                suggestion="Verify the task ID is correct",
+                                http_status=404,
+                            )
+                        elif transition_response.status_code == 400:
+                            error_detail = transition_response.json().get("detail", "Invalid transition")
+                            return MCPErrorFormatter.format_error(
+                                error_type="invalid_transition",
+                                message=error_detail,
+                                suggestion="Use find_tasks(task_id=...) to check current status, "
+                                           "then check valid transitions",
+                            )
+                        else:
+                            return MCPErrorFormatter.from_http_error(transition_response, "transition task status")
+
                     update_fields: dict[str, Any] = {}
                     if title is not None:
                         update_fields["title"] = title
                     if description is not None:
                         update_fields["description"] = description
-                    if status is not None:
-                        update_fields["status"] = status
                     if assignee is not None:
                         update_fields["assignee"] = assignee
                     if task_order is not None:
