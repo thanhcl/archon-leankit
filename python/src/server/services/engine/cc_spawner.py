@@ -169,22 +169,53 @@ class CCSpawner:
     # Model routing
     # ------------------------------------------------------------------
 
+    # Stages where review-grade models are enforced regardless of task metadata
+    _REVIEW_STAGES = frozenset({"code-review", "architect-review"})
+
     @staticmethod
     def select_model(
         task: dict[str, Any] | None = None,
         force_model: str | None = None,
+        stage: str | None = None,
+        retry_count: int = 0,
+        previous_model: str | None = None,
     ) -> str:
-        """Select the appropriate Claude model based on task complexity and priority.
+        """Select the appropriate Claude model based on stage, task metadata, and retry state.
 
-        Routing rules:
+        Routing rules (evaluated in order):
             1. force_model (project config override) → use as-is
-            2. complexity=complex OR priority=high/critical → Opus
-            3. complexity=simple AND priority=low → Haiku
-            4. Default (medium complexity) → Sonnet
+            2. stage=architect-review → always Opus (design reasoning)
+            3. stage=code-review → always >= Sonnet (quality gate)
+            4. stage=retry → model >= previous attempt (escalation ladder)
+            5. complexity=complex OR priority=high/critical → Opus
+            6. complexity=simple AND priority=low → Haiku (execute only)
+            7. Default → Sonnet
+
+        The stage parameter ensures review stages never receive a model weaker
+        than Sonnet, preventing the false-approve rework cycle where a weak
+        reviewer approves bad code that the owner later rejects.
         """
         if force_model:
             return force_model
 
+        # Stage-aware routing: review stages get strong models unconditionally
+        if stage == "architect-review":
+            return MODEL_OPUS
+        if stage == "code-review":
+            return MODEL_SONNET
+
+        # Retry escalation: never downgrade on retry
+        if stage == "retry" or retry_count > 0:
+            base = CCSpawner._select_by_task_metadata(task)
+            if previous_model:
+                return CCSpawner._escalate_model(previous_model, base, retry_count)
+            return base
+
+        return CCSpawner._select_by_task_metadata(task)
+
+    @staticmethod
+    def _select_by_task_metadata(task: dict[str, Any] | None = None) -> str:
+        """Select model based on task complexity and priority (execute stage)."""
         if not task:
             return MODEL_DEFAULT
 
@@ -198,6 +229,30 @@ class CCSpawner:
             return MODEL_HAIKU
 
         return MODEL_DEFAULT
+
+    @staticmethod
+    def _escalate_model(previous_model: str, base_model: str, retry_count: int) -> str:
+        """Ensure retry model is >= previous attempt. Escalation ladder:
+        haiku/codex → sonnet (retry 1), sonnet → opus (retry 2+).
+        """
+        _MODEL_TIER = {MODEL_HAIKU: 0, MODEL_SONNET: 1, MODEL_DEFAULT: 1, MODEL_OPUS: 2}
+        prev_tier = _MODEL_TIER.get(previous_model, 1)
+        base_tier = _MODEL_TIER.get(base_model, 1)
+
+        # Retry must be >= previous model
+        effective_tier = max(prev_tier, base_tier)
+
+        # Escalate on retry: bump up one tier from previous
+        if retry_count >= 2:
+            effective_tier = max(effective_tier, 2)  # → Opus
+        elif retry_count >= 1:
+            effective_tier = max(effective_tier, 1)  # → at least Sonnet
+
+        if effective_tier >= 2:
+            return MODEL_OPUS
+        if effective_tier >= 1:
+            return MODEL_SONNET
+        return MODEL_HAIKU
 
     # ------------------------------------------------------------------
     # Claude Code CLI execution
@@ -232,6 +287,9 @@ class CCSpawner:
         token_profile: dict[str, Any] | None = None,
         model_fallback_chain: list[str] | None = None,
         workspace_context: RunWorkspaceContext | None = None,
+        stage: str | None = None,
+        retry_count: int = 0,
+        previous_model: str | None = None,
     ) -> CCExecutionResult:
         """Spawn a Claude Code CLI session for a task.
 
@@ -250,11 +308,21 @@ class CCSpawner:
                 selected (preserving legacy behaviour). Set to [] to disable fallback.
             workspace_context: Optional run workspace context for persisting stdout/stderr
                 to log files keyed by execution_run_id.
+            stage: Execution stage (execute, code-review, architect-review, retry).
+                When provided, review stages enforce minimum model tiers.
+            retry_count: Number of previous failed attempts for this task.
+            previous_model: Model used in the previous attempt (for retry escalation).
 
         Returns:
             CCExecutionResult with parsed output.
         """
-        selected_model = self.select_model(task=task, force_model=config.force_model)
+        selected_model = self.select_model(
+            task=task,
+            force_model=config.force_model,
+            stage=stage,
+            retry_count=retry_count,
+            previous_model=previous_model,
+        )
         provider = get_provider_for_isolation(config.isolation, worktree_base=self.worktree_base)
 
         try:

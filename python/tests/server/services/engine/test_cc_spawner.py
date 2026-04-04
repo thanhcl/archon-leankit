@@ -724,6 +724,82 @@ class TestModelRouting:
 
 
 # ---------------------------------------------------------------------------
+# Tests: stage-aware model routing (B-P3-05)
+# ---------------------------------------------------------------------------
+
+
+class TestStageAwareModelRouting:
+    """Verify that review stages enforce minimum model tiers regardless of task metadata."""
+
+    def test_code_review_always_sonnet_even_for_simple_low(self):
+        """Root cause fix: simple/low task in code-review must NOT get haiku."""
+        task = {"complexity": "simple", "priority": "low"}
+        assert CCSpawner.select_model(task=task, stage="code-review") == MODEL_SONNET
+
+    def test_code_review_returns_sonnet_for_medium_task(self):
+        task = {"complexity": "medium", "priority": "medium"}
+        assert CCSpawner.select_model(task=task, stage="code-review") == MODEL_SONNET
+
+    def test_code_review_returns_sonnet_for_complex_task(self):
+        """code-review caps at sonnet — opus is for architect-review only."""
+        task = {"complexity": "complex", "priority": "critical"}
+        assert CCSpawner.select_model(task=task, stage="code-review") == MODEL_SONNET
+
+    def test_architect_review_always_opus(self):
+        task = {"complexity": "simple", "priority": "low"}
+        assert CCSpawner.select_model(task=task, stage="architect-review") == MODEL_OPUS
+
+    def test_architect_review_opus_regardless_of_metadata(self):
+        task = {"complexity": "medium", "priority": "medium"}
+        assert CCSpawner.select_model(task=task, stage="architect-review") == MODEL_OPUS
+
+    def test_execute_stage_preserves_existing_logic_opus(self):
+        task = {"complexity": "complex", "priority": "high"}
+        assert CCSpawner.select_model(task=task, stage="execute") == MODEL_OPUS
+
+    def test_execute_stage_preserves_existing_logic_haiku(self):
+        task = {"complexity": "simple", "priority": "low"}
+        assert CCSpawner.select_model(task=task, stage="execute") == MODEL_HAIKU
+
+    def test_execute_stage_preserves_existing_logic_sonnet(self):
+        task = {"complexity": "medium", "priority": "medium"}
+        assert CCSpawner.select_model(task=task, stage="execute") == MODEL_SONNET
+
+    def test_no_stage_preserves_existing_logic(self):
+        """Backward compatibility: no stage param works as before."""
+        task = {"complexity": "simple", "priority": "low"}
+        assert CCSpawner.select_model(task=task) == MODEL_HAIKU
+
+    def test_force_model_overrides_stage(self):
+        task = {"complexity": "simple", "priority": "low"}
+        assert CCSpawner.select_model(task=task, stage="code-review", force_model="custom") == "custom"
+
+
+class TestRetryModelEscalation:
+    """Verify retry escalation ladder: codex/haiku → sonnet → opus."""
+
+    def test_retry_1_escalates_haiku_to_sonnet(self):
+        task = {"complexity": "simple", "priority": "low"}
+        result = CCSpawner.select_model(task=task, stage="retry", retry_count=1, previous_model=MODEL_HAIKU)
+        assert result == MODEL_SONNET
+
+    def test_retry_2_escalates_sonnet_to_opus(self):
+        task = {"complexity": "medium", "priority": "medium"}
+        result = CCSpawner.select_model(task=task, stage="retry", retry_count=2, previous_model=MODEL_SONNET)
+        assert result == MODEL_OPUS
+
+    def test_retry_never_downgrades(self):
+        task = {"complexity": "simple", "priority": "low"}
+        result = CCSpawner.select_model(task=task, retry_count=1, previous_model=MODEL_SONNET)
+        assert result >= MODEL_SONNET or result == MODEL_SONNET
+
+    def test_retry_0_no_escalation(self):
+        task = {"complexity": "simple", "priority": "low"}
+        result = CCSpawner.select_model(task=task, retry_count=0, previous_model=MODEL_HAIKU)
+        assert result == MODEL_HAIKU
+
+
+# ---------------------------------------------------------------------------
 # Tests: model in spawn command
 # ---------------------------------------------------------------------------
 
