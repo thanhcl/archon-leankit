@@ -97,15 +97,35 @@ class ContractScorer:
         }
 
     def _extract_criteria(self, task: dict[str, Any]) -> list[dict[str, Any] | str]:
-        """Extract acceptance criteria from task contract or task fields."""
-        # 1. Formal contract (current_contract)
+        """Extract acceptance criteria using formal-contract-first resolution.
+
+        Resolution order (H4-R2: formal-contract-first):
+        1. Formal contract criteria from archon_task_contracts (injected as
+           ``_formal_contract_criteria`` by the caller).
+        2. Inline current_contract dict on the task.
+        3. architect_review.locked_contract JSONB mirror (compatibility).
+        4. Task-level acceptance_criteria as last resort.
+        """
+        # 1. Formal contract criteria (DB-sourced via current_contract_id)
+        formal = task.get("_formal_contract_criteria")
+        if isinstance(formal, list) and formal:
+            return formal
+
+        # 2. Inline current_contract
         contract = task.get("current_contract")
         if isinstance(contract, dict):
             criteria = contract.get("acceptance_criteria")
             if isinstance(criteria, list) and criteria:
                 return criteria
 
-        # 2. Task-level acceptance criteria
+        # 3. Mirror: architect_review.locked_contract (compatibility fallback)
+        ar = task.get("architect_review")
+        if isinstance(ar, dict):
+            locked = ar.get("locked_contract")
+            if isinstance(locked, list) and locked:
+                return locked
+
+        # 4. Task-level acceptance criteria
         criteria = task.get("acceptance_criteria")
         if isinstance(criteria, list) and criteria:
             return criteria

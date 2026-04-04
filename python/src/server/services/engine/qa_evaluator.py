@@ -119,18 +119,28 @@ def build_qa_eval_prompt(
     """Build the adversarial QA evaluator prompt.
 
     The evaluator receives:
-    - The locked contract criteria from architect-review
+    - Contract criteria (formal-contract-first, mirror as fallback)
     - The task description and acceptance criteria
     - A git diff of changes
     - Build / start commands
 
     It must act as a *hostile user*, not a peer reviewer.
+
+    Contract resolution order (H4-R2: formal-contract-first):
+    1. ``_formal_contract_criteria`` on task (DB-sourced via current_contract_id)
+    2. ``locked_contract`` parameter (from caller, usually mirror)
+    3. Empty list (untestable)
     """
     task_title = task.get("title", "Untitled")
     task_description = task.get("description", "")
     acceptance_criteria = task.get("acceptance_criteria") or []
 
-    contract_text = _format_contract(locked_contract)
+    # Prefer formal contract criteria injected by task_engine
+    effective_contract = task.get("_formal_contract_criteria")
+    if not isinstance(effective_contract, list) or not effective_contract:
+        effective_contract = locked_contract
+
+    contract_text = _format_contract(effective_contract)
     acceptance_text = _format_acceptance_criteria(acceptance_criteria)
 
     diff_section = ""
