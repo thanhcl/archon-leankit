@@ -87,6 +87,7 @@ class ExecutionHealthMonitor:
             else _read_int_env(_ENV_TOTAL_LIMIT, _DEFAULT_TOTAL_LIMIT)
         )
         self._metrics: dict[str, _TaskMetrics] = {}
+        self._task_total_limits: dict[str, int] = {}  # per-task overrides (C-P6-02)
 
     # ── Public properties ─────────────────────────────────────────────
 
@@ -137,11 +138,12 @@ class ExecutionHealthMonitor:
                 metrics.abort_reason = reason
                 return HEALTH_LOOP_DETECTED
 
-        # Total tool-call budget check
-        if metrics.total_count > self._total_limit:
+        # Total tool-call budget check (uses per-task override if set, C-P6-02)
+        effective_limit = self._task_total_limits.get(task_id, self._total_limit)
+        if metrics.total_count > effective_limit:
             reason = (
                 f"Execution budget exceeded: {metrics.total_count} total tool calls "
-                f"(limit {self._total_limit})"
+                f"(limit {effective_limit})"
             )
             metrics.abort_reason = reason
             return HEALTH_BUDGET_EXCEEDED
@@ -168,6 +170,22 @@ class ExecutionHealthMonitor:
     def reset(self, task_id: str) -> None:
         """Clear accumulated metrics for a task (e.g., between retries)."""
         self._metrics.pop(task_id, None)
+        self._task_total_limits.pop(task_id, None)
+
+    def set_task_total_limit(self, task_id: str, limit: int) -> None:
+        """Override the total tool-call limit for a specific task.
+
+        Used by the engine to apply per-profile budgets from engine_policy
+        (C-P6-02). When set, this overrides the global total_limit for this task.
+        """
+        self._task_total_limits[task_id] = limit
+        logger.info(
+            f"Tool budget override set | task_id={task_id} | limit={limit}"
+        )
+
+    def get_task_total_limit(self, task_id: str) -> int:
+        """Return the effective total tool-call limit for a task."""
+        return self._task_total_limits.get(task_id, self._total_limit)
 
     # ── Internal ──────────────────────────────────────────────────────
 

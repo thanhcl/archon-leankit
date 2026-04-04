@@ -213,11 +213,32 @@ class CostBudgetService:
     def _get_budget_config(self, project_id: str | None) -> dict[str, float]:
         """Get budget configuration for a project.
 
-        Reads from the project's metadata if available, otherwise uses env-var-backed defaults.
+        Priority order (highest wins):
+        1. engine_policy.budget_policy (C-P6-01 — canonical policy source)
+        2. project metadata.cost_budget (legacy)
+        3. environment variable defaults
+
         Supports both new field names (daily_budget_usd, weekly_budget_usd) and legacy names
         (max_cost_per_day, max_cost_per_sprint).
         """
         if project_id:
+            # 1. Check engine_policy.budget_policy first (C-P6-01)
+            try:
+                from .projects.engine_policy_service import EnginePolicyService
+                policy_service = EnginePolicyService(supabase_client=self.supabase_client)
+                policy = policy_service.get_active_policy(project_id)
+                if policy:
+                    budget_policy = policy.get("budget_policy") or {}
+                    ep_daily = budget_policy.get("daily_limit_usd")
+                    ep_weekly = budget_policy.get("sprint_limit_usd")
+                    if ep_daily is not None or ep_weekly is not None:
+                        daily = float(ep_daily) if ep_daily is not None else DEFAULT_DAILY_BUDGET
+                        weekly = float(ep_weekly) if ep_weekly is not None else DEFAULT_WEEKLY_BUDGET
+                        return {"daily_budget_usd": daily, "weekly_budget_usd": weekly}
+            except Exception as e:
+                logger.debug(f"Could not read engine_policy budget for project {project_id}: {e}")
+
+            # 2. Fallback to project metadata (legacy)
             try:
                 response = (
                     self.supabase_client.table("archon_projects")

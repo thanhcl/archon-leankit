@@ -20,6 +20,7 @@ from .runner_adapter import DEFAULT_RUNNER_KEY
 logger = get_logger(__name__)
 
 RoutingSource = Literal["explicit", "policy", "default"]
+_TRUTHY_ENV_VALUES = {"1", "true", "yes"}
 
 # Default path for runner token profiles config
 # __file__ is at python/src/server/services/engine/runner_routing.py
@@ -270,7 +271,49 @@ def resolve_collaboration_mode(
 
 def get_runner_capabilities() -> list[dict[str, Any]]:
     """Return the runner capability matrix in a JSON-friendly shape."""
-    return [asdict(capability) for capability in RUNNER_CAPABILITY_MATRIX.values()]
+    enabled_runner_keys = _filter_disabled_runners(set(RUNNER_CAPABILITY_MATRIX.keys()))
+    return [
+        asdict(capability)
+        for runner_key, capability in RUNNER_CAPABILITY_MATRIX.items()
+        if runner_key in enabled_runner_keys
+    ]
+
+
+def get_runtime_default_runner_key() -> str:
+    """Return the effective runtime default runner, respecting env kill switches."""
+    disable_claude = _env_flag("LEANKIT_ENGINE_DISABLE_CLAUDE_CODE")
+    disable_codex = _env_flag("LEANKIT_ENGINE_DISABLE_CODEX")
+
+    if disable_claude and not disable_codex:
+        return CODEX_RUNNER_KEY
+    return DEFAULT_RUNNER_KEY
+
+
+def _env_flag(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in _TRUTHY_ENV_VALUES
+
+
+def _runner_disabled_by_policy(runner_key: str, model_routing: dict[str, Any] | None = None) -> bool:
+    if runner_key == CODEX_RUNNER_KEY and model_routing and model_routing.get("disable_codex"):
+        return True
+    if runner_key == DEFAULT_RUNNER_KEY and model_routing and model_routing.get("disable_claude_code"):
+        return True
+    if runner_key == CODEX_RUNNER_KEY and _env_flag("LEANKIT_ENGINE_DISABLE_CODEX"):
+        return True
+    if runner_key == DEFAULT_RUNNER_KEY and _env_flag("LEANKIT_ENGINE_DISABLE_CLAUDE_CODE"):
+        return True
+    return False
+
+
+def _filter_disabled_runners(
+    available_runner_keys: set[str],
+    model_routing: dict[str, Any] | None = None,
+) -> set[str]:
+    return {
+        runner_key
+        for runner_key in available_runner_keys
+        if not _runner_disabled_by_policy(runner_key, model_routing)
+    }
 
 
 def get_fallback_runner_chain(
@@ -293,6 +336,8 @@ def get_fallback_runner_chain(
     Returns:
         Ordered list of runner keys to try, excluding the primary runner.
     """
+    effective_available = _filter_disabled_runners(set(available_runner_keys), model_routing)
+
     if model_routing:
         fallback_policy = model_routing.get("fallback_policy") or {}
         if isinstance(fallback_policy, dict):
@@ -303,12 +348,12 @@ def get_fallback_runner_chain(
                 return [
                     rk
                     for rk in configured_chain
-                    if isinstance(rk, str) and rk in available_runner_keys and rk != primary_runner_key
+                    if isinstance(rk, str) and rk in effective_available and rk != primary_runner_key
                 ]
 
     # Default chain: CC → Codex, excluding the primary runner
     default_chain = [DEFAULT_RUNNER_KEY, CODEX_RUNNER_KEY]
-    return [rk for rk in default_chain if rk in available_runner_keys and rk != primary_runner_key]
+    return [rk for rk in default_chain if rk in effective_available and rk != primary_runner_key]
 
 
 def check_approval_required(
@@ -458,27 +503,32 @@ def resolve_runner_selection(
     task_id = task.get("id", "<unknown>")
 
     # 1. Explicit task-level override always wins
+    effective_available = _filter_disabled_runners(set(available_runner_keys), model_routing)
+
     for explicit_field in _EXPLICIT_FIELDS:
         value = task.get(explicit_field)
         if isinstance(value, str) and value.strip():
-            selection = RunnerSelection(
-                runner_key=value.strip(),
-                source="explicit",
-                reason=f"explicit:{explicit_field}",
-            )
+            candidate = value.strip()
+            if candidate in effective_available:
+                selection = RunnerSelection(
+                    runner_key=candidate,
+                    source="explicit",
+                    reason=f"explicit:{explicit_field}",
+                )
+                logger.info(
+                    "Runner selected | task_id=%s | runner=%s | source=%s | reason=%s",
+                    task_id, selection.runner_key, selection.source, selection.reason,
+                )
+                return selection
             logger.info(
-                "Runner selected | task_id=%s | runner=%s | source=%s | reason=%s",
-                task_id, selection.runner_key, selection.source, selection.reason,
+                "Runner override ignored | task_id=%s | runner=%s | field=%s | reason=runner-disabled",
+                task_id,
+                candidate,
+                explicit_field,
             )
-            return selection
 
     # 2. Project-level policy (from archon_engine_policies)
-    effective_available: set[str]
     if model_routing:
-        # Respect disable_codex flag
-        effective_available = set(available_runner_keys)
-        if model_routing.get("disable_codex"):
-            effective_available.discard(CODEX_RUNNER_KEY)
         policy_selection = apply_policy_overrides(model_routing, stage, effective_available, default_runner_key)
         if policy_selection is not None:
             logger.info(
@@ -486,8 +536,6 @@ def resolve_runner_selection(
                 task_id, policy_selection.runner_key, policy_selection.source, policy_selection.reason,
             )
             return policy_selection
-    else:
-        effective_available = set(available_runner_keys)
 
     task_type = str(task.get("task_type") or "feature").lower()
     priority = str(task.get("priority") or "medium").lower()
@@ -495,12 +543,7 @@ def resolve_runner_selection(
     created_from = str(task.get("created_from") or "").lower()
     tags = set(_normalize_string_list(task.get("tags")))
 
-    # When disable_codex is set via policy, restrict global heuristics too
-    available_for_heuristics: set[str]
-    if model_routing and model_routing.get("disable_codex"):
-        available_for_heuristics = effective_available
-    else:
-        available_for_heuristics = set(available_runner_keys)
+    available_for_heuristics = effective_available
 
     # Resolve effective repo language/framework (policy repo_metadata overrides arg)
     effective_language: str | None = None
@@ -546,6 +589,36 @@ def resolve_runner_selection(
                     effective_language, effective_framework,
                 )
                 return selection
+
+    # 4-pre. Approval-aware routing: tasks with explicit approval
+    # requirements (task-level or policy-level collaboration_mode="approve")
+    # should prefer Claude Code for complex review flows
+    task_collab = task.get("collaboration_mode")
+    policy_collab = (model_routing or {}).get("collaboration_mode")
+    if task_collab == COLLABORATION_MODE_APPROVE or policy_collab == COLLABORATION_MODE_APPROVE:
+        runner_key = _first_supported([DEFAULT_RUNNER_KEY, CODEX_RUNNER_KEY], available_for_heuristics)
+        if runner_key:
+            selection = RunnerSelection(
+                runner_key=runner_key, source="policy", reason="policy:approval-aware-claude"
+            )
+            logger.info(
+                "Runner selected | task_id=%s | runner=%s | source=%s | reason=%s",
+                task_id, selection.runner_key, selection.source, selection.reason,
+            )
+            return selection
+
+    # Coordinator children → use same runner as parent for consistency
+    if task.get("parent_task_id") and task.get("decomposition_mode") != "coordinator":
+        parent_runner = task.get("_parent_runner_key")
+        if isinstance(parent_runner, str) and parent_runner in effective_available:
+            selection = RunnerSelection(
+                runner_key=parent_runner, source="policy", reason="policy:coordinator-child-affinity"
+            )
+            logger.info(
+                "Runner selected | task_id=%s | runner=%s | source=%s | reason=%s",
+                task_id, selection.runner_key, selection.source, selection.reason,
+            )
+            return selection
 
     # 4a. Bootstrap quality-gate tasks → Claude Code
     if (created_from.startswith("project-bootstrap-") or "project-bootstrap" in tags) and (
@@ -607,8 +680,9 @@ def resolve_runner_selection(
             return selection
 
     # 5. Engine default
+    fallback_runner_key = _first_supported([default_runner_key, CODEX_RUNNER_KEY, DEFAULT_RUNNER_KEY], available_for_heuristics)
     selection = RunnerSelection(
-        runner_key=default_runner_key,
+        runner_key=fallback_runner_key or default_runner_key,
         source="default",
         reason="default:engine-default-runner",
     )

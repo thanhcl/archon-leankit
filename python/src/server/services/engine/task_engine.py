@@ -32,9 +32,10 @@ import asyncio
 import hashlib
 import json
 import os
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field, replace
-from datetime import datetime
-from typing import Any, Awaitable, Callable
+from datetime import UTC, datetime
+from typing import Any
 
 from ...config.env_aliases import (
     get_engine_escalation_enabled,
@@ -60,16 +61,27 @@ from .bug_task_creator import BugTaskCreator
 from .capacity_tracker import GlobalCapacityTracker, SharedAgentPool
 from .cc_spawner import MODEL_SONNET, CCExecutionResult, CCSpawner, ProjectConfig, is_runner_level_failure
 from .codex_runner import CodexRunnerAdapter
+from .evaluator_templates import (
+    build_contract_aware_evaluator,
+    build_owner_review_summary,
+    resolve_evaluator_template,
+)
 from .execution_health_monitor import (
     HEALTH_HEALTHY,
     ExecutionHealthMonitor,
 )
 from .health_monitor import HealthMonitor
 from .learning_processor import LearningProcessor
-from .notifier import Notifier
+from .notifier import EVENT_TASK_CONTRACT_GATE_BLOCKED, Notifier
 from .prompt_builder import PromptBuilder
+from .review_prompts import build_adversarial_code_review_prompt
 from .run_workspace import RunWorkspaceContext, RunWorkspaceManager
-from .runner_adapter import DEFAULT_RUNNER_KEY, ClaudeCodeRunnerAdapter, ExecutionRunner
+from .runner_adapter import (
+    DEFAULT_RUNNER_KEY,
+    ClaudeCodeRunnerAdapter,
+    ExecutionRunner,
+    get_engine_default_runner_key,
+)
 from .runner_routing import (
     COLLABORATION_MODE_APPROVE,
     COLLABORATION_MODE_AUTO,
@@ -81,8 +93,13 @@ from .runner_routing import (
     resolve_runner_selection,
     select_token_profile,
 )
+from .auto_approval import evaluate_auto_approval
+from .coordinator_service import CoordinatorService
+from .lifecycle_hooks import LifecycleHooks
 from .task_boundaries import task_has_boundary_rules, validate_task_boundaries
 from .task_conflicts import predict_task_overlap
+from .task_decomposer import TaskDecomposer
+from .task_scheduler import score_and_sort_tasks
 
 logger = get_logger(__name__)
 
@@ -191,8 +208,10 @@ class TaskEngine:
             task_service=self.task_service,
             notifier=self.notifier,
         )
-        self.default_runner_key = DEFAULT_RUNNER_KEY
+        self.default_runner_key = get_engine_default_runner_key()
         self.runner_adapters: dict[str, ExecutionRunner] = {}
+        self._run_heartbeat_interval_seconds = 15.0
+        self._run_missing_process_grace_seconds = max(float(self.poll_interval * 2), 120.0)
         self.spawner = ClaudeCodeRunnerAdapter(
             CCSpawner(
                 default_timeout=default_timeout,
@@ -219,6 +238,19 @@ class TaskEngine:
         self._escalation_enabled: bool = get_engine_escalation_enabled()
         self._pid_check_interval: int = get_engine_pid_check_interval()
 
+        # Coordinator mode services (C-P7)
+        self.coordinator_service = CoordinatorService(
+            task_service=self.task_service,
+            lifecycle_service=self.lifecycle_service,
+            notifier=self.notifier,
+        )
+        self.task_decomposer = TaskDecomposer()
+
+        # Adaptive polling state (C-P5-04)
+        self._adaptive_poll_intervals = (2, 5, 15, 30)  # seconds: active→recent→idle→deep_idle
+        self._adaptive_idle_cycles: int = 0  # consecutive cycles with no work
+        self._base_poll_interval: int = poll_interval
+
     @property
     def spawner(self) -> ExecutionRunner:
         """Backward-compatible default runner alias."""
@@ -228,7 +260,10 @@ class TaskEngine:
     def spawner(self, runner: ExecutionRunner) -> None:
         """Keep legacy `spawner` access while registering the default adapter."""
         self._spawner = runner
-        self.runner_adapters[self.default_runner_key] = runner
+        runner_key = getattr(runner, "runner_key", None)
+        if not isinstance(runner_key, str) or not runner_key.strip():
+            runner_key = DEFAULT_RUNNER_KEY
+        self.runner_adapters[runner_key] = runner
 
     def register_runner(self, runner: ExecutionRunner) -> None:
         """Register a non-default execution runner adapter."""
@@ -253,6 +288,7 @@ class TaskEngine:
             )
             return None
         try:
+            now_iso = datetime.now().isoformat()
             ok, result = await self.execution_run_service.create_run(
                 task_id=task_id,
                 project_id=project_id,
@@ -262,6 +298,8 @@ class TaskEngine:
                 session_id=session_id,
                 model=model,
                 retry_index=retry_index,
+                started_at=now_iso,
+                heartbeat_at=now_iso,
                 metadata=metadata or {},
             )
             if ok:
@@ -287,6 +325,87 @@ class TaskEngine:
                 logger.warning(f"Execution run update failed | run_id={run_id} | error={result.get('error')}")
         except Exception as e:
             logger.warning(f"Execution run update error | run_id={run_id} | error={e}")
+
+    @staticmethod
+    def _parse_iso_timestamp(raw_value: Any) -> datetime | None:
+        """Parse a timestamp string into a timezone-aware datetime when possible."""
+        if not isinstance(raw_value, str) or not raw_value.strip():
+            return None
+        try:
+            parsed = datetime.fromisoformat(raw_value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=UTC)
+        return parsed
+
+    def _execution_run_last_activity_at(self, run: dict[str, Any]) -> datetime | None:
+        """Return the freshest known activity timestamp for an execution run."""
+        for field_name in ("heartbeat_at", "updated_at", "started_at"):
+            parsed = self._parse_iso_timestamp(run.get(field_name))
+            if parsed is not None:
+                return parsed
+        return None
+
+    def _execution_run_activity_age_seconds(self, run: dict[str, Any]) -> float | None:
+        """Return seconds since the last known execution-run heartbeat or update."""
+        activity_at = self._execution_run_last_activity_at(run)
+        if activity_at is None:
+            return None
+        return (datetime.now(UTC) - activity_at).total_seconds()
+
+    def _runner_get_process(self, runner: ExecutionRunner, task_id: str) -> asyncio.subprocess.Process | None:
+        """Best-effort access to a runner's subprocess handle for a task."""
+        get_process = getattr(runner, "get_process", None)
+        if get_process is None:
+            inner = getattr(runner, "_spawner", None)
+            get_process = getattr(inner, "get_process", None) if inner else None
+        if get_process is None:
+            return None
+        try:
+            return get_process(task_id)
+        except Exception:
+            return None
+
+    def _find_runner_process(
+        self, task_id: str
+    ) -> tuple[str | None, ExecutionRunner | None, asyncio.subprocess.Process | None]:
+        """Find which registered runner currently owns a live subprocess for a task."""
+        for runner_key, runner in self.runner_adapters.items():
+            process = self._runner_get_process(runner, task_id)
+            if process is not None:
+                return runner_key, runner, process
+        return None, None, None
+
+    async def _kill_task_process(self, task_id: str) -> bool:
+        """Best-effort kill across all registered runners for a task."""
+        killed = False
+        for runner in self.runner_adapters.values():
+            try:
+                runner_killed = await runner.kill(task_id)
+                killed = runner_killed or killed
+            except Exception:
+                continue
+        return killed
+
+    async def _get_active_execute_run(self, task_id: str) -> dict[str, Any] | None:
+        """Fetch the active execute-stage run for a task, if one exists."""
+        ok, result = self.execution_run_service.list_runs(
+            task_id=task_id,
+            status="running",
+            stage="execute",
+            limit=1,
+        )
+        if not ok:
+            return None
+        runs = result.get("runs") or []
+        return runs[0] if runs else None
+
+    async def _touch_execution_run_heartbeat(self, run_id: str | None) -> None:
+        """Persist a heartbeat for an in-flight execute run."""
+        if not run_id:
+            return
+        await self._update_execution_run(run_id, heartbeat_at=datetime.now().isoformat())
 
     def _resolve_project_id(self, task: dict[str, Any]) -> str | None:
         """Resolve project context from task payload or engine scope."""
@@ -554,6 +673,18 @@ class TaskEngine:
 
         return replace(self.project_config, isolation=isolation)
 
+    @staticmethod
+    def _get_auto_approval_tier(policy: dict[str, Any] | None) -> int:
+        """Read auto_approval_tier from engine policy review_policy (B-P4-03)."""
+        if not policy:
+            return 0
+        review_policy = policy.get("review_policy") or {}
+        tier = review_policy.get("auto_approval_tier", 0)
+        try:
+            return int(tier)
+        except (TypeError, ValueError):
+            return 0
+
     def _review_config_for_policy(self, policy: dict[str, Any] | None) -> ReviewConfig:
         """Return the effective architect review config for one project."""
         if not policy:
@@ -563,14 +694,43 @@ class TaskEngine:
         if not isinstance(review_policy, dict):
             return self.review_config
 
+        overrides: dict[str, Any] = {}
+
         review_mode = review_policy.get("review_mode")
-        if not isinstance(review_mode, str) or not review_mode.strip():
+        if isinstance(review_mode, str) and review_mode.strip():
+            overrides["review_mode"] = review_mode
+
+        provider = review_policy.get("provider")
+        if isinstance(provider, str) and provider.strip():
+            overrides["provider"] = provider
+
+        model = review_policy.get("model")
+        if isinstance(model, str) and model.strip():
+            overrides["model"] = model
+
+        for field_name in ("temperature", "confidence_approve_threshold", "confidence_retry_threshold"):
+            value = review_policy.get(field_name)
+            if isinstance(value, (int, float)):
+                overrides[field_name] = float(value)
+
+        for field_name in ("max_tokens", "timeout"):
+            value = review_policy.get(field_name)
+            if isinstance(value, int) and value > 0:
+                overrides[field_name] = value
+
+        for field_name in (
+            "security_override_to_api",
+            "api_fallback_to_self_review",
+            "independent_review_enabled",
+        ):
+            value = review_policy.get(field_name)
+            if isinstance(value, bool):
+                overrides[field_name] = value
+
+        if not overrides:
             return self.review_config
 
-        if review_mode == self.review_config.review_mode:
-            return self.review_config
-
-        return replace(self.review_config, review_mode=review_mode)
+        return replace(self.review_config, **overrides)
 
     @staticmethod
     def _map_worktree_mode_to_isolation(worktree_mode: Any) -> str | None:
@@ -826,7 +986,7 @@ class TaskEngine:
             except TimeoutError:
                 logger.warning("Shutdown grace period exceeded — killing remaining")
                 for task_id in list(self._execution_tasks):
-                    await self.spawner.kill(task_id)
+                    await self._kill_task_process(task_id)
 
         if self._loop_task and not self._loop_task.done():
             self._loop_task.cancel()
@@ -859,17 +1019,34 @@ class TaskEngine:
             if exec_task is None or exec_task.done():
                 continue
 
-            # Resolve process handle via duck-typed get_process (supported by both runner adapters)
-            get_process = getattr(self.spawner, "get_process", None)
-            if get_process is None:
-                inner = getattr(self.spawner, "_spawner", None)
-                get_process = getattr(inner, "get_process", None) if inner else None
-            if get_process is None:
-                continue
-
-            process = get_process(task_id)
+            _runner_key, _runner, process = self._find_runner_process(task_id)
             if process is None:
-                # Not in the runner's _running dict — could be in review phase or already cleaned up
+                active_run = await self._get_active_execute_run(task_id)
+                if active_run is None:
+                    # The execute-stage run is already terminal, so the task may be in post-execute review.
+                    continue
+                age_seconds = self._execution_run_activity_age_seconds(active_run)
+                if age_seconds is None or age_seconds <= self._run_missing_process_grace_seconds:
+                    continue
+                logger.error(
+                    "Tracked execute run lost its runner process without completing | "
+                    f"task_id={task_id} | run_id={active_run.get('id')} | stale_for={int(age_seconds)}s"
+                )
+                exec_task.cancel()
+                self._execution_tasks.pop(task_id, None)
+                if self.global_tracker and self.project_id:
+                    self.global_tracker.release(self.project_id)
+                if self.agent_pool and self.project_id:
+                    self.agent_pool.release(self.project_id)
+                reason = (
+                    "Runner process disappeared without completion "
+                    f"(no heartbeat for {int(age_seconds)}s)"
+                )
+                await self._force_fail_orphaned_run(
+                    task_id,
+                    reason=reason,
+                    run_id=active_run.get("id"),
+                )
                 continue
 
             if process.returncode is not None:
@@ -889,6 +1066,47 @@ class TaskEngine:
                     self.agent_pool.release(self.project_id)
                 reason = f"CC process died unexpectedly (pid={pid}, exit_code={exit_code})"
                 await self._force_fail_orphaned_run(task_id, reason=reason)
+
+        await self._reconcile_stale_execute_runs()
+
+    async def _reconcile_stale_execute_runs(self) -> None:
+        """Fail execute-stage runs that are marked running but have no live runtime owner."""
+        ok, result = self.execution_run_service.list_runs(
+            project_id=self.project_id,
+            status="running",
+            stage="execute",
+            limit=100,
+        )
+        if not ok:
+            return
+
+        for run in result.get("runs", []):
+            task_id = run.get("task_id")
+            run_id = run.get("id")
+            if not isinstance(task_id, str) or not task_id:
+                continue
+            if not isinstance(run_id, str) or not run_id:
+                continue
+            if task_id in self._execution_tasks:
+                continue
+
+            _runner_key, _runner, process = self._find_runner_process(task_id)
+            if process is not None and process.returncode is None:
+                continue
+
+            age_seconds = self._execution_run_activity_age_seconds(run)
+            if age_seconds is None or age_seconds <= self._run_missing_process_grace_seconds:
+                continue
+
+            logger.error(
+                "Stale execute run detected outside active watchdog map | "
+                f"task_id={task_id} | run_id={run_id} | stale_for={int(age_seconds)}s"
+            )
+            await self._force_fail_orphaned_run(
+                task_id,
+                reason=f"Execute run lost runtime ownership (stale for {int(age_seconds)}s)",
+                run_id=run_id,
+            )
 
     async def _force_fail_orphaned_run(
         self, task_id: str, reason: str, run_id: str | None = None
@@ -983,6 +1201,415 @@ class TaskEngine:
             logger.error(f"Startup orphan recovery failed: {e}", exc_info=True)
 
     # ------------------------------------------------------------------
+    # Coordinator parent advancement (C-P7-03)
+    # ------------------------------------------------------------------
+
+    async def _advance_coordinator_parents(self) -> None:
+        """Find coordinator parents whose children are all terminal and advance them."""
+        if not self.project_id:
+            return
+
+        try:
+            # Find coordinator tasks in executing/on-hold states
+            for status in ("executing", "on-hold"):
+                ok, result = self.task_service.list_tasks(
+                    project_id=self.project_id,
+                    status=status,
+                    include_closed=False,
+                    include_archived=False,
+                    exclude_large_fields=True,
+                )
+                if not ok:
+                    continue
+
+                for task in result.get("tasks", []):
+                    if task.get("decomposition_mode") != "coordinator":
+                        continue
+                    # Skip tasks we're actively executing
+                    if task["id"] in self._execution_tasks:
+                        continue
+
+                    await self.coordinator_service.advance_parent_if_ready(task["id"])
+
+        except Exception as e:
+            logger.error(f"Coordinator parent advancement failed: {e}", exc_info=True)
+
+    # ------------------------------------------------------------------
+    # Stalled run detection + auto-recovery (D-P2-02)
+    # ------------------------------------------------------------------
+
+    async def _detect_stalled_runs(self) -> None:
+        """Detect execution runs that have not made progress within policy thresholds.
+
+        Uses heartbeat_at from execution runs to determine staleness.
+        Configurable via engine_policy.capacity_policy:
+        - stalled_warning_seconds (default 300): emit warning
+        - stalled_kill_seconds (default 600): kill run and trigger recovery
+
+        Recovery ladder: kill → retry with escalated model → alert operator
+        """
+        if not self.project_id:
+            return
+
+        # Read thresholds from engine policy
+        warning_threshold = 300
+        kill_threshold = 600
+        policy = self.engine_policy_service.get_active_policy(self.project_id)
+        if policy:
+            capacity = policy.get("capacity_policy") or {}
+            warning_threshold = capacity.get("stalled_warning_seconds", 300)
+            kill_threshold = capacity.get("stalled_kill_seconds", 600)
+
+        try:
+            ok, result = self.execution_run_service.list_runs(
+                project_id=self.project_id,
+                status="running",
+                limit=50,
+            )
+            if not ok:
+                return
+
+            for run in result.get("runs", []):
+                run_id = run.get("id")
+                task_id = run.get("task_id")
+                if not run_id or not task_id:
+                    continue
+
+                age_seconds = self._execution_run_activity_age_seconds(run)
+                if age_seconds is None:
+                    continue
+
+                if age_seconds >= kill_threshold:
+                    logger.error(
+                        f"Stalled run killed | task_id={task_id} | run_id={run_id} | "
+                        f"stalled_for={int(age_seconds)}s | threshold={kill_threshold}s"
+                    )
+                    # Kill the process
+                    await self._kill_task_process(task_id)
+                    # Fail the run
+                    await self._update_execution_run(
+                        run_id,
+                        status="failed",
+                        finished_at=datetime.now().isoformat(),
+                        error_summary=f"Run stalled for {int(age_seconds)}s (threshold {kill_threshold}s)",
+                    )
+                    # Apply retry-or-escalate policy
+                    ok_task, task_result = self.task_service.get_task(task_id)
+                    task = task_result.get("task", {"id": task_id}) if ok_task else {"id": task_id}
+                    await self._handle_task_failure(
+                        task_id, task,
+                        reason=f"Stalled run auto-killed after {int(age_seconds)}s",
+                    )
+                    await self.notifier.emit(
+                        "health.stalled_run_killed",
+                        task_id=task_id,
+                        data={
+                            "run_id": run_id,
+                            "task_id": task_id,
+                            "project_id": self.project_id,
+                            "stalled_seconds": int(age_seconds),
+                            "threshold": kill_threshold,
+                        },
+                        is_critical=True,
+                    )
+
+                elif age_seconds >= warning_threshold:
+                    logger.warning(
+                        f"Stalled run warning | task_id={task_id} | run_id={run_id} | "
+                        f"stalled_for={int(age_seconds)}s | threshold={warning_threshold}s"
+                    )
+                    await self.notifier.emit(
+                        "health.stalled_run_warning",
+                        task_id=task_id,
+                        data={
+                            "run_id": run_id,
+                            "task_id": task_id,
+                            "project_id": self.project_id,
+                            "stalled_seconds": int(age_seconds),
+                            "warning_threshold": warning_threshold,
+                            "kill_threshold": kill_threshold,
+                        },
+                    )
+
+        except Exception as e:
+            logger.error(f"Stalled run detection failed: {e}", exc_info=True)
+
+    # ------------------------------------------------------------------
+    # Lifecycle reconciliation watchdog (D-P2-04)
+    # ------------------------------------------------------------------
+
+    async def _reconcile_task_lifecycle(self) -> None:
+        """Detect tasks stuck in executing/review states with no active run.
+
+        Finds tasks where:
+        - status is 'executing', 'architect-review', or 'code-review'
+        - latest execution run is terminal (completed/failed/cancelled)
+        - no active execution run exists for the task
+
+        For each, advances the task to the correct next state.
+        """
+        if not self.project_id:
+            return
+
+        active_task_statuses = {"executing", "architect-review", "code-review"}
+        terminal_run_statuses = {"completed", "failed", "cancelled"}
+
+        try:
+            # Fetch tasks in active execution states
+            for status in active_task_statuses:
+                ok, result = self.task_service.list_tasks(
+                    project_id=self.project_id,
+                    status=status,
+                    include_closed=False,
+                    include_archived=False,
+                    exclude_large_fields=True,
+                )
+                if not ok:
+                    continue
+
+                tasks = result.get("tasks", [])
+                for task in tasks:
+                    task_id = task["id"]
+
+                    # Skip tasks we're actively executing
+                    if task_id in self._execution_tasks:
+                        continue
+
+                    # Check if any run is still active
+                    ok_runs, runs_result = self.execution_run_service.list_runs(
+                        task_id=task_id,
+                        limit=5,
+                    )
+                    if not ok_runs:
+                        continue
+
+                    runs = runs_result.get("runs", [])
+                    if not runs:
+                        # No runs at all — task stuck without run, fail it
+                        logger.warning(
+                            f"Lifecycle watchdog: task in '{status}' with no runs | task_id={task_id}"
+                        )
+                        await self.lifecycle_service.execute_transition(
+                            task_id=task_id,
+                            new_status="failed",
+                            changed_by="lifecycle-watchdog",
+                            reason=f"Task stuck in '{status}' with no execution runs",
+                        )
+                        await self.notifier.emit(
+                            "task.lifecycle_reconciled",
+                            task_id=task_id,
+                            data={
+                                "previous_status": status,
+                                "new_status": "failed",
+                                "reason": "no_runs",
+                                "project_id": self.project_id,
+                            },
+                        )
+                        continue
+
+                    # Check if any run is still active (running/queued/reviewing)
+                    has_active_run = any(
+                        r.get("status") not in terminal_run_statuses
+                        for r in runs
+                    )
+                    if has_active_run:
+                        continue
+
+                    # All runs are terminal — determine next task state from latest run
+                    latest_run = runs[0]  # list_runs returns most recent first
+                    latest_status = latest_run.get("status")
+
+                    if latest_status == "completed":
+                        # Run completed but task didn't advance — advance it now
+                        next_status = self._next_status_after_completed_run(status)
+                        logger.warning(
+                            f"Lifecycle watchdog: advancing stuck task | "
+                            f"task_id={task_id} | {status} → {next_status} | "
+                            f"run_id={latest_run.get('id')}"
+                        )
+                        await self.lifecycle_service.execute_transition(
+                            task_id=task_id,
+                            new_status=next_status,
+                            changed_by="lifecycle-watchdog",
+                            reason=f"Run completed but task stuck in '{status}'",
+                        )
+                    else:
+                        # Latest run failed/cancelled — mark task failed
+                        logger.warning(
+                            f"Lifecycle watchdog: failing stuck task | "
+                            f"task_id={task_id} | {status} → failed | "
+                            f"latest_run_status={latest_status}"
+                        )
+                        await self.lifecycle_service.execute_transition(
+                            task_id=task_id,
+                            new_status="failed",
+                            changed_by="lifecycle-watchdog",
+                            reason=f"All runs terminal (latest: {latest_status}), task stuck in '{status}'",
+                        )
+
+                    await self.notifier.emit(
+                        "task.lifecycle_reconciled",
+                        task_id=task_id,
+                        data={
+                            "previous_status": status,
+                            "new_status": next_status if latest_status == "completed" else "failed",
+                            "latest_run_id": latest_run.get("id"),
+                            "latest_run_status": latest_status,
+                            "project_id": self.project_id,
+                        },
+                    )
+
+        except Exception as e:
+            logger.error(f"Lifecycle reconciliation watchdog failed: {e}", exc_info=True)
+
+    @staticmethod
+    def _next_status_after_completed_run(current_task_status: str) -> str:
+        """Determine what status a task should advance to after its run completes."""
+        advancement = {
+            "executing": "architect-review",
+            "architect-review": "code-review",
+            "code-review": "review",
+        }
+        return advancement.get(current_task_status, "review")
+
+    # ------------------------------------------------------------------
+    # Dependency auto-unblock reconciliation (C-P5-03)
+    # ------------------------------------------------------------------
+
+    async def _reconcile_blocked_dependencies(self) -> None:
+        """Auto-clear satisfied blocked_by references and detect invalid blockers.
+
+        Scans tasks with status in blocked-eligible states that have blocked_by
+        entries pointing to terminal tasks (done, cancelled, failed). Clears those
+        entries so the task can proceed.
+
+        Called periodically from _poll_cycle (every 3 cycles, same cadence as
+        _assign_approved_tasks).
+        """
+        if not self.project_id:
+            return
+
+        terminal_statuses = {"done", "cancelled", "failed"}
+
+        try:
+            # Fetch tasks that have blocked_by set and are in non-terminal states
+            ok, result = self.task_service.list_tasks(
+                project_id=self.project_id,
+                include_closed=False,
+                include_archived=False,
+            )
+            if not ok:
+                return
+
+            all_tasks = result.get("tasks", [])
+            blocked_tasks = [
+                t for t in all_tasks
+                if (t.get("blocked_by") or []) and t.get("status") not in terminal_statuses
+            ]
+
+            if not blocked_tasks:
+                return
+
+            # Collect all unique blocker IDs
+            blocker_ids: set[str] = set()
+            for task in blocked_tasks:
+                blocker_ids.update(task.get("blocked_by") or [])
+
+            if not blocker_ids:
+                return
+
+            # Batch-fetch blocker statuses
+            blocker_statuses: dict[str, str | None] = {}
+            try:
+                response = (
+                    self.task_service.supabase_client.table("archon_tasks")
+                    .select("id, status")
+                    .in_("id", list(blocker_ids))
+                    .execute()
+                )
+                found_ids: set[str] = set()
+                for row in response.data or []:
+                    blocker_statuses[row["id"]] = row["status"]
+                    found_ids.add(row["id"])
+
+                # Mark non-existent blocker IDs
+                for bid in blocker_ids:
+                    if bid not in found_ids:
+                        blocker_statuses[bid] = None  # non-existent
+            except Exception as e:
+                logger.error(f"Auto-unblock: failed to fetch blocker statuses: {e}", exc_info=True)
+                return
+
+            # Process each blocked task
+            for task in blocked_tasks:
+                task_id = task["id"]
+                blocked_by = task.get("blocked_by") or []
+                resolved: list[str] = []
+                invalid: list[str] = []
+                still_blocking: list[str] = []
+
+                for bid in blocked_by:
+                    status = blocker_statuses.get(bid)
+                    if status is None:
+                        invalid.append(bid)
+                        resolved.append(bid)
+                    elif status in terminal_statuses:
+                        resolved.append(bid)
+                    else:
+                        still_blocking.append(bid)
+
+                if not resolved:
+                    continue
+
+                # Compute remaining blockers
+                remaining = still_blocking
+
+                # Update the task to remove resolved blockers
+                try:
+                    update_data: dict[str, Any] = {
+                        "blocked_by": remaining if remaining else [],
+                    }
+                    self.task_service.supabase_client.table("archon_tasks").update(
+                        update_data
+                    ).eq("id", task_id).execute()
+
+                    logger.info(
+                        f"Auto-unblock: cleared {len(resolved)} blocker(s) | "
+                        f"task_id={task_id} | "
+                        f"cleared={resolved} | "
+                        f"remaining={remaining}"
+                    )
+
+                    if invalid:
+                        logger.warning(
+                            f"Auto-unblock: invalid blocker(s) detected | "
+                            f"task_id={task_id} | "
+                            f"invalid_ids={invalid}"
+                        )
+
+                    # Emit event via notifier
+                    await self.notifier.emit(
+                        "task.auto_unblocked",
+                        task_id=task_id,
+                        data={
+                            "task_id": task_id,
+                            "project_id": self.project_id,
+                            "cleared_blockers": resolved,
+                            "invalid_blockers": invalid,
+                            "remaining_blockers": remaining,
+                        },
+                    )
+                except Exception as e:
+                    logger.error(
+                        f"Auto-unblock: failed to update task | "
+                        f"task_id={task_id} | error={e}",
+                        exc_info=True,
+                    )
+
+        except Exception as e:
+            logger.error(f"Auto-unblock reconciliation failed: {e}", exc_info=True)
+
+    # ------------------------------------------------------------------
     # Retry and escalation policy
     # ------------------------------------------------------------------
 
@@ -1036,6 +1663,31 @@ class TaskEngine:
         )
 
         if retry_count < max_retries:
+            # Check feedback policy — escalate rather than retry if no actionable feedback exists
+            can_retry, policy_reason = await self._validate_retry_feedback_policy(task_id, retry_count)
+            if not can_retry:
+                await self.lifecycle_service.execute_transition(
+                    task_id=task_id,
+                    new_status="failed",
+                    changed_by="task-engine",
+                    reason=policy_reason,
+                )
+                if self._escalation_enabled:
+                    await self.lifecycle_service.execute_transition(
+                        task_id=task_id,
+                        new_status="escalated",
+                        changed_by="task-engine",
+                        reason=policy_reason,
+                    )
+                    await self.notifier.on_task_escalated(task_id, policy_reason, runtime=runtime)
+                    logger.warning(
+                        f"Task escalated — retry feedback policy blocked retry | task_id={task_id} | "
+                        f"reason={policy_reason}"
+                    )
+                else:
+                    await self.notifier.on_task_failed(task_id, policy_reason, runtime=runtime)
+                return
+
             await self.lifecycle_service.execute_transition(
                 task_id=task_id,
                 new_status="failed",
@@ -1067,6 +1719,130 @@ class TaskEngine:
             await self.notifier.on_task_failed(task_id, reason, runtime=runtime)
 
     # ------------------------------------------------------------------
+    # Review feedback artifacts
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _map_findings_to_feedback(raw_findings: list[Any]) -> list[dict[str, Any]]:
+        """Convert raw review findings to structured feedback records.
+
+        Severity-to-score mapping: critical=1.0, high=3.0, medium=6.0, low=8.0.
+        Explicit score fields are preserved (clamped to 0–10).
+        Non-dict entries are skipped.
+        """
+        _severity_score = {"critical": 1.0, "high": 3.0, "medium": 6.0, "low": 8.0}
+        result = []
+        for f in raw_findings:
+            if not isinstance(f, dict):
+                continue
+            criterion = f.get("type") or f.get("category") or "general"
+            if "score" in f:
+                score = float(f["score"])
+                score = max(0.0, min(10.0, score))
+            else:
+                severity = str(f.get("severity", "medium")).lower()
+                score = _severity_score.get(severity, 6.0)
+            result.append({
+                "criterion": criterion,
+                "score": score,
+                "passed": False,
+                "details": f.get("description", ""),
+                "evidence": f.get("evidence", ""),
+            })
+        return result
+
+    async def _write_review_feedback(
+        self,
+        task_id: str,
+        run_id: str | None,
+        task: dict[str, Any],
+        findings: list[Any],
+        overall_score: float | None,
+        verdict: str,
+        suggested_retry_direction: str | None,
+        reviewer_identity: str,
+        stage: str,
+    ) -> None:
+        """Persist a review feedback artifact to archon_review_feedback.
+
+        Extracts contract_revision from task.current_contract.version if present.
+        DB errors are non-fatal — the review pipeline must continue regardless.
+        """
+        contract_revision: int | None = None
+        current_contract = task.get("current_contract")
+        if isinstance(current_contract, dict):
+            contract_revision = current_contract.get("version")
+
+        mapped_findings = self._map_findings_to_feedback(findings)
+
+        row: dict[str, Any] = {
+            "task_id": task_id,
+            "run_id": run_id,
+            "contract_revision": contract_revision,
+            "findings": mapped_findings,
+            "overall_score": overall_score,
+            "verdict": verdict,
+            "suggested_retry_direction": suggested_retry_direction,
+            "reviewer_identity": reviewer_identity,
+        }
+
+        try:
+            self.task_service.supabase_client.table("archon_review_feedback").insert(row).execute()
+        except Exception as e:
+            logger.warning(f"Review feedback DB write failed (non-fatal) | task_id={task_id} | error={e}")
+
+        try:
+            await self.notifier.on_review_feedback_written(task_id, {
+                "verdict": verdict,
+                "reviewer_identity": reviewer_identity,
+                "overall_score": overall_score,
+                "stage": stage,
+                "contract_revision": contract_revision,
+            })
+        except Exception as e:
+            logger.warning(f"Review feedback event emit failed (non-fatal) | task_id={task_id} | error={e}")
+
+    async def _fetch_latest_review_feedback(self, task_id: str) -> dict[str, Any] | None:
+        """Fetch the most recent review feedback record for a task. Returns None on any error."""
+        try:
+            result = (
+                self.task_service.supabase_client
+                .table("archon_review_feedback")
+                .select("*")
+                .eq("task_id", task_id)
+                .order("created_at", desc=True)
+                .limit(1)
+                .execute()
+            )
+            rows = result.data or []
+            return rows[0] if rows else None
+        except Exception as e:
+            logger.warning(f"Fetch review feedback failed (non-fatal) | task_id={task_id} | error={e}")
+            return None
+
+    async def _validate_retry_feedback_policy(
+        self, task_id: str, retry_count: int
+    ) -> tuple[bool, str]:
+        """Check whether a retry is allowed based on the review feedback policy.
+
+        First failure (retry_count == 0) always proceeds.
+        Subsequent retries require feedback with at least findings or a suggested_retry_direction.
+        """
+        if retry_count == 0:
+            return True, ""
+
+        feedback = await self._fetch_latest_review_feedback(task_id)
+        if feedback is None:
+            return False, f"No review feedback found for task {task_id} on attempt {retry_count + 1}"
+
+        has_findings = bool(feedback.get("findings"))
+        has_direction = bool((feedback.get("suggested_retry_direction") or "").strip())
+        if not has_findings and not has_direction:
+            return False, f"Review feedback for task {task_id} is ambiguous — no findings or retry direction"
+
+        return True, ""
+
+    # ------------------------------------------------------------------
     # Main loop
     # ------------------------------------------------------------------
 
@@ -1074,10 +1850,56 @@ class TaskEngine:
         while self._running:
             try:
                 self._reap_completed()
+                had_work_before = bool(self._execution_tasks)
                 await self._poll_cycle()
+                has_work_after = bool(self._execution_tasks)
+
+                # Adaptive poll interval (C-P5-04)
+                poll_mode = self._get_poll_mode()
+                if poll_mode == "adaptive":
+                    sleep_seconds = self._compute_adaptive_interval(had_work_before, has_work_after)
+                else:
+                    sleep_seconds = self.poll_interval
             except Exception as e:
                 logger.error(f"Poll cycle error: {e}", exc_info=True)
-            await asyncio.sleep(self.poll_interval)
+                sleep_seconds = self.poll_interval
+            await asyncio.sleep(sleep_seconds)
+
+    def _get_poll_mode(self) -> str:
+        """Read poll_mode from engine policy capacity_policy."""
+        if not self.project_id:
+            return "fixed"
+        policy = self.engine_policy_service.get_active_policy(self.project_id)
+        if policy:
+            capacity = policy.get("capacity_policy") or {}
+            return capacity.get("poll_mode", "fixed")
+        return "fixed"
+
+    def _compute_adaptive_interval(self, had_work_before: bool, has_work_after: bool) -> float:
+        """Compute adaptive poll interval based on recent activity.
+
+        Tiers:
+        - Active (just spawned/running tasks): 2s
+        - Recent activity (just completed): 5s
+        - Idle (3+ cycles no work): 15s
+        - Deep idle (10+ cycles no work): 30s
+        """
+        if has_work_after:
+            self._adaptive_idle_cycles = 0
+            return self._adaptive_poll_intervals[0]  # 2s — active
+
+        if had_work_before and not has_work_after:
+            self._adaptive_idle_cycles = 0
+            return self._adaptive_poll_intervals[1]  # 5s — just completed
+
+        self._adaptive_idle_cycles += 1
+
+        if self._adaptive_idle_cycles >= 10:
+            return self._adaptive_poll_intervals[3]  # 30s — deep idle
+        if self._adaptive_idle_cycles >= 3:
+            return self._adaptive_poll_intervals[2]  # 15s — idle
+
+        return self._adaptive_poll_intervals[1]  # 5s — recent
 
     def _reap_completed(self) -> None:
         done = [tid for tid, t in self._execution_tasks.items() if t.done()]
@@ -1148,6 +1970,18 @@ class TaskEngine:
         return None
 
     async def _poll_cycle(self) -> None:
+        try:
+            await self._reconcile_stale_execute_runs()
+        except Exception as exc:
+            logger.warning(f"Stale execute run reconcile failed during poll cycle: {exc}")
+
+        # Lifecycle reconciliation every 3 cycles (D-P2-04)
+        if self._poll_cycle_count % 3 == 0:
+            try:
+                await self._reconcile_task_lifecycle()
+            except Exception as exc:
+                logger.warning(f"Lifecycle reconciliation failed during poll cycle: {exc}")
+
         if not self._has_capacity():
             return
 
@@ -1159,6 +1993,27 @@ class TaskEngine:
         # Auto-assign approved tasks every 3 cycles to avoid extra DB queries each poll
         if self._poll_cycle_count % 3 == 1:
             await self._assign_approved_tasks()
+
+        # Auto-unblock tasks with satisfied dependencies every 3 cycles (C-P5-03)
+        if self._poll_cycle_count % 3 == 2:
+            try:
+                await self._reconcile_blocked_dependencies()
+            except Exception as exc:
+                logger.warning(f"Dependency auto-unblock failed during poll cycle: {exc}")
+
+        # Stalled run detection every 6 cycles (D-P2-02)
+        if self._poll_cycle_count % 6 == 3:
+            try:
+                await self._detect_stalled_runs()
+            except Exception as exc:
+                logger.warning(f"Stalled run detection failed during poll cycle: {exc}")
+
+        # Coordinator parent advancement every 3 cycles (C-P7-03)
+        if self._poll_cycle_count % 3 == 1:
+            try:
+                await self._advance_coordinator_parents()
+            except Exception as exc:
+                logger.warning(f"Coordinator parent advancement failed during poll cycle: {exc}")
 
         success, result = self.task_service.list_tasks(
             project_id=self.project_id,
@@ -1175,11 +2030,26 @@ class TaskEngine:
         if not tasks:
             return
 
-        priority_order = {"critical": 0, "high": 1, "medium": 2, "low": 3}
-        tasks.sort(key=lambda t: (
-            priority_order.get(t.get("priority", "medium"), 2),
-            t.get("created_at", ""),
-        ))
+        # Determine scheduling mode from engine policy
+        scheduling_mode = "fifo"
+        all_project_tasks: list[dict[str, Any]] | None = None
+        if self.project_id:
+            policy = self.engine_policy_service.get_active_policy(self.project_id)
+            if policy:
+                capacity = policy.get("capacity_policy") or {}
+                scheduling_mode = capacity.get("scheduling_mode", "fifo")
+
+        if scheduling_mode == "priority_weighted" and self.project_id:
+            # Fetch all non-terminal tasks for blocking_count computation
+            ok, all_result = self.task_service.list_tasks(
+                project_id=self.project_id,
+                include_closed=False,
+                include_archived=False,
+            )
+            if ok:
+                all_project_tasks = all_result.get("tasks", [])
+
+        tasks = score_and_sort_tasks(tasks, all_project_tasks, mode=scheduling_mode)
 
         # Check budget before spawning tasks
         if self.project_id:
@@ -1354,6 +2224,29 @@ class TaskEngine:
             )
             if ok:
                 logger.info(f"Auto-assigned approved task | task_id={task_id}")
+            elif res.get("contract_gate"):
+                contract_id = res.get("contract_id", "")
+                contract_status = res.get("contract_status", "unknown")
+                blocked_transition = res.get("blocked_transition", "approved → assigned")
+                logger.warning(
+                    "Contract gate blocked auto-assign | task_id=%s | contract_id=%s | "
+                    "contract_status=%s | blocked_transition=%s",
+                    task_id,
+                    contract_id,
+                    contract_status,
+                    blocked_transition,
+                )
+                await self.notifier.emit(
+                    EVENT_TASK_CONTRACT_GATE_BLOCKED,
+                    task_id=task_id,
+                    data={
+                        "task_id": task_id,
+                        "contract_id": contract_id,
+                        "contract_status": contract_status,
+                        "blocked_transition": blocked_transition,
+                        "reason": res.get("error", ""),
+                    },
+                )
             else:
                 logger.warning(f"Failed to auto-assign task | task_id={task_id} | error={res.get('error')}")
 
@@ -1385,7 +2278,7 @@ class TaskEngine:
             )
             # Kill any lingering CC process for this task
             try:
-                await self.spawner.kill(task_id)
+                await self._kill_task_process(task_id)
             except Exception:
                 pass
             timeout_reason = f"Execution timed out after {timeout_seconds // 60}m"
@@ -1412,6 +2305,51 @@ class TaskEngine:
                 stderr=f"Task-level timeout after {timeout_seconds}s",
                 exit_code=-1,
                 duration_seconds=timeout_seconds,
+            )
+        except Exception as exc:
+            logger.error(
+                "Task execution crashed before completion | task_id=%s | error=%s",
+                task_id,
+                exc,
+                exc_info=True,
+            )
+            try:
+                await self._kill_task_process(task_id)
+            except Exception:
+                pass
+
+            crash_reason = str(exc)[:500] or "Runner execution crashed unexpectedly"
+            ok, result = self.execution_run_service.list_runs(
+                task_id=task_id,
+                status="running",
+                stage="execute",
+                limit=1,
+            )
+            if ok and result.get("runs"):
+                await self._update_execution_run(
+                    result["runs"][0]["id"],
+                    status="failed",
+                    finished_at=datetime.now().isoformat(),
+                    error_summary=crash_reason,
+                )
+
+            await self.task_service.update_task(
+                task_id=task_id,
+                update_fields={
+                    "execution_result": {
+                        "exit_code": -1,
+                        "crashed": True,
+                        "stderr_preview": crash_reason,
+                    }
+                },
+            )
+            await self._handle_task_failure(task_id, task, crash_reason)
+            return CCExecutionResult(
+                success=False,
+                stdout="",
+                stderr=crash_reason,
+                exit_code=-1,
+                duration_seconds=0,
             )
 
     async def _execute_task(
@@ -1583,6 +2521,7 @@ class TaskEngine:
         return (
             self._stage_claim,
             self._stage_policy_load,
+            self._stage_contract_negotiation,
             self._stage_guidance_injection,
             self._stage_boundary_injection,
             self._stage_workspace_acquire,
@@ -1737,6 +2676,7 @@ class TaskEngine:
         """
         return (
             self._stage_claim,
+            self._stage_pre_validation,
             self._stage_policy_load,
             self._stage_guidance_injection,
             self._stage_boundary_injection,
@@ -1789,6 +2729,69 @@ class TaskEngine:
         state.full_task = full["task"]
         return state
 
+    async def _stage_pre_validation(self, state: TaskExecutionState) -> TaskExecutionState:
+        """Pre-execution scope validation gate (B-P4-02).
+
+        Validates task readiness before investing in policy loading and prompt
+        building. Catches issues that would otherwise waste an entire execution run.
+
+        Checks:
+        1. Contract lock gate: if task has a contract, it must be locked
+        2. allowed_paths validity: paths must be parseable globs
+        3. Dependencies: final re-check that blocked_by is clear
+        """
+        if state.full_task is None:
+            return state
+
+        task = state.full_task
+        task_id = state.task_id
+        issues: list[str] = []
+
+        # 1. Contract lock gate
+        current_contract = task.get("current_contract")
+        if isinstance(current_contract, dict):
+            contract_status = current_contract.get("negotiation_status", "")
+            if contract_status and contract_status != "locked":
+                issues.append(f"Contract not locked (status={contract_status})")
+
+        # 2. allowed_paths validity
+        allowed_paths = task.get("allowed_paths") or []
+        if allowed_paths:
+            for path in allowed_paths:
+                if not isinstance(path, str) or not path.strip():
+                    issues.append(f"Invalid allowed_path entry: {path!r}")
+                    break
+
+        # 3. Dependencies final check
+        blocked_by = task.get("blocked_by") or []
+        if blocked_by:
+            still_blocked = self._recheck_blocked_by(task_id, blocked_by)
+            if still_blocked:
+                issues.append(f"Unresolved blockers: {still_blocked}")
+
+        if issues:
+            reason = f"Pre-validation failed: {'; '.join(issues)}"
+            logger.warning(f"Pre-validation gate | task_id={task_id} | issues={issues}")
+            await self.notifier.emit(
+                "engine.pre_validation_failed",
+                task_id=task_id,
+                data={
+                    "task_id": task_id,
+                    "issues": issues,
+                    "project_id": task.get("project_id"),
+                },
+            )
+            state.final_result = CCExecutionResult(
+                success=False,
+                stdout="",
+                stderr=reason,
+                exit_code=-3,
+                duration_seconds=0,
+            )
+            return state
+
+        return state
+
     async def _stage_policy_load(self, state: TaskExecutionState) -> TaskExecutionState:
         """Load routing policy, approval state, and the execution lifecycle claim."""
         if state.full_task is None:
@@ -1812,6 +2815,9 @@ class TaskEngine:
         if os.environ.get("LEANKIT_ENGINE_DISABLE_CODEX", "").lower() in ("1", "true", "yes"):
             state.model_routing = state.model_routing or {}
             state.model_routing["disable_codex"] = True
+        if os.environ.get("LEANKIT_ENGINE_DISABLE_CLAUDE_CODE", "").lower() in ("1", "true", "yes"):
+            state.model_routing = state.model_routing or {}
+            state.model_routing["disable_claude_code"] = True
 
         if state.model_routing and state.model_routing.get("force_model"):
             state.full_task = {**state.full_task, "_policy_force_model": state.model_routing["force_model"]}
@@ -1866,14 +2872,139 @@ class TaskEngine:
             )
         return state
 
+    async def _stage_contract_negotiation(self, state: TaskExecutionState) -> TaskExecutionState:
+        """Adversarially enrich the draft contract before execution begins.
+
+        Reads the current draft contract from archon_task_contracts, calls
+        enrich_contract_adversarially() to tighten thresholds and add missing
+        edge cases, then persists the enriched criteria back with
+        negotiation_status='negotiated'. Contracts already negotiated or locked
+        are skipped (idempotent on retry). After enrichment, locks the contract.
+        """
+        if state.full_task is None or state.final_result is not None:
+            return state
+
+        contract_id = state.full_task.get("current_contract_id")
+        if not contract_id:
+            # Not contract-managed — skip silently
+            return state
+
+        ok, result = self.task_service.get_contract(contract_id)
+        if not ok:
+            logger.warning(
+                f"Could not fetch contract for negotiation | task_id={state.task_id} | error={result.get('error')}"
+            )
+            return state
+
+        contract = result["contract"]
+        neg_status = contract.get("negotiation_status", "draft")
+        if neg_status in ("negotiated", "locked"):
+            logger.info(
+                f"Contract already {neg_status}, skipping negotiation | task_id={state.task_id}"
+            )
+            return state
+
+        # Build proposed criteria from DB contract acceptance_criteria
+        db_criteria: list[dict[str, Any]] = contract.get("acceptance_criteria") or []
+        proposed_criteria = [
+            {
+                "criterion": c.get("description") or c.get("name") or "",
+                "threshold": c.get("threshold") or "",
+                "category": c.get("category") or "functional",
+            }
+            for c in db_criteria
+            if c.get("description") or c.get("name")
+        ]
+
+        from .review_prompts import enrich_contract_adversarially
+        enriched = enrich_contract_adversarially(state.full_task, proposed_criteria)
+
+        # Map enriched criteria back to DB format
+        db_enriched: list[dict[str, Any]] = [
+            {
+                "name": c.get("criterion", "")[:100],
+                "description": c.get("criterion", ""),
+                "threshold": c.get("threshold") or "",
+                "category": c.get("category", "functional"),
+                "added_by": c.get("added_by"),
+            }
+            for c in enriched
+        ]
+
+        # Update contract with enriched criteria
+        update_ok, _ = self.task_service.update_contract(
+            contract_id=contract_id,
+            update_fields={
+                "acceptance_criteria": db_enriched,
+                "negotiation_status": "negotiated",
+                "source_stage": "pre-execute",
+                "negotiated_by": "task-engine",
+            },
+        )
+
+        if update_ok:
+            added = len(enriched) - len(proposed_criteria)
+            logger.info(
+                f"Contract negotiated | task_id={state.task_id} | "
+                f"criteria_before={len(proposed_criteria)} | after={len(enriched)} | added={added}"
+            )
+            # Lock the contract immediately after negotiation
+            lock_ok, _ = self.task_service.lock_contract(contract_id, locked_by="task-engine")
+            if lock_ok:
+                logger.info(f"Contract locked | task_id={state.task_id} | contract_id={contract_id}")
+            else:
+                logger.warning(f"Contract lock failed | task_id={state.task_id} | contract_id={contract_id}")
+        else:
+            logger.warning(f"Contract negotiation update failed | task_id={state.task_id}")
+
+        return state
+
     async def _stage_guidance_injection(self, state: TaskExecutionState) -> TaskExecutionState:
-        """Build the unified prompt and record prompt injection statistics."""
+        """Build the unified prompt and record prompt injection statistics.
+
+        For retry attempts (retry_index > 0), fetches the latest structured
+        review feedback and passes it to the prompt builder so retries get
+        targeted context instead of raw execution_result dumps.
+        """
         if state.full_task is None:
             return state
+
+        # Fetch structured review feedback for retry runs (B-P4-01)
+        review_feedback: dict[str, Any] | None = None
+        retry_count = state.full_task.get("retry_count") or 0
+        if retry_count > 0:
+            review_feedback = await self._fetch_latest_review_feedback(state.task_id)
+            if review_feedback:
+                logger.info(
+                    f"Retry context injected | task_id={state.task_id} | "
+                    f"retry={retry_count} | "
+                    f"verdict={review_feedback.get('verdict')} | "
+                    f"findings_count={len(review_feedback.get('findings') or [])}"
+                )
+                # Store retry_context summary in run metadata for auditability
+                if state.run_metadata is None:
+                    state.run_metadata = {}
+                state.run_metadata["retry_context"] = {
+                    "source_run_id": review_feedback.get("run_id"),
+                    "verdict": review_feedback.get("verdict"),
+                    "reviewer_identity": review_feedback.get("reviewer_identity"),
+                    "findings_count": len(review_feedback.get("findings") or []),
+                    "failed_criteria": [
+                        f.get("criterion") for f in (review_feedback.get("findings") or [])
+                        if isinstance(f, dict) and not f.get("passed", True)
+                    ],
+                    "suggested_direction": review_feedback.get("suggested_retry_direction"),
+                    "contract_revision": review_feedback.get("contract_revision"),
+                }
+            else:
+                logger.warning(
+                    f"No review feedback for retry | task_id={state.task_id} | retry={retry_count}"
+                )
 
         state.prompt, state.injection_stats = await self.prompt_builder.build(
             task=state.full_task,
             build_command=self.project_config.build_command,
+            review_feedback=review_feedback,
         )
         logger.info(
             f"Injection stats | task_id={state.task_id} | "
@@ -1994,9 +3125,33 @@ class TaskEngine:
             return state
 
         await self.notifier.on_task_started(state.full_task, runtime=state.execute_runtime)
+
+        # Lifecycle hook: capture run start context
+        start_ctx = LifecycleHooks.capture_run_start(
+            task=state.full_task,
+            model=state.selected_model,
+            token_profile=state.token_profile_name,
+            contract=state.full_task.get("current_contract"),
+            runner_key=state.runner_key,
+        )
+        if state.run_metadata is None:
+            state.run_metadata = {}
+        state.run_metadata.setdefault("lifecycle", {})["start"] = start_ctx
+
         state.exec_health_monitor = ExecutionHealthMonitor()
 
+        # Apply per-profile tool budget from engine policy (C-P6-02)
+        if state.token_profile_name and state.policy:
+            capacity = (state.policy.get("capacity_policy") or {})
+            tool_budgets = capacity.get("tool_call_budget") or {}
+            profile_budget = tool_budgets.get(state.token_profile_name)
+            if isinstance(profile_budget, int) and profile_budget > 0:
+                state.exec_health_monitor.set_task_total_limit(state.task_id, profile_budget)
+
+        last_heartbeat_monotonic = 0.0
+
         async def _on_stream(tid: str, stream_event: dict[str, Any]) -> None:
+            nonlocal last_heartbeat_monotonic
             await self.notifier.on_agent_status(
                 task_id=tid,
                 agent_id=tid,
@@ -2009,6 +3164,13 @@ class TaskEngine:
                     agent_id=tid,
                 ),
             )
+            now_monotonic = asyncio.get_running_loop().time()
+            if (
+                state.execute_run_id
+                and (now_monotonic - last_heartbeat_monotonic) >= self._run_heartbeat_interval_seconds
+            ):
+                last_heartbeat_monotonic = now_monotonic
+                await self._touch_execution_run_heartbeat(state.execute_run_id)
             if state.abort_reasons:
                 return
             if state.exec_health_monitor is None:
@@ -2197,7 +3359,10 @@ class TaskEngine:
             if state.runner_result.success and state.runner_result.parsed.get("result", "").upper() != "FAILURE"
             else "failed"
         )
+        # Preserve any metadata set by earlier stages (e.g. retry_context from B-P4-01)
+        prior_metadata = state.run_metadata or {}
         state.run_metadata = {
+            **prior_metadata,
             "result": state.runner_result.parsed.get("result"),
             "files_changed": state.runner_result.parsed.get("files_changed"),
             "tests_added": state.runner_result.parsed.get("tests_added"),
@@ -2214,6 +3379,26 @@ class TaskEngine:
         if injected_env_keys is not None:
             state.run_metadata["injected_env_keys"] = injected_env_keys
 
+        # Lifecycle hook: capture run stop context
+        stop_metrics = {}
+        if state.exec_health_monitor is not None:
+            snapshot = state.exec_health_monitor.get_metrics_snapshot(state.task_id)
+            stop_metrics["total_tool_calls"] = snapshot.get("total_count", 0)
+        stop_ctx = LifecycleHooks.capture_run_stop(
+            result=state.runner_result.parsed if state.runner_result else None,
+            runner_result=state.runner_result,
+            metrics=stop_metrics,
+        )
+        state.run_metadata.setdefault("lifecycle", {})["stop"] = stop_ctx
+
+        # Record tool call metrics in run metadata (C-P6-02)
+        if state.exec_health_monitor is not None:
+            health_snapshot = state.exec_health_monitor.get_metrics_snapshot(state.task_id)
+            state.run_metadata["total_tool_calls"] = health_snapshot.get("total_count", 0)
+            state.run_metadata["tool_budget_limit"] = state.exec_health_monitor.get_task_total_limit(state.task_id)
+            if state.token_profile_name:
+                state.run_metadata["profile_used"] = state.token_profile_name
+
         if state.runner_result.timed_out or not state.runner_result.success:
             partial_context = self._extract_partial_context(state.runner_result)
             if (
@@ -2223,6 +3408,16 @@ class TaskEngine:
             ):
                 state.run_metadata["partial_context"] = partial_context
                 state.execution_result["partial_context"] = partial_context
+
+            # Lifecycle hook: capture timeout context for retry continuity
+            if state.runner_result.timed_out:
+                timeout_ctx = LifecycleHooks.capture_run_timeout(
+                    runner_result=state.runner_result,
+                    elapsed_seconds=state.runner_result.duration_seconds or 0,
+                    partial_files=partial_context.get("files_modified"),
+                    partial_output=partial_context.get("partial_output"),
+                )
+                state.run_metadata.setdefault("lifecycle", {})["timeout"] = timeout_ctx
 
         state.llm_metrics = {}
         if state.runner_result.parsed.get("llm_input_tokens") is not None:
@@ -2422,6 +3617,7 @@ class TaskEngine:
         effective_review_config = self._review_config_for_policy(policy)
         model_routing = policy.get("model_routing") or None if policy else None
         collaboration_mode = resolve_collaboration_mode(task, model_routing)
+        _contract = task.get("current_contract") or {}
         architect_run_id = await self._create_execution_run(
             task_id=task_id,
             project_id=project_id,
@@ -2433,6 +3629,8 @@ class TaskEngine:
             metadata={
                 "mode": effective_review_config.review_mode,
                 "collaboration_mode": collaboration_mode,
+                "contract_id": _contract.get("id"),
+                "contract_version": _contract.get("version"),
             },
         )
 
@@ -2542,7 +3740,36 @@ class TaskEngine:
                 # Run independent code review (fresh CC session)
                 await self._run_code_review(task_id, execution_result)
             else:
-                # Independent review disabled → go directly to review
+                # Independent review disabled → go directly to review.
+                # Lock proposed contract into the JSONB mirror field so downstream
+                # owner-review can reference it without a formal contract record.
+                proposed = (execution_result or {}).get("proposed_contract")
+                if isinstance(proposed, list):
+                    review_data["locked_contract"] = proposed
+
+                # Build evaluator payloads for architect-review and the upcoming owner-review
+                # using the updated task state (with locked_contract now in architect_review).
+                local_task = {**task, "architect_review": review_data}
+                ar_evaluator_template = resolve_evaluator_template("architect-review", policy)
+                ar_contract_evaluator = build_contract_aware_evaluator(
+                    "architect-review", local_task, execution_result, policy=policy
+                )
+                owner_template = resolve_evaluator_template("owner-review", policy)
+                owner_summary = build_owner_review_summary(
+                    local_task, execution_result, review_context={"stage": "architect-review"}
+                )
+                owner_evaluator = build_contract_aware_evaluator(
+                    "owner-review", local_task, execution_result, policy=policy
+                )
+                review_data["evaluator_template"] = ar_evaluator_template
+                review_data["contract_evaluator"] = ar_contract_evaluator
+                review_data["owner_review"] = {
+                    "template": owner_template,
+                    "contract_evaluator": owner_evaluator,
+                    "summary": owner_summary,
+                }
+                review_data["summary"] = owner_summary["comparison_digest"]
+
                 await self.lifecycle_service.execute_transition(
                     task_id=task_id,
                     new_status="review",
@@ -2579,6 +3806,19 @@ class TaskEngine:
                         session_id=task_id,
                     ),
                 )
+
+            # Persist feedback artifact for rejection/escalation (enables retry context + audit)
+            await self._write_review_feedback(
+                task_id=task_id,
+                run_id=architect_run_id,
+                task=task,
+                findings=review_result.findings or [],
+                overall_score=review_result.confidence,
+                verdict=review_result.verdict,
+                suggested_retry_direction=review_result.feedback or action.reason,
+                reviewer_identity=action.changed_by or "architect-reviewer",
+                stage="architect-review",
+            )
 
             # Auto-create bug tasks from review findings
             if review_result.findings:
@@ -2628,6 +3868,31 @@ class TaskEngine:
 
     # Max review cycles before escalation
     MAX_CODE_REVIEW_CYCLES = 2
+
+    def _load_formal_contract_criteria(self, task: dict[str, Any]) -> list[dict[str, Any]]:
+        """Load contract criteria from archon_task_contracts using current_contract_id.
+
+        Returns the acceptance_criteria list from the formal contract record, or an
+        empty list if no current_contract_id is set or the record cannot be fetched.
+        The caller injects the returned value into the task dict as
+        ``_formal_contract_criteria`` before passing it to prompt builders.
+        """
+        contract_id = task.get("current_contract_id")
+        if not contract_id:
+            return []
+        ok, result = self.task_service.get_contract(contract_id)
+        if not ok:
+            logger.warning(
+                "Could not load formal contract | task_id=%s | contract_id=%s | error=%s",
+                task.get("id"),
+                contract_id,
+                result.get("error"),
+            )
+            return []
+        criteria = result["contract"].get("acceptance_criteria")
+        if not isinstance(criteria, list):
+            return []
+        return criteria
 
     @staticmethod
     def _build_code_review_prompt(
@@ -2752,6 +4017,7 @@ class TaskEngine:
             )
             return
 
+        _cr_contract = task.get("current_contract") or {}
         code_review_run_id = await self._create_execution_run(
             task_id=task_id,
             project_id=self._resolve_project_id(task),
@@ -2765,14 +4031,23 @@ class TaskEngine:
                 "runner_key": review_runner_key,
                 "source_app": self._runner_source_app(review_runner, review_runner_key),
                 "runner_routing_reason": review_routing_reason,
+                "contract_id": _cr_contract.get("id"),
+                "contract_version": _cr_contract.get("version"),
             },
         )
 
         # Get git diff
         git_diff = await self._get_git_diff(task_id)
 
-        # Build reviewer prompt
-        prompt = self._build_code_review_prompt(task, git_diff)
+        # Load formal contract from archon_task_contracts and inject into task dict
+        # so the contract-aware prompt builder can reference it.  The mirror field
+        # (architect_review.locked_contract) is preserved as a fallback.
+        formal_criteria = self._load_formal_contract_criteria(task)
+        if formal_criteria:
+            task = {**task, "_formal_contract_criteria": formal_criteria}
+
+        # Build contract-aware reviewer prompt using the formal contract criteria
+        prompt = build_adversarial_code_review_prompt(task, git_diff, policy=policy)
 
         # Spawn fresh CC session with Sonnet model (cost saving)
         review_config = ProjectConfig(
@@ -2821,6 +4096,28 @@ class TaskEngine:
         }
         if review_result.stderr:
             code_review_data["stderr_preview"] = review_result.stderr[:500]
+
+        # Build contract-aware evaluator payloads for code-review and owner-review stages.
+        # Formal contract criteria are already injected into `task` as `_formal_contract_criteria`
+        # when `current_contract_id` is set; the JSONB mirror is the fallback.
+        code_review_context = {"stage": "code-review", "verdict": verdict}
+        cr_evaluator_template = resolve_evaluator_template("code-review", policy)
+        cr_contract_evaluator = build_contract_aware_evaluator("code-review", task, execution_result, policy=policy)
+        owner_template = resolve_evaluator_template("owner-review", policy)
+        owner_review_summary_data = build_owner_review_summary(
+            task, execution_result, review_context=code_review_context
+        )
+        owner_review_evaluator = build_contract_aware_evaluator(
+            "owner-review", task, execution_result, review_context=code_review_context, policy=policy
+        )
+        code_review_data["evaluator_template"] = cr_evaluator_template
+        code_review_data["contract_evaluator"] = cr_contract_evaluator
+        code_review_data["summary"] = owner_review_summary_data["comparison_digest"]
+        code_review_data["owner_review"] = {
+            "template": owner_template,
+            "contract_evaluator": owner_review_evaluator,
+            "summary": owner_review_summary_data,
+        }
 
         # Build quality gate score for the code review
         code_review_as_review = ArchitectReviewResult(
@@ -2906,23 +4203,63 @@ class TaskEngine:
 
         # Decide next action based on verdict
         if verdict == "APPROVE":
-            await self.lifecycle_service.execute_transition(
-                task_id=task_id,
-                new_status="review",
-                changed_by="code-reviewer",
-                reason="Code review approved",
+            # Check auto-approval policy (B-P4-03)
+            auto_tier = self._get_auto_approval_tier(policy)
+            can_auto, auto_reason = evaluate_auto_approval(
+                stage="code-review",
+                task=task,
+                execution_result=execution_result,
+                tier=auto_tier,
+                boundary_validation=task.get("_boundary_validation"),
             )
-            await self.notifier.on_task_review_ready(
-                task_id,
-                code_review_data,
-                runtime=self._build_runtime_context(
-                    task,
-                    stage="code-review",
-                    execution_run_id=code_review_run_id,
-                    session_id=f"{task_id}-review",
-                ),
-            )
-            logger.info(f"Code review approved | task_id={task_id}")
+
+            if can_auto:
+                # Auto-approve: skip manual "review" → go directly to "done"
+                await self.lifecycle_service.execute_transition(
+                    task_id=task_id,
+                    new_status="review",
+                    changed_by="code-reviewer",
+                    reason="Code review approved",
+                )
+                await self.lifecycle_service.execute_transition(
+                    task_id=task_id,
+                    new_status="done",
+                    changed_by="auto-approval",
+                    reason=f"Auto-approved (tier {auto_tier}): {auto_reason}",
+                )
+                await self.notifier.emit(
+                    "task.auto_approved",
+                    task_id=task_id,
+                    data={
+                        "tier": auto_tier,
+                        "stage": "code-review",
+                        "reason": auto_reason,
+                        "project_id": self._resolve_project_id(task),
+                    },
+                )
+                await self.notifier.on_task_done(task_id)
+                logger.info(
+                    f"Task auto-approved | task_id={task_id} | tier={auto_tier} | reason={auto_reason}"
+                )
+            else:
+                # Normal flow: manual review required
+                await self.lifecycle_service.execute_transition(
+                    task_id=task_id,
+                    new_status="review",
+                    changed_by="code-reviewer",
+                    reason="Code review approved",
+                )
+                await self.notifier.on_task_review_ready(
+                    task_id,
+                    code_review_data,
+                    runtime=self._build_runtime_context(
+                        task,
+                        stage="code-review",
+                        execution_run_id=code_review_run_id,
+                        session_id=f"{task_id}-review",
+                    ),
+                )
+                logger.info(f"Code review approved (manual review required) | task_id={task_id}")
 
         elif verdict == "REQUEST_CHANGES":
             # Check if we have review cycles left for auto-retry
@@ -2932,6 +4269,20 @@ class TaskEngine:
             feedback = "; ".join(
                 f.get("description", "") for f in findings[:5] if isinstance(f, dict)
             ) or "Changes requested by code reviewer"
+
+            # Persist feedback artifact for changes-requested (enables retry context + audit)
+            cr_verdict = "escalate" if (has_critical and new_cycle >= self.MAX_CODE_REVIEW_CYCLES) else "changes-requested"
+            await self._write_review_feedback(
+                task_id=task_id,
+                run_id=code_review_run_id,
+                task=task,
+                findings=findings if isinstance(findings, list) else [],
+                overall_score=code_review_as_review.confidence,
+                verdict=cr_verdict,
+                suggested_retry_direction=feedback,
+                reviewer_identity="code-reviewer",
+                stage="code-review",
+            )
 
             if has_critical and new_cycle >= self.MAX_CODE_REVIEW_CYCLES:
                 # Critical findings + max cycles → escalate

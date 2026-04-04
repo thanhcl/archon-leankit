@@ -13,9 +13,13 @@ from pydantic import BaseModel
 from ..config.logfire_config import get_logger
 from ..services.cost_budget_service import CostBudgetService
 from ..services.credential_service import credential_service
-from ..services.engine.runner_routing import get_runner_capabilities
+from ..services.engine.analytics_service import EngineAnalyticsService
+from ..services.engine.coordinator_service import CoordinatorService
+from ..services.engine.runner_routing import get_runner_capabilities, get_runtime_default_runner_key
+from ..services.engine.task_decomposer import TaskDecomposer
 from ..services.projects import ProjectService, TaskService
 from ..services.projects.execution_run_service import ExecutionRunService
+from ..services.projects.task_lifecycle_service import TaskLifecycleService
 
 logger = get_logger(__name__)
 
@@ -56,15 +60,26 @@ _DEFAULTS: dict[str, Any] = {
 }
 
 
+def _coerce_config_object(value: Any) -> dict[str, Any]:
+    """Normalize credential payloads stored as JSON strings or dicts."""
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            return {}
+        if isinstance(parsed, dict):
+            return parsed
+    return {}
+
+
 @router.get("/review-config")
 async def get_review_config():
     """Get current review configuration."""
     try:
         stored = await credential_service.get_credential(_CONFIG_KEY)
-        if stored and isinstance(stored, dict):
-            config = {**_DEFAULTS, **stored}
-        else:
-            config = dict(_DEFAULTS)
+        config = {**_DEFAULTS, **_coerce_config_object(stored)}
         return config
     except Exception as e:
         logger.error(f"Failed to get review config: {e}")
@@ -77,9 +92,7 @@ async def update_review_config(request: ReviewConfigRequest):
     try:
         # Get current config
         stored = await credential_service.get_credential(_CONFIG_KEY)
-        current = {**_DEFAULTS}
-        if stored and isinstance(stored, dict):
-            current.update(stored)
+        current = {**_DEFAULTS, **_coerce_config_object(stored)}
 
         # Apply updates
         updates = request.model_dump(exclude_none=True)
@@ -141,10 +154,7 @@ async def get_concurrency_config():
     """Get current engine concurrency limits."""
     try:
         stored = await credential_service.get_credential(_CONCURRENCY_CONFIG_KEY)
-        if stored and isinstance(stored, dict):
-            config = {**_CONCURRENCY_DEFAULTS, **stored}
-        else:
-            config = dict(_CONCURRENCY_DEFAULTS)
+        config = {**_CONCURRENCY_DEFAULTS, **_coerce_config_object(stored)}
         return config
     except Exception as e:
         logger.error(f"Failed to get concurrency config: {e}")
@@ -156,9 +166,7 @@ async def update_concurrency_config(request: ConcurrencyConfigRequest):
     """Update engine concurrency limits (takes effect on next engine restart)."""
     try:
         stored = await credential_service.get_credential(_CONCURRENCY_CONFIG_KEY)
-        current = {**_CONCURRENCY_DEFAULTS}
-        if stored and isinstance(stored, dict):
-            current.update(stored)
+        current = {**_CONCURRENCY_DEFAULTS, **_coerce_config_object(stored)}
 
         updates = request.model_dump(exclude_none=True)
         if not updates:
@@ -229,8 +237,9 @@ async def get_agent_pools():
     """
     try:
         stored = await credential_service.get_credential(_AGENT_POOLS_CONFIG_KEY)
-        if stored and isinstance(stored, dict):
-            return stored
+        config = _coerce_config_object(stored)
+        if config:
+            return config
         return dict(_AGENT_POOL_DEFAULTS)
     except Exception as e:
         logger.error(f"Failed to get agent pools config: {e}")
@@ -289,7 +298,7 @@ async def update_agent_pools(request: AgentPoolsConfigRequest):
 async def get_runner_capability_matrix():
     """Return the current runner capability matrix and default routing baseline."""
     return {
-        "default_runner": "claude-code-cli",
+        "default_runner": get_runtime_default_runner_key(),
         "runners": get_runner_capabilities(),
     }
 
@@ -316,7 +325,7 @@ async def register_engine_heartbeat(request: HeartbeatRequest):
     """
     try:
         stored = await credential_service.get_credential(_HEARTBEAT_CONFIG_KEY)
-        current: dict[str, Any] = stored if isinstance(stored, dict) else {}
+        current: dict[str, Any] = _coerce_config_object(stored)
 
         if request.started_at is not None:
             current["started_at"] = request.started_at
@@ -371,8 +380,7 @@ async def get_engine_status():
         # Get concurrency config
         stored = await credential_service.get_credential(_CONCURRENCY_CONFIG_KEY)
         concurrency_config = {**_CONCURRENCY_DEFAULTS}
-        if stored and isinstance(stored, dict):
-            concurrency_config.update(stored)
+        concurrency_config.update(_coerce_config_object(stored))
 
         max_global = concurrency_config["max_parallel_global"]
         default_per_project = concurrency_config["max_parallel_default"]
@@ -441,6 +449,22 @@ async def get_engine_status():
 _ORPHAN_THRESHOLD_SECONDS = int(os.environ.get("ENGINE_ORPHAN_THRESHOLD_SECONDS", "2400"))
 
 
+def _run_last_activity_at(run: dict[str, Any]) -> datetime | None:
+    """Return the freshest known activity timestamp for an execution run."""
+    for field_name in ("heartbeat_at", "updated_at", "started_at"):
+        raw_value = run.get(field_name)
+        if not isinstance(raw_value, str) or not raw_value.strip():
+            continue
+        try:
+            parsed = datetime.fromisoformat(raw_value.replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=UTC)
+        return parsed
+    return None
+
+
 @router.get("/health")
 async def get_engine_health():
     """Structured engine health including active runs, queue depth, capacity, budget, and PID watchdog status.
@@ -474,11 +498,10 @@ async def get_engine_health():
         # Get concurrency config and heartbeat state
         stored_concurrency = await credential_service.get_credential(_CONCURRENCY_CONFIG_KEY)
         concurrency_config = {**_CONCURRENCY_DEFAULTS}
-        if stored_concurrency and isinstance(stored_concurrency, dict):
-            concurrency_config.update(stored_concurrency)
+        concurrency_config.update(_coerce_config_object(stored_concurrency))
 
         stored_heartbeat = await credential_service.get_credential(_HEARTBEAT_CONFIG_KEY)
-        heartbeat: dict[str, Any] = stored_heartbeat if isinstance(stored_heartbeat, dict) else {}
+        heartbeat: dict[str, Any] = _coerce_config_object(stored_heartbeat)
 
         max_global = concurrency_config["max_parallel_global"]
         default_per_project = concurrency_config["max_parallel_default"]
@@ -500,18 +523,12 @@ async def get_engine_health():
         orphaned_run_ids: list[str] = []
         if ok_runs:
             for run in runs_result.get("runs", []):
-                started_at_raw = run.get("started_at")
-                if not started_at_raw:
+                activity_at = _run_last_activity_at(run)
+                if activity_at is None:
                     continue
-                try:
-                    started_at = datetime.fromisoformat(started_at_raw.replace("Z", "+00:00"))
-                    if started_at.tzinfo is None:
-                        started_at = started_at.replace(tzinfo=UTC)
-                    age_seconds = (now_utc - started_at).total_seconds()
-                    if age_seconds > _ORPHAN_THRESHOLD_SECONDS:
-                        orphaned_run_ids.append(run["id"])
-                except (ValueError, TypeError):
-                    pass
+                age_seconds = (now_utc - activity_at).total_seconds()
+                if age_seconds > _ORPHAN_THRESHOLD_SECONDS:
+                    orphaned_run_ids.append(run["id"])
 
         pid_watchdog_status = "orphaned_detected" if orphaned_run_ids else "ok"
 
@@ -560,6 +577,38 @@ async def get_engine_health():
         total_active = sum(per_project_executing.values())
         total_queued = sum(per_project_queued.values())
 
+        # Blocked task count (D-P2-01)
+        ok_blocked, blocked_result = task_service.list_tasks(
+            include_closed=False,
+            include_archived=False,
+            exclude_large_fields=True,
+        )
+        blocked_count = 0
+        if ok_blocked:
+            for t in blocked_result.get("tasks", []):
+                if (t.get("blocked_by") or []) and t.get("status") not in {"done", "cancelled", "failed"}:
+                    blocked_count += 1
+
+        # Completed/failed today counts (D-P2-01)
+        today_start = now_utc.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+        ok_completed, completed_result = run_service.list_runs(status="completed", limit=500)
+        completed_today = 0
+        failed_today = 0
+        if ok_completed:
+            for r in completed_result.get("runs", []):
+                fin = r.get("finished_at") or ""
+                if fin >= today_start:
+                    completed_today += 1
+
+        ok_failed_runs, failed_result = run_service.list_runs(status="failed", limit=500)
+        if ok_failed_runs:
+            for r in failed_result.get("runs", []):
+                fin = r.get("finished_at") or ""
+                if fin >= today_start:
+                    failed_today += 1
+
+        stalled_count = len(orphaned_run_ids)
+
         # Compute uptime from heartbeat started_at
         engine_started_at: str | None = heartbeat.get("started_at")
         last_poll_at: str | None = heartbeat.get("last_poll_at")
@@ -581,10 +630,32 @@ async def get_engine_health():
         else:
             overall_status = "idle"
 
+        # Compute health_score (0.0–1.0) (D-P2-01)
+        # Penalties: stalled runs, budget warnings, high blocked ratio
+        health_score = 1.0
+        if stalled_count > 0:
+            health_score -= min(0.3, stalled_count * 0.1)
+        if blocked_count > 5:
+            health_score -= min(0.2, (blocked_count - 5) * 0.02)
+        budget_warnings = sum(
+            1 for p in project_health
+            if p.get("budget", {}).get("status") in ("warning", "exceeded")
+        )
+        if budget_warnings > 0:
+            health_score -= min(0.2, budget_warnings * 0.1)
+        if failed_today > completed_today and completed_today > 0:
+            health_score -= 0.1
+        health_score = round(max(0.0, health_score), 2)
+
         return {
             "status": overall_status,
+            "health_score": health_score,
             "active_runs": total_active,
             "queue_depth": total_queued,
+            "blocked_tasks": blocked_count,
+            "stalled_runs": stalled_count,
+            "completed_today": completed_today,
+            "failed_today": failed_today,
             "started_at": engine_started_at,
             "uptime_seconds": uptime_seconds,
             "last_poll_at": last_poll_at,
@@ -603,6 +674,79 @@ async def get_engine_health():
 
     except Exception as e:
         logger.error(f"Failed to get engine health: {e}")
+        raise HTTPException(status_code=500, detail={"error": str(e)}) from e
+
+
+# ---------------------------------------------------------------------------
+# Engine slots — lightweight capacity check (C-P5-02)
+# ---------------------------------------------------------------------------
+
+
+@router.get("/slots")
+async def get_engine_slots():
+    """Lightweight slot capacity view without full health computation.
+
+    Returns per-project slot usage and global capacity.
+    No auth required — internal service endpoint.
+    """
+    try:
+        task_service = TaskService()
+        project_service = ProjectService()
+
+        ok, result = task_service.list_tasks(
+            status="executing",
+            include_closed=False,
+            include_archived=False,
+            exclude_large_fields=True,
+        )
+        executing_tasks = result.get("tasks", []) if ok else []
+
+        per_project: dict[str, int] = {}
+        for task in executing_tasks:
+            pid = task.get("project_id", "unknown")
+            per_project[pid] = per_project.get(pid, 0) + 1
+
+        stored = await credential_service.get_credential(_CONCURRENCY_CONFIG_KEY)
+        concurrency_config = {**_CONCURRENCY_DEFAULTS}
+        concurrency_config.update(_coerce_config_object(stored))
+
+        max_global = concurrency_config["max_parallel_global"]
+        default_per_project = concurrency_config["max_parallel_default"]
+        total_active = sum(per_project.values())
+
+        ok_proj, proj_result = project_service.list_office_configs()
+        project_slots = []
+        if ok_proj:
+            for proj in proj_result.get("projects", []):
+                pid = proj["id"]
+                settings = proj.get("office_settings") or {}
+                try:
+                    max_concurrent = int(settings.get("max_concurrent", default_per_project))
+                except (TypeError, ValueError):
+                    max_concurrent = default_per_project
+
+                used = per_project.get(pid, 0)
+                project_slots.append({
+                    "project_id": pid,
+                    "project_name": proj.get("title", ""),
+                    "active": used,
+                    "max": max_concurrent,
+                    "available": max(0, max_concurrent - used),
+                    "exhausted": used >= max_concurrent,
+                })
+
+        return {
+            "global": {
+                "total": max_global,
+                "active": total_active,
+                "available": max(0, max_global - total_active),
+                "exhausted": total_active >= max_global,
+            },
+            "projects": project_slots,
+        }
+
+    except Exception as e:
+        logger.error(f"Failed to get engine slots: {e}")
         raise HTTPException(status_code=500, detail={"error": str(e)}) from e
 
 
@@ -683,4 +827,152 @@ async def get_engine_queue():
 
     except Exception as e:
         logger.error(f"Failed to get engine queue: {e}")
+        raise HTTPException(status_code=500, detail={"error": str(e)}) from e
+
+
+# ---------------------------------------------------------------------------
+# Analytics endpoints (Batch 3: C-P6-03, C-P6-04, D-P2-03)
+# ---------------------------------------------------------------------------
+
+
+@router.get("/analytics/profiles")
+async def get_profile_analytics(project_id: str | None = None, days: int = 30):
+    """Per-profile success metrics with anomaly detection (C-P6-03).
+
+    Returns success_rate, avg_cost, avg_retries per token profile.
+    Flags profiles with consistently low success or over-provisioning.
+    """
+    try:
+        service = EngineAnalyticsService()
+        return service.get_profile_metrics(project_id=project_id, days=days)
+    except Exception as e:
+        logger.error(f"Failed to get profile analytics: {e}")
+        raise HTTPException(status_code=500, detail={"error": str(e)}) from e
+
+
+@router.get("/analytics/models")
+async def get_model_cost_analytics(project_id: str | None = None, days: int = 30):
+    """Model routing cost breakdown with savings recommendations (C-P6-04).
+
+    Returns cost per model × stage with suggestions to downgrade where appropriate.
+    """
+    try:
+        service = EngineAnalyticsService()
+        return service.get_model_cost_breakdown(project_id=project_id, days=days)
+    except Exception as e:
+        logger.error(f"Failed to get model cost analytics: {e}")
+        raise HTTPException(status_code=500, detail={"error": str(e)}) from e
+
+
+@router.get("/analytics/cost")
+async def get_cost_trending(project_id: str | None = None, days: int = 30):
+    """Cost attribution and trending with anomaly detection (D-P2-03).
+
+    Returns daily cost time series and flags runs with cost > 3x profile average.
+    """
+    try:
+        service = EngineAnalyticsService()
+        return service.get_cost_trending(project_id=project_id, days=days)
+    except Exception as e:
+        logger.error(f"Failed to get cost trending: {e}")
+        raise HTTPException(status_code=500, detail={"error": str(e)}) from e
+
+
+# ---------------------------------------------------------------------------
+# Coordinator endpoints (C-P7)
+# ---------------------------------------------------------------------------
+
+
+class CoordinatorDecomposeRequest(BaseModel):
+    task_id: str
+    children: list[dict[str, Any]] | None = None  # explicit specs, or auto-decompose if None
+
+
+@router.post("/coordinator/decompose")
+async def decompose_task(request: CoordinatorDecomposeRequest):
+    """Decompose a task into coordinator children.
+
+    If children specs are provided, creates them directly.
+    If not, uses TaskDecomposer to auto-generate specs from the task.
+    """
+    try:
+        task_service = TaskService()
+        lifecycle_service = TaskLifecycleService()
+
+        ok, result = task_service.get_task(request.task_id)
+        if not ok:
+            raise HTTPException(status_code=404, detail={"error": f"Task {request.task_id} not found"})
+
+        task = result["task"]
+
+        if request.children:
+            specs = request.children
+        else:
+            decomposer = TaskDecomposer()
+            should, reason = decomposer.should_decompose(task)
+            if not should:
+                return {"decomposed": False, "reason": reason, "children": []}
+            specs = decomposer.build_decomposition_specs(task)
+            if not specs:
+                return {"decomposed": False, "reason": "no decomposition specs generated", "children": []}
+
+        coordinator = CoordinatorService(task_service, lifecycle_service)
+        children = await coordinator.create_coordinator_children(
+            parent_task_id=request.task_id,
+            children_specs=specs,
+        )
+
+        return {
+            "decomposed": True,
+            "parent_task_id": request.task_id,
+            "children_count": len(children),
+            "children": [{"id": c.get("id"), "title": c.get("title"), "status": c.get("status")} for c in children],
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to decompose task: {e}")
+        raise HTTPException(status_code=500, detail={"error": str(e)}) from e
+
+
+@router.get("/coordinator/{task_id}/status")
+async def get_coordinator_status(task_id: str):
+    """Get coordinator task status including children summary."""
+    try:
+        task_service = TaskService()
+        coordinator = CoordinatorService(task_service)
+
+        ok, result = task_service.get_task(task_id)
+        if not ok:
+            raise HTTPException(status_code=404, detail={"error": f"Task {task_id} not found"})
+
+        task = result["task"]
+        if task.get("decomposition_mode") != "coordinator":
+            return {
+                "is_coordinator": False,
+                "task_id": task_id,
+                "decomposition_mode": task.get("decomposition_mode", "none"),
+            }
+
+        children = coordinator.get_coordinator_children(task_id)
+        should_advance, details = await coordinator.evaluate_parent_status(task_id)
+
+        return {
+            "is_coordinator": True,
+            "task_id": task_id,
+            "task_status": task.get("status"),
+            "children_count": len(children),
+            "children": [
+                {"id": c.get("id"), "title": c.get("title"), "status": c.get("status"), "priority": c.get("priority")}
+                for c in children
+            ],
+            "should_advance": should_advance,
+            "advancement_details": details,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to get coordinator status: {e}")
         raise HTTPException(status_code=500, detail={"error": str(e)}) from e

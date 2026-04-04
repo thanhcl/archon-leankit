@@ -8,7 +8,7 @@ import pytest
 from src.server.services.engine.architect_reviewer import ArchitectReviewResult, ReviewAction, ReviewConfig
 from src.server.services.engine.capacity_tracker import GlobalCapacityTracker
 from src.server.services.engine.cc_spawner import CCExecutionResult
-from src.server.services.engine.task_engine import TaskEngine
+from src.server.services.engine.task_engine import TaskEngine, TaskExecutionState
 
 
 def _make_task(**overrides):
@@ -113,9 +113,11 @@ def _setup_engine():
     engine.notifier.on_task_escalated = AsyncMock()
     engine.notifier.on_task_failed = AsyncMock()
     engine.notifier.on_code_review_changes_requested = AsyncMock()
+    engine.notifier.on_agent_status = AsyncMock()
     engine.health_monitor = MagicMock()
     engine.health_monitor.start = AsyncMock()
     engine.health_monitor.stop = AsyncMock()
+    engine._validate_retry_feedback_policy = AsyncMock(return_value=(True, ""))
     engine.bug_task_creator = MagicMock()
     engine.bug_task_creator.create_bug_tasks_from_findings = AsyncMock(return_value=[])
     engine.approval_request_service = MagicMock()
@@ -297,6 +299,7 @@ class TestExecuteTask:
 
         assert [stage.__name__ for stage in engine._build_execute_stage_chain()] == [
             "_stage_claim",
+            "_stage_pre_validation",
             "_stage_policy_load",
             "_stage_guidance_injection",
             "_stage_boundary_injection",
@@ -378,6 +381,30 @@ class TestExecuteTask:
 
         assert result is expected
         assert stage_calls == ["stage_one", "stage_appended", "stage_terminal"]
+
+    @pytest.mark.asyncio
+    async def test_stage_lifecycle_restore_updates_execution_run_heartbeat_from_stream(self):
+        engine = _setup_engine()
+        full_task = _make_task(id="task-001", status="executing")
+        state = TaskExecutionState(
+            task=full_task,
+            task_id="task-001",
+            full_task=full_task,
+            runner=engine.spawner,
+            execute_run_id="run-execute-001",
+        )
+
+        state = await engine._stage_lifecycle_restore(state)
+        assert state.stream_callback is not None
+
+        await state.stream_callback("task-001", {"event": "assistant", "message": "working"})
+
+        heartbeat_updates = [
+            call
+            for call in engine.execution_run_service.update_run.await_args_list
+            if call.args[0] == "run-execute-001" and "heartbeat_at" in call.args[1]
+        ]
+        assert heartbeat_updates
 
     @pytest.mark.asyncio
     async def test_success_full_pipeline(self):
@@ -554,6 +581,27 @@ class TestExecuteTask:
         assert review_config.review_mode == "api"
         architect_run = engine.execution_run_service.create_run.await_args_list[1].kwargs
         assert architect_run["metadata"]["mode"] == "api"
+
+    @pytest.mark.asyncio
+    async def test_engine_policy_review_policy_overrides_provider_and_model(self):
+        engine = _setup_engine()
+        engine.engine_policy_service.get_active_policy.return_value = {
+            "review_policy": {
+                "review_mode": "api",
+                "provider": "anthropic",
+                "model": "claude-opus-4-6",
+                "timeout": 90,
+            },
+        }
+
+        result = await engine._execute_task(_make_task())
+
+        assert result.success is True
+        review_config = engine.architect_reviewer.review.await_args.kwargs["config"]
+        assert review_config.review_mode == "api"
+        assert review_config.provider == "anthropic"
+        assert review_config.model == "claude-opus-4-6"
+        assert review_config.timeout == 90
 
     @pytest.mark.asyncio
     async def test_engine_policy_isolation_mode_overrides_project_config(self):
@@ -1286,6 +1334,36 @@ class TestRetryAndEscalationPolicy:
         assert "build error" in call_args[1]["reason"]
 
     @pytest.mark.asyncio
+    async def test_handle_failure_marks_failed_then_escalated_when_retry_feedback_missing(self):
+        engine = _setup_engine()
+        engine._escalation_enabled = True
+        engine._validate_retry_feedback_policy = AsyncMock(return_value=(False, "No review feedback"))
+        task = _make_task(status="executing", retry_count=1, max_retries=3)
+
+        await engine._handle_task_failure("task-001", task, "CC failed")
+
+        transition_calls = engine.lifecycle_service.execute_transition.call_args_list
+        statuses = [call.kwargs["new_status"] for call in transition_calls]
+        assert statuses[:2] == ["failed", "escalated"]
+        engine.notifier.on_task_escalated.assert_called_once()
+        engine.notifier.on_task_failed.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_handle_failure_marks_failed_when_retry_feedback_missing_and_escalation_disabled(self):
+        engine = _setup_engine()
+        engine._escalation_enabled = False
+        engine._validate_retry_feedback_policy = AsyncMock(return_value=(False, "No review feedback"))
+        task = _make_task(status="executing", retry_count=1, max_retries=3)
+
+        await engine._handle_task_failure("task-001", task, "CC failed")
+
+        transition_calls = engine.lifecycle_service.execute_transition.call_args_list
+        statuses = [call.kwargs["new_status"] for call in transition_calls]
+        assert statuses == ["failed"]
+        engine.notifier.on_task_failed.assert_called_once()
+        engine.notifier.on_task_escalated.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_schedule_retry_requeues_task_after_delay(self):
         engine = _setup_engine()
         engine._retry_delay = 0
@@ -1785,3 +1863,122 @@ class TestPipelineExecution:
         assert result.success is True
         # Standard chain spawns at least once (execution + optional code review)
         engine.spawner.spawn.assert_awaited()
+
+
+# ---------------------------------------------------------------------------
+# Tests: _assign_approved_tasks — contract gate observability
+# ---------------------------------------------------------------------------
+
+
+class TestAssignApprovedTasksContractGate:
+    """Engine must emit structured log + notifier event when contract gate blocks assignment."""
+
+    @pytest.mark.asyncio
+    async def test_assigns_when_no_contract_gate(self):
+        """Normal approved task (no contract) gets assigned without event."""
+        engine = _setup_engine()
+        engine.notifier.emit = AsyncMock()
+        approved_task = _make_task(id="t-approved", status="approved")
+        engine.task_service.list_tasks.return_value = (True, {"tasks": [approved_task]})
+        engine.lifecycle_service.execute_transition = AsyncMock(
+            return_value=(True, {"task": _make_task(id="t-approved", status="assigned")})
+        )
+
+        await engine._assign_approved_tasks()
+
+        engine.lifecycle_service.execute_transition.assert_awaited_once()
+        engine.notifier.emit.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_emits_contract_gate_event_when_unlocked(self):
+        """Engine emits task_contract_gate_blocked when lifecycle blocks due to unlocked contract."""
+        from src.server.services.engine.notifier import EVENT_TASK_CONTRACT_GATE_BLOCKED
+
+        engine = _setup_engine()
+        engine.notifier.emit = AsyncMock()
+        approved_task = _make_task(id="t-gated", status="approved")
+        engine.task_service.list_tasks.return_value = (True, {"tasks": [approved_task]})
+        engine.lifecycle_service.execute_transition = AsyncMock(
+            return_value=(
+                False,
+                {
+                    "error": "Contract must be locked before assignment.",
+                    "contract_gate": True,
+                    "contract_id": "ctr-001",
+                    "contract_status": "unlocked",
+                    "blocked_transition": "approved → assigned",
+                },
+            )
+        )
+
+        await engine._assign_approved_tasks()
+
+        engine.notifier.emit.assert_awaited_once()
+        call_args = engine.notifier.emit.call_args
+        assert call_args[0][0] == EVENT_TASK_CONTRACT_GATE_BLOCKED
+        assert call_args[1]["task_id"] == "t-gated"
+        data = call_args[1]["data"]
+        assert data["contract_id"] == "ctr-001"
+        assert data["contract_status"] == "unlocked"
+        assert data["blocked_transition"] == "approved → assigned"
+
+    @pytest.mark.asyncio
+    async def test_non_contract_failure_does_not_emit_gate_event(self):
+        """Ordinary assignment failure (not contract gate) must not emit the contract gate event."""
+        from src.server.services.engine.notifier import EVENT_TASK_CONTRACT_GATE_BLOCKED
+
+        engine = _setup_engine()
+        engine.notifier.emit = AsyncMock()
+        approved_task = _make_task(id="t-fail", status="approved")
+        engine.task_service.list_tasks.return_value = (True, {"tasks": [approved_task]})
+        engine.lifecycle_service.execute_transition = AsyncMock(
+            return_value=(False, {"error": "Invalid transition for some other reason"})
+        )
+
+        await engine._assign_approved_tasks()
+
+        for call in engine.notifier.emit.await_args_list:
+            assert call[0][0] != EVENT_TASK_CONTRACT_GATE_BLOCKED
+
+    @pytest.mark.asyncio
+    async def test_skips_assignment_does_not_call_execute_for_zero_tasks(self):
+        """No approved tasks → no transitions attempted."""
+        engine = _setup_engine()
+        engine.task_service.list_tasks.return_value = (True, {"tasks": []})
+        engine.lifecycle_service.execute_transition = AsyncMock()
+
+        await engine._assign_approved_tasks()
+
+        engine.lifecycle_service.execute_transition.assert_not_awaited()
+
+
+class TestPollCycleReconcile:
+    @pytest.mark.asyncio
+    async def test_poll_cycle_reconciles_stale_runs_before_capacity_gate(self):
+        engine = _setup_engine()
+        engine._reconcile_stale_execute_runs = AsyncMock()
+        engine.spawner.has_capacity = False
+
+        await engine._poll_cycle()
+
+        engine._reconcile_stale_execute_runs.assert_awaited_once()
+
+
+class TestTaskExecuteFailureContainment:
+    @pytest.mark.asyncio
+    async def test_execute_task_with_timeout_converts_spawn_exception_into_failed_run(self):
+        engine = _setup_engine()
+        task = _make_task(id="task-crash", status="assigned")
+        engine.spawner.spawn = AsyncMock(side_effect=TypeError("boom"))
+        engine.execution_run_service.list_runs.return_value = (
+            True,
+            {"runs": [{"id": "run-crash"}]},
+        )
+        engine._handle_task_failure = AsyncMock()
+
+        result = await engine._execute_task_with_timeout(task, timeout_seconds=30)
+
+        assert result.success is False
+        assert "boom" in result.stderr
+        engine.execution_run_service.update_run.assert_awaited()
+        engine._handle_task_failure.assert_awaited_once_with("task-crash", task, "boom")

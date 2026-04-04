@@ -66,8 +66,21 @@ _DEFAULT_POLICY: dict[str, Any] = {
         "clean_env": False,
         "allowed_tools": [],
     },
-    "review_policy": {},
-    "capacity_policy": {},
+    "review_policy": {
+        "auto_approval_tier": 0,
+    },
+    "capacity_policy": {
+        "scheduling_mode": "fifo",
+        "poll_mode": "fixed",
+        "tool_call_budget": {
+            "simple_bugfix": 20,
+            "standard_feature": 40,
+            "complex_architecture": 60,
+            "research_exploration": 80,
+        },
+        "stalled_warning_seconds": 300,
+        "stalled_kill_seconds": 600,
+    },
 }
 
 
