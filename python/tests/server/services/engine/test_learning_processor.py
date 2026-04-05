@@ -1,12 +1,16 @@
 """Tests for LearningProcessor — store, find, recurrence, auto-promote."""
 
+from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from src.server.services.engine.learning_processor import (
+    CONFIDENCE_FLOOR,
+    DECAY_PERIOD_DAYS,
     LearningProcessor,
     _code_pattern_key,
+    _effective_confidence,
     _keyword_overlap,
     _pattern_key,
 )
@@ -1066,3 +1070,345 @@ class TestPromotionLog:
         )
         call = log_table.insert.call_args[0][0]
         assert call["confidence"] == 0.95
+
+
+# ---------------------------------------------------------------------------
+# Tests: GStack-inspired structured reflection features
+# ---------------------------------------------------------------------------
+
+
+class TestEffectiveConfidence:
+    """Tests for _effective_confidence() — time-decay for learning confidence."""
+
+    def test_no_decay_for_fresh_learning(self):
+        now = datetime(2026, 4, 4)
+        learning = {"confidence": 8, "source": "observed", "created_at": now.isoformat()}
+        assert _effective_confidence(learning, now) == 8
+
+    def test_decay_one_point_per_30_days(self):
+        now = datetime(2026, 4, 4)
+        created = now - timedelta(days=30)
+        learning = {"confidence": 8, "source": "observed", "created_at": created.isoformat()}
+        assert _effective_confidence(learning, now) == 7
+
+    def test_decay_90_days_loses_3_points(self):
+        now = datetime(2026, 4, 4)
+        created = now - timedelta(days=90)
+        learning = {"confidence": 8, "source": "observed", "created_at": created.isoformat()}
+        assert _effective_confidence(learning, now) == 5
+
+    def test_decay_floors_at_zero(self):
+        now = datetime(2026, 4, 4)
+        created = now - timedelta(days=365)
+        learning = {"confidence": 5, "source": "inferred", "created_at": created.isoformat()}
+        assert _effective_confidence(learning, now) == 0
+
+    def test_user_stated_never_decays(self):
+        now = datetime(2026, 4, 4)
+        created = now - timedelta(days=365)
+        learning = {"confidence": 9, "source": "user_stated", "created_at": created.isoformat()}
+        assert _effective_confidence(learning, now) == 9
+
+    def test_inferred_source_decays(self):
+        now = datetime(2026, 4, 4)
+        created = now - timedelta(days=60)
+        learning = {"confidence": 7, "source": "inferred", "created_at": created.isoformat()}
+        assert _effective_confidence(learning, now) == 5
+
+    def test_missing_created_at_returns_base(self):
+        learning = {"confidence": 6, "source": "observed"}
+        assert _effective_confidence(learning) == 6
+
+    def test_default_confidence_is_5(self):
+        now = datetime(2026, 4, 4)
+        learning = {"source": "observed", "created_at": now.isoformat()}
+        assert _effective_confidence(learning, now) == 5
+
+    def test_uses_last_seen_as_fallback(self):
+        now = datetime(2026, 4, 4)
+        last_seen = (now - timedelta(days=60)).isoformat()
+        learning = {"confidence": 8, "source": "observed", "last_seen": last_seen}
+        assert _effective_confidence(learning, now) == 6
+
+    def test_handles_iso_with_timezone(self):
+        now = datetime(2026, 4, 4)
+        created = (now - timedelta(days=30)).isoformat() + "Z"
+        learning = {"confidence": 8, "source": "observed", "created_at": created}
+        assert _effective_confidence(learning, now) == 7
+
+
+class TestNewLearningTypes:
+    """Tests that new GStack-inspired learning types are accepted."""
+
+    def test_pitfall_type_valid(self):
+        assert LearningProcessor._validate(
+            {"type": "pitfall", "description": "subprocess.run fails for long runners"}
+        ) is True
+
+    def test_operational_type_valid(self):
+        assert LearningProcessor._validate(
+            {"type": "operational", "description": "must run pnpm generate before tests"}
+        ) is True
+
+    def test_tool_type_valid(self):
+        assert LearningProcessor._validate(
+            {"type": "tool", "description": "bun test needs --timeout 30000 for E2E"}
+        ) is True
+
+    def test_architecture_insight_type_valid(self):
+        assert LearningProcessor._validate(
+            {"type": "architecture_insight", "description": "auth middleware is stateless"}
+        ) is True
+
+    def test_original_types_still_valid(self):
+        for t in ("error", "correction", "best_practice", "knowledge_gap"):
+            assert LearningProcessor._validate(
+                {"type": t, "description": "test"}
+            ) is True
+
+    def test_unknown_type_still_rejected(self):
+        assert LearningProcessor._validate(
+            {"type": "random_garbage", "description": "test"}
+        ) is False
+
+
+class TestStoreExtendedFields:
+    """Tests that store() persists confidence, source, and files from structured reflection."""
+
+    @pytest.mark.asyncio
+    async def test_store_with_confidence_and_source(self):
+        client = _mock_client()
+        processor = LearningProcessor(supabase_client=client)
+
+        learning = _make_learning(
+            type="pitfall",
+            description="subprocess.run fails for long-running runners",
+            confidence=8,
+            source="observed",
+            files=["engine/runner.py"],
+        )
+        await processor.store(_make_task(), learning)
+
+        insert_call = client.table().insert.call_args[0][0]
+        assert insert_call["confidence"] == 8
+        assert insert_call["source"] == "observed"
+        assert insert_call["files"] == ["engine/runner.py"]
+
+    @pytest.mark.asyncio
+    async def test_store_defaults_without_extended_fields(self):
+        client = _mock_client()
+        processor = LearningProcessor(supabase_client=client)
+
+        learning = _make_learning()  # original format, no confidence/source/files
+        await processor.store(_make_task(), learning)
+
+        insert_call = client.table().insert.call_args[0][0]
+        assert insert_call["confidence"] == 5
+        assert insert_call["source"] == "observed"
+        assert insert_call["files"] == []
+
+    @pytest.mark.asyncio
+    async def test_store_pitfall_with_full_reflection_data(self):
+        client = _mock_client()
+        processor = LearningProcessor(supabase_client=client)
+
+        learning = {
+            "type": "pitfall",
+            "description": "Redis cache not invalidated on deploy causes stale data",
+            "area": "backend",
+            "confidence": 9,
+            "source": "observed",
+            "files": ["config/redis.yml", "lib/cache.rb"],
+            "suggested_rule": "Always invalidate Redis cache after deploy",
+        }
+        lid = await processor.store(_make_task(), learning)
+
+        assert lid == "learn-new"
+        insert_call = client.table().insert.call_args[0][0]
+        assert insert_call["type"] == "pitfall"
+        assert insert_call["confidence"] == 9
+        assert insert_call["source"] == "observed"
+        assert len(insert_call["files"]) == 2
+
+
+class TestGetRelevantLearningsWithDecay:
+    """Tests that get_relevant_learnings applies confidence decay and filtering."""
+
+    def _mock_client_for_learnings(self, data=None):
+        client = MagicMock()
+        table = MagicMock()
+        select = MagicMock()
+        select.in_.return_value = select
+        select.eq.return_value = select
+        select.order.return_value = select
+        select.limit.return_value = select
+        execute_result = MagicMock()
+        execute_result.data = data or []
+        select.execute.return_value = execute_result
+        table.select.return_value = select
+        client.table.return_value = table
+        return client
+
+    def test_fresh_learning_included(self):
+        now = datetime.now()
+        learnings = [
+            _make_existing_learning(
+                confidence=8, source="observed",
+                created_at=now.isoformat(),
+            ),
+        ]
+        client = self._mock_client_for_learnings(data=learnings)
+        processor = LearningProcessor(supabase_client=client)
+        result = processor.get_relevant_learnings(project_id="proj-001")
+        assert len(result) == 1
+        assert result[0]["effective_confidence"] == 8
+
+    def test_old_low_confidence_filtered_out(self):
+        now = datetime.now()
+        old = now - timedelta(days=200)
+        learnings = [
+            _make_existing_learning(
+                confidence=3, source="observed",
+                created_at=old.isoformat(),
+            ),
+        ]
+        client = self._mock_client_for_learnings(data=learnings)
+        processor = LearningProcessor(supabase_client=client)
+        result = processor.get_relevant_learnings(project_id="proj-001")
+        # confidence 3 - (200/30=6) = -3 → floored at 0 → below CONFIDENCE_FLOOR
+        assert len(result) == 0
+
+    def test_user_stated_never_filtered(self):
+        now = datetime.now()
+        old = now - timedelta(days=365)
+        learnings = [
+            _make_existing_learning(
+                confidence=3, source="user_stated",
+                created_at=old.isoformat(),
+            ),
+        ]
+        client = self._mock_client_for_learnings(data=learnings)
+        processor = LearningProcessor(supabase_client=client)
+        result = processor.get_relevant_learnings(project_id="proj-001")
+        assert len(result) == 1
+        assert result[0]["effective_confidence"] == 3
+
+    def test_sorted_by_effective_confidence(self):
+        now = datetime.now()
+        learnings = [
+            _make_existing_learning(
+                id="learn-old", confidence=9, source="observed",
+                created_at=(now - timedelta(days=180)).isoformat(),
+                description="old high confidence learning about input",
+                recurrence_count=5,
+            ),
+            _make_existing_learning(
+                id="learn-new", confidence=7, source="observed",
+                created_at=now.isoformat(),
+                description="new moderate confidence learning about input validation",
+                recurrence_count=2,
+            ),
+        ]
+        client = self._mock_client_for_learnings(data=learnings)
+        processor = LearningProcessor(supabase_client=client)
+        result = processor.get_relevant_learnings(
+            project_id="proj-001",
+            task_keywords=["input", "validation"],
+        )
+        # learn-new: eff_conf=7, overlap higher for "input validation"
+        # learn-old: eff_conf=9-6=3, overlap lower
+        assert len(result) == 2
+        # New learning should rank higher (better overlap + higher effective confidence)
+        assert result[0]["id"] == "learn-new"
+
+
+class TestFormatLearningsExtended:
+    """Tests that _format_learnings shows confidence and new type icons."""
+
+    def test_shows_effective_confidence(self):
+        from src.server.services.engine.prompt_builder import PromptBuilder
+
+        learnings = [
+            {"type": "pitfall", "description": "Redis stale on deploy",
+             "area": "backend", "recurrence_count": 2, "effective_confidence": 7},
+        ]
+        output = PromptBuilder._format_learnings(learnings)
+        assert "conf=7/10" in output
+        assert "\U0001f6a7" in output  # construction icon for pitfall
+
+    def test_shows_icons_for_new_types(self):
+        from src.server.services.engine.prompt_builder import PromptBuilder
+
+        types_and_icons = {
+            "pitfall": "\U0001f6a7",
+            "operational": "\u2699\ufe0f",
+            "tool": "\U0001f527",
+            "architecture_insight": "\U0001f3d7\ufe0f",
+        }
+        for ltype, expected_icon in types_and_icons.items():
+            learnings = [{"type": ltype, "description": "test", "recurrence_count": 1}]
+            output = PromptBuilder._format_learnings(learnings)
+            assert expected_icon in output, f"Missing icon for {ltype}"
+
+    def test_original_types_still_have_icons(self):
+        from src.server.services.engine.prompt_builder import PromptBuilder
+
+        for ltype in ("error", "correction", "best_practice", "knowledge_gap"):
+            learnings = [{"type": ltype, "description": "test", "recurrence_count": 1}]
+            output = PromptBuilder._format_learnings(learnings)
+            assert "## Relevant Learnings from Previous Runs" in output
+
+    def test_header_says_previous_runs(self):
+        from src.server.services.engine.prompt_builder import PromptBuilder
+
+        learnings = [{"type": "error", "description": "test", "recurrence_count": 1}]
+        output = PromptBuilder._format_learnings(learnings)
+        assert "Previous Runs" in output
+
+    def test_empty_learnings_returns_empty(self):
+        from src.server.services.engine.prompt_builder import PromptBuilder
+
+        assert PromptBuilder._format_learnings([]) == ""
+
+
+class TestReflectionPromptInOutput:
+    """Tests that the structured reflection prompt appears in built prompts."""
+
+    @pytest.mark.asyncio
+    async def test_reflection_questions_in_legacy_prompt(self):
+        from src.server.services.engine.prompt_builder import PromptBuilder
+
+        class FakeRAG:
+            async def perform_rag_query(self, **kw):
+                return False, {}
+
+        builder = PromptBuilder(rag_service=FakeRAG(), compress=False)
+        prompt, _ = await builder.build(_make_task())
+
+        assert "## Structured Reflection (REQUIRED before reporting completion)" in prompt
+        assert "Unexpected failures" in prompt
+        assert "Backtracking" in prompt
+        assert "Project quirks" in prompt
+        assert "Time sinks" in prompt
+        assert "Contract/schema gaps" in prompt
+        assert "Guidance gaps" in prompt
+        assert ">= 5 minutes" in prompt
+
+    @pytest.mark.asyncio
+    async def test_extended_learning_types_in_output_format(self):
+        from src.server.services.engine.prompt_builder import PromptBuilder
+
+        class FakeRAG:
+            async def perform_rag_query(self, **kw):
+                return False, {}
+
+        builder = PromptBuilder(rag_service=FakeRAG(), compress=False)
+        prompt, _ = await builder.build(_make_task())
+
+        assert "pitfall" in prompt
+        assert "operational" in prompt
+        assert "tool" in prompt
+        assert "architecture_insight" in prompt
+        assert '"confidence": 1-10' in prompt
+        assert '"source":"observed|inferred|user_stated"' in prompt
+        assert '"files"' in prompt

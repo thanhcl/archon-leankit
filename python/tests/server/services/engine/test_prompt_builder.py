@@ -374,7 +374,7 @@ async def test_compress_false_uses_legacy_render():
     # Legacy template has verbose section headers
     assert "## Task Assessment (REQUIRED — output BEFORE implementation)" in prompt
     assert "## Self-Review (REQUIRED after implementation)" in prompt
-    assert "## Learnings (REQUIRED in output)" in prompt
+    assert "## Structured Reflection (REQUIRED before reporting completion)" in prompt
 
 
 @pytest.mark.asyncio
@@ -425,7 +425,7 @@ async def test_learnings_injected_compressed():
         rag_service=FakeRAGService(), learning_processor=lp, compress=True,
     )
     prompt, _ = await builder.build(_make_task())
-    assert "## Relevant Learnings from Previous Tasks" in prompt
+    assert "## Relevant Learnings from Previous Runs" in prompt
     assert "Missing null check" in prompt
     assert "validate JWT expiry" in prompt
 
@@ -438,7 +438,7 @@ async def test_learnings_injected_legacy():
         rag_service=FakeRAGService(), learning_processor=lp, compress=False,
     )
     prompt, _ = await builder.build(_make_task())
-    assert "## Relevant Learnings from Previous Tasks" in prompt
+    assert "## Relevant Learnings from Previous Runs" in prompt
     assert "Missing null check" in prompt
 
 
@@ -474,7 +474,7 @@ async def test_no_learnings_no_section():
         rag_service=FakeRAGService(), learning_processor=lp, compress=True,
     )
     prompt, _ = await builder.build(_make_task())
-    assert "## Relevant Learnings from Previous Tasks" not in prompt
+    assert "## Relevant Learnings from Previous Runs" not in prompt
 
 
 @pytest.mark.asyncio
@@ -485,7 +485,7 @@ async def test_learnings_graceful_without_processor():
     )
     prompt, _ = await builder.build(_make_task())
     assert "# Task:" in prompt
-    assert "## Relevant Learnings from Previous Tasks" not in prompt
+    assert "## Relevant Learnings from Previous Runs" not in prompt
 
 
 @pytest.mark.asyncio
