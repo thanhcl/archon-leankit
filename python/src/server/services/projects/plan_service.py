@@ -286,11 +286,22 @@ class PlanService:
         complexity: str | None = None,
         item_key: str | None = None,
         metadata: dict[str, Any] | None = None,
+        _bypass_lock: bool = False,
     ) -> tuple[bool, dict[str, Any]]:
-        """Update an existing implementation item."""
+        """Update an existing implementation item.
+
+        Rejects mutations on contract-locked items unless ``_bypass_lock``
+        is True (used internally by sprint batch approve/create).
+        """
         ok, check = self.get_item(item_id)
         if not ok:
             return False, check
+
+        # Guard: reject mutations on contract-locked items (N4-1)
+        if not _bypass_lock:
+            item_meta = (check.get("item") or {}).get("metadata") or {}
+            if item_meta.get("contract_locked"):
+                return False, {"error": f"Item {item_id} is contract-locked by sprint batch"}
 
         updates: dict[str, Any] = {"updated_at": datetime.now().isoformat()}
         if phase_id is not None:
@@ -581,3 +592,139 @@ class PlanService:
                 logger.error(f"Auto-link error | task_id={task['id']} | item_key={item_key} | error={exc}", exc_info=True)
 
         return True, {"scanned": scanned, "linked": linked, "skipped": skipped, "errors": errors}
+
+    # ── Sprint Batch Orchestration (N4-1) ────────────────────────────────
+
+    def create_sprint_batch(
+        self,
+        plan_id: str,
+        *,
+        batch_size: int = 5,
+        filter_status: str = "READY",
+        created_by: str = "archon",
+    ) -> tuple[bool, dict[str, Any]]:
+        """Group eligible plan items into a sprint-sized batch with contract lock.
+
+        Selects up to ``batch_size`` items with the given status, marks them as
+        ``contract_locked=True`` in item metadata, and stores the batch record
+        in plan metadata.  Only Archon (control plane) may create batches —
+        Virtual Office is read-only.
+
+        Returns:
+            (success, {"batch": {...}, "locked_items": [...]})
+        """
+        ok, items_result = self.list_items(plan_id)
+        if not ok:
+            return False, items_result
+
+        all_items = items_result.get("items", [])
+        eligible = [
+            item for item in all_items
+            if (item.get("status") or "").upper() == filter_status.upper()
+            and not (item.get("metadata") or {}).get("contract_locked")
+        ]
+
+        # Sort by priority (P0 > P1 > P2 > P3) then item_order descending
+        priority_rank = {"P0": 0, "P1": 1, "P2": 2, "P3": 3}
+        eligible.sort(key=lambda i: (
+            priority_rank.get((i.get("priority") or "P3").upper(), 9),
+            -(i.get("item_order") or 0),
+        ))
+
+        selected = eligible[:batch_size]
+        if not selected:
+            return False, {"error": "No eligible items found for batching"}
+
+        batch_id = f"batch-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+        batch_record = {
+            "batch_id": batch_id,
+            "plan_id": plan_id,
+            "status": "pending_approval",
+            "created_by": created_by,
+            "created_at": datetime.now().isoformat(),
+            "item_ids": [item["id"] for item in selected],
+            "item_count": len(selected),
+        }
+
+        # Lock selected items
+        locked_items = []
+        for item in selected:
+            item_meta = dict(item.get("metadata") or {})
+            item_meta["contract_locked"] = True
+            item_meta["sprint_batch_id"] = batch_id
+            ok_update, _ = self.update_item(item["id"], metadata=item_meta)
+            if ok_update:
+                locked_items.append(item["id"])
+
+        # Store batch in plan metadata
+        ok_plan, plan_result = self.get_plan(plan_id)
+        if ok_plan:
+            plan_meta = dict((plan_result.get("plan") or {}).get("metadata") or {})
+            batches = plan_meta.get("sprint_batches", [])
+            batches.append(batch_record)
+            plan_meta["sprint_batches"] = batches
+            self.update_plan(plan_id, metadata=plan_meta)
+
+        return True, {"batch": batch_record, "locked_items": locked_items}
+
+    def get_sprint_batch(self, plan_id: str, batch_id: str) -> tuple[bool, dict[str, Any]]:
+        """Retrieve a sprint batch record (read-only, VO-accessible)."""
+        ok, plan_result = self.get_plan(plan_id)
+        if not ok:
+            return False, plan_result
+
+        plan_meta = (plan_result.get("plan") or {}).get("metadata") or {}
+        batches = plan_meta.get("sprint_batches", [])
+        for batch in batches:
+            if batch.get("batch_id") == batch_id:
+                return True, {"batch": batch}
+        return False, {"error": f"Batch {batch_id} not found"}
+
+    def approve_sprint_batch(
+        self,
+        plan_id: str,
+        batch_id: str,
+        *,
+        approved_by: str = "chief-teamlead",
+    ) -> tuple[bool, dict[str, Any]]:
+        """Release the human gate on a sprint batch and unlock items for execution.
+
+        Only Archon (control plane) may approve — VO stays read-only.
+        """
+        ok, plan_result = self.get_plan(plan_id)
+        if not ok:
+            return False, plan_result
+
+        plan_meta = dict((plan_result.get("plan") or {}).get("metadata") or {})
+        batches = plan_meta.get("sprint_batches", [])
+        target = None
+        for batch in batches:
+            if batch.get("batch_id") == batch_id:
+                target = batch
+                break
+        if target is None:
+            return False, {"error": f"Batch {batch_id} not found"}
+
+        if target.get("status") != "pending_approval":
+            return False, {"error": f"Batch {batch_id} is not pending approval (status: {target.get('status')})"}
+
+        target["status"] = "approved"
+        target["approved_by"] = approved_by
+        target["approved_at"] = datetime.now().isoformat()
+
+        # Unlock items
+        unlocked = []
+        for item_id in target.get("item_ids", []):
+            ok_item, item_result = self.get_item(item_id)
+            if not ok_item:
+                continue
+            item_meta = dict((item_result.get("item") or {}).get("metadata") or {})
+            item_meta["contract_locked"] = False
+            item_meta["sprint_approved"] = True
+            self.update_item(item_id, metadata=item_meta)
+            unlocked.append(item_id)
+
+        plan_meta["sprint_batches"] = batches
+        self.update_plan(plan_id, metadata=plan_meta)
+
+        return True, {"batch": target, "unlocked_items": unlocked}

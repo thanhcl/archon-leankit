@@ -396,3 +396,40 @@ async def get_item_rollup(item_id: str):
         status_code = 404 if "not found" in (result.get("error") or "").lower() else 400
         raise HTTPException(status_code=status_code, detail=result.get("error"))
     return validate_response(result["rollup"], ItemRollup)
+
+
+# ── Sprint Batch Orchestration (N4-1) ────────────────────────────────────
+
+
+@router.post("/plans/{plan_id}/sprint-batches")
+async def create_sprint_batch(plan_id: str, batch_size: int = 5, filter_status: str = "READY"):
+    """Create a sprint batch from eligible plan items (Archon-only).
+
+    Groups up to ``batch_size`` items with the given status, contract-locks
+    them, and stores the batch in plan metadata with ``pending_approval`` status.
+    """
+    service = PlanService()
+    ok, result = service.create_sprint_batch(plan_id, batch_size=batch_size, filter_status=filter_status)
+    if not ok:
+        raise HTTPException(status_code=400, detail=result.get("error"))
+    return result
+
+
+@router.get("/plans/{plan_id}/sprint-batches/{batch_id}")
+async def get_sprint_batch(plan_id: str, batch_id: str):
+    """Get a sprint batch record (read-only, VO-accessible)."""
+    service = PlanService()
+    ok, result = service.get_sprint_batch(plan_id, batch_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail=result.get("error"))
+    return result
+
+
+@router.post("/plans/{plan_id}/sprint-batches/{batch_id}/approve")
+async def approve_sprint_batch(plan_id: str, batch_id: str, approved_by: str = "chief-teamlead"):
+    """Approve a sprint batch — releases human gate and unlocks items (Archon-only)."""
+    service = PlanService()
+    ok, result = service.approve_sprint_batch(plan_id, batch_id, approved_by=approved_by)
+    if not ok:
+        raise HTTPException(status_code=400, detail=result.get("error"))
+    return result
