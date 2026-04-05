@@ -116,6 +116,62 @@ _CODE_REVIEW_VERDICT_RE = re.compile(r"CODE_REVIEW_VERDICT:\s*(APPROVE|REQUEST_C
 _CODE_REVIEW_FINDINGS_RE = re.compile(r"CODE_REVIEW_FINDINGS:\s*(\[.*\])", re.IGNORECASE)
 
 
+# N3-1: Signals that indicate model-level fallback should trigger.
+# These are provider/capacity errors, NOT code/logic failures.
+_MODEL_FALLBACK_SIGNALS = (
+    "rate_limit",
+    "rate limit",
+    "429",
+    "too many requests",
+    "overloaded",
+    "503",
+    "service unavailable",
+    "capacity",
+    "server_error",
+    "internal server error",
+    "api_error",
+    "authentication_error",
+    "invalid_api_key",
+    "not logged in",
+)
+
+
+def _is_model_fallback_eligible(result: CCExecutionResult) -> bool:
+    """Return True if the failure should trigger a model-level fallback.
+
+    Model fallback is appropriate for provider-level errors (rate limits,
+    capacity, auth). It is NOT appropriate for task-level failures where
+    the model ran but produced incorrect output.
+
+    N3-1: Rate-limit (429) and capacity (503) trigger fallback.
+    Code/logic errors (exit_code=0 with RESULT: FAILURE) do NOT.
+    """
+    if result.success:
+        return False
+
+    # Very short duration + non-zero exit → likely provider/infra error
+    if result.duration_seconds < 10.0 and result.exit_code != 0:
+        return True
+
+    # Check stderr/stdout for known provider error signals
+    combined = (result.stderr + " " + result.stdout).lower()
+    return any(signal in combined for signal in _MODEL_FALLBACK_SIGNALS)
+
+
+def _classify_fallback_reason(result: CCExecutionResult) -> str:
+    """Classify why a model fallback was triggered."""
+    combined = (result.stderr + " " + result.stdout).lower()
+    if "429" in combined or "rate_limit" in combined or "rate limit" in combined or "too many requests" in combined:
+        return "rate_limit_429"
+    if "503" in combined or "service unavailable" in combined or "overloaded" in combined or "capacity" in combined:
+        return "capacity_503"
+    if "not logged in" in combined or "authentication" in combined or "invalid_api_key" in combined:
+        return "auth_error"
+    if result.duration_seconds < 10.0:
+        return "quick_failure"
+    return "provider_error"
+
+
 class CCSpawner:
     """Spawns and manages Claude Code CLI sessions."""
 
@@ -372,14 +428,16 @@ class CCSpawner:
                 workspace_context=workspace_context,
             )
 
-            if not result.success:
-                # Build the effective fallback list: explicit chain or legacy single-Opus retry
+            if not result.success and _is_model_fallback_eligible(result):
+                # N3-1: Model-level fallback triggers only on rate-limit (429),
+                # capacity (503), or auth errors — NOT on code/logic failures.
                 chain: list[str] = []
                 if model_fallback_chain is not None:
                     chain = model_fallback_chain
                 elif selected_model != MODEL_OPUS:
                     chain = [MODEL_OPUS]
 
+                fallback_reason = _classify_fallback_reason(result)
                 attempted = {selected_model}
                 last_result = result
                 for fallback_model in chain:
@@ -387,7 +445,8 @@ class CCSpawner:
                         continue
                     attempted.add(fallback_model)
                     logger.warning(
-                        f"Model {selected_model} failed, trying fallback {fallback_model} | task_id={task_id}"
+                        f"Model fallback triggered | model={selected_model} → {fallback_model} | "
+                        f"reason={fallback_reason} | task_id={task_id}"
                     )
                     last_result = await self._spawn_with_model(
                         task_id=task_id,
@@ -402,6 +461,7 @@ class CCSpawner:
                     )
                     last_result.parsed["fallback_from"] = selected_model
                     last_result.parsed["fallback_to"] = fallback_model
+                    last_result.parsed["fallback_reason"] = fallback_reason
                     if model_fallback_chain is not None:
                         last_result.parsed["model_fallback_chain"] = model_fallback_chain
                     if last_result.success:
