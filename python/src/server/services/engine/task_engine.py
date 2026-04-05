@@ -2867,6 +2867,25 @@ class TaskEngine:
         if state.model_routing and state.model_routing.get("force_model"):
             state.full_task = {**state.full_task, "_policy_force_model": state.model_routing["force_model"]}
 
+        # TD-2: Auto-decomposition check — propose decomposition for complex tasks.
+        # Does NOT auto-decompose; sets decomposition_suggested on the task for
+        # TeamLead to approve via API. Skips if task is already a child or coordinator.
+        if (
+            state.full_task.get("decomposition_mode") != "coordinator"
+            and state.full_task.get("parent_task_id") is None
+            and state.retry_index == 0  # Only on first attempt
+        ):
+            should, reason = self.task_decomposer.should_decompose(state.full_task)
+            if should:
+                logger.info(
+                    f"Decomposition suggested | task_id={state.task_id} | reason={reason}"
+                )
+                self.task_service.update_task(state.task_id, metadata={
+                    **(state.full_task.get("metadata") or {}),
+                    "decomposition_suggested": True,
+                    "decomposition_reason": reason,
+                })
+
         # Collaboration mode gate: check how architect-planned tasks should be handled
         collaboration_blocked, collaboration_reason = await self._check_collaboration_gate(
             state.task_id,

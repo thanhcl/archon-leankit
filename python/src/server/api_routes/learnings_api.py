@@ -67,6 +67,55 @@ async def promote_learning(learning_id: str):
     return {"message": msg}
 
 
+# ── ML-1/ML-3: 3-Tier Learning Review Endpoints ─────────────────────
+
+
+@router.get("/flagged")
+async def list_flagged_learnings(project_id: str | None = None):
+    """List learnings flagged for TeamLead review, sorted by recurrence."""
+    processor = _get_processor()
+    flagged = await processor.list_flagged_for_review(project_id=project_id)
+    return {"learnings": flagged, "count": len(flagged)}
+
+
+@router.post("/{learning_id}/approve-probation")
+async def approve_to_probation(learning_id: str, approved_by: str = "teamlead"):
+    """Promote a candidate learning to probation tier (TeamLead action)."""
+    processor = _get_processor()
+    ok = await processor.promote_to_probation(learning_id, approved_by=approved_by)
+    if not ok:
+        raise HTTPException(status_code=400, detail={"error": "Failed to promote to probation"})
+    return {"message": f"Learning {learning_id} promoted to probation", "tier": "probation"}
+
+
+@router.post("/{learning_id}/approve-guidance")
+async def approve_to_guidance_pack(learning_id: str, approved_by: str = "teamlead"):
+    """Promote a probation learning to repo guidance pack (TeamLead action)."""
+    processor = _get_processor()
+    ok = await processor.promote_to_guidance_pack(learning_id, approved_by=approved_by)
+    if not ok:
+        raise HTTPException(status_code=400, detail={"error": "Failed to promote to guidance pack"})
+    return {"message": f"Learning {learning_id} promoted to guidance pack", "tier": "promoted"}
+
+
+@router.post("/{learning_id}/reject")
+async def reject_learning(learning_id: str, reason: str = "rejected"):
+    """Reject a flagged learning (TeamLead action) — demotes to candidate."""
+    processor = _get_processor()
+    ok = await processor.demote_to_candidate(learning_id, reason=reason)
+    if not ok:
+        raise HTTPException(status_code=400, detail={"error": "Failed to reject learning"})
+    return {"message": f"Learning {learning_id} demoted to candidate", "tier": "candidate"}
+
+
+@router.post("/expire-probations")
+async def expire_stale_probations():
+    """Expire probation learnings older than 30 days (can be called by scheduler)."""
+    processor = _get_processor()
+    count = await processor.expire_stale_probations()
+    return {"expired": count}
+
+
 @router.get("/promotion-log")
 async def get_promotion_log(project_id: str | None = None, limit: int = 50):
     """List promotion audit log entries ordered by most recent first."""

@@ -199,22 +199,24 @@ class TestIncrementRecurrence:
 
 class TestAutoPromote:
     @pytest.mark.asyncio
-    async def test_promotes_with_suggested_rule(self):
+    async def test_flags_for_review_instead_of_promoting(self):
+        """ML-1: auto_promote now flags for review instead of promoting to KB."""
         client = _mock_client()
         notifier = MagicMock()
-        notifier.on_learning_promoted = AsyncMock()
+        notifier.on_learning_pattern_detected = AsyncMock()
         processor = LearningProcessor(supabase_client=client, notifier=notifier)
 
         learning = _make_existing_learning(recurrence_count=3, suggested_rule="Always validate inputs")
         await processor.auto_promote(learning)
 
+        # ML-1: Should flag for review
         update_call = client.table().update.call_args[0][0]
-        assert update_call["status"] == "promoted"
-        assert update_call["promoted_to"] == "KB"
-        notifier.on_learning_promoted.assert_called_once()
+        assert update_call.get("flagged_for_review") is True
+        notifier.on_learning_pattern_detected.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_skips_without_suggested_rule(self):
+    async def test_flags_without_suggested_rule(self):
+        """ML-1: auto_promote flags even without suggested_rule."""
         client = _mock_client()
         notifier = MagicMock()
         notifier.on_learning_pattern_detected = AsyncMock()
@@ -223,8 +225,9 @@ class TestAutoPromote:
         learning = _make_existing_learning(recurrence_count=3, suggested_rule=None)
         await processor.auto_promote(learning)
 
-        # Should not update status to promoted
-        client.table().update.assert_not_called()
+        # ML-1: Should flag for review (update sets flagged_for_review)
+        update_call = client.table().update.call_args[0][0]
+        assert update_call.get("flagged_for_review") is True
         notifier.on_learning_pattern_detected.assert_called_once()
 
 
@@ -258,13 +261,14 @@ class TestProcess:
 
     @pytest.mark.asyncio
     async def test_auto_promotes_at_threshold(self):
+        """ML-1: At threshold, learning is FLAGGED for review (not auto-promoted)."""
         existing = _make_existing_learning(
             recurrence_count=2, status="pending",
             suggested_rule="Always validate inputs",
         )
         client = _mock_client(select_data=[existing])
         notifier = MagicMock()
-        notifier.on_learning_promoted = AsyncMock()
+        notifier.on_learning_pattern_detected = AsyncMock()
         processor = LearningProcessor(supabase_client=client, notifier=notifier)
 
         await processor.process(
@@ -272,8 +276,8 @@ class TestProcess:
             [_make_learning(description="Missing null check on user input caused crash")],
         )
 
-        # Should have been promoted (count goes from 2 → 3)
-        notifier.on_learning_promoted.assert_called_once()
+        # ML-1: Should flag for review, not auto-promote
+        notifier.on_learning_pattern_detected.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_skips_invalid_learning(self):
@@ -996,7 +1000,8 @@ class TestPromotionLog:
         return client, log_table
 
     @pytest.mark.asyncio
-    async def test_auto_promote_writes_log(self):
+    async def test_auto_promote_flags_for_review(self):
+        """ML-1: auto_promote now redirects to flag_for_review (no KB write)."""
         client, log_table = self._mock_full_client()
         processor = LearningProcessor(supabase_client=client)
 
@@ -1008,15 +1013,9 @@ class TestPromotionLog:
         )
         await processor.auto_promote(learning)
 
-        log_table.insert.assert_called_once()
-        log_call = log_table.insert.call_args[0][0]
-        assert log_call["learning_id"] == "learn-001"
-        assert log_call["promotion_type"] == "auto"
-        assert log_call["promoted_to"] == "KB"
-        assert log_call["recurrence_count"] == 3
-        assert log_call["source_run_ids"] == ["run-1", "run-2"]
-        assert log_call["source_task_ids"] == ["task-a", "task-b"]
-        assert 0 < log_call["confidence"] <= 0.95
+        # ML-1: auto_promote redirects to flag_for_review — no promotion log written
+        # Promotion log table should NOT be called (no KB write)
+        log_table.insert.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_log_promotion_handles_db_error(self):

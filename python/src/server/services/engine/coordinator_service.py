@@ -208,18 +208,23 @@ class CoordinatorService:
 
         # All children terminal — determine parent next status
         if summary["done"] > 0 and summary["failed"] == 0:
-            # All done (or cancelled) — parent advances to review
+            # TD-3: All done → aggregate qa-eval review before owner review.
+            # Parent NEVER auto-completes — aggregate evaluator checks
+            # cross-subtask integration and parent acceptance criteria.
             return True, {
-                "next_status": "review",
-                "reason": "all_children_completed",
+                "next_status": "code-review",
+                "reason": "all_children_completed_aggregate_review",
                 "summary": summary,
+                "aggregate_review": True,
             }
         elif summary["done"] > 0:
-            # Mixed done/failed — parent goes to review with warnings
+            # TD-3: Mixed done/failed → aggregate review with warnings.
+            # Evaluator identifies which subtask(s) need rework.
             return True, {
-                "next_status": "review",
-                "reason": "children_mixed_results",
+                "next_status": "code-review",
+                "reason": "children_mixed_results_aggregate_review",
                 "summary": summary,
+                "aggregate_review": True,
             }
         else:
             # All failed/cancelled — parent fails

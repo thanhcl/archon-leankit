@@ -13,7 +13,7 @@ Usage:
 """
 
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 from ...config.logfire_config import get_logger
@@ -42,6 +42,18 @@ DECAY_PERIOD_DAYS = 30
 # Learnings with decayed confidence below this threshold are excluded from injection
 CONFIDENCE_FLOOR = 2
 VALID_CATEGORIES = {"security", "error-handling", "testing", "architecture", "performance", "api-design"}
+
+# ML-1: 3-tier learning model (mid-term design direction rev 2)
+# Tier transitions require human approval except candidate (automatic).
+TIER_CANDIDATE = "candidate"
+TIER_PROBATION = "probation"
+TIER_PROMOTED = "promoted"
+VALID_TIERS = {TIER_CANDIDATE, TIER_PROBATION, TIER_PROMOTED}
+
+# Recurrence threshold to FLAG for TeamLead review (not auto-promote)
+FLAG_FOR_REVIEW_THRESHOLD = 3
+# Probation duration in days — reverts to candidate if not reinforced
+PROBATION_DURATION_DAYS = 30
 
 
 def _normalize(text: str) -> str:
@@ -140,8 +152,10 @@ class LearningProcessor:
                 await self.increment_recurrence(similar, task_id, execution_run_id)
                 new_count = (similar.get("recurrence_count") or 1) + 1
 
-                if new_count >= PROMOTE_THRESHOLD and similar.get("status") == "pending":
-                    await self.auto_promote(similar)
+                # ML-1: Flag for TeamLead review when threshold met (no auto-promote)
+                tier = similar.get("tier", TIER_CANDIDATE)
+                if new_count >= FLAG_FOR_REVIEW_THRESHOLD and tier == TIER_CANDIDATE:
+                    await self.flag_for_review(similar)
 
                 ids.append(similar["id"])
             else:
@@ -183,6 +197,8 @@ class LearningProcessor:
                 "related_tasks": [task["id"]] if task.get("id") else [],
                 "source_run_ids": [execution_run_id] if execution_run_id else [],
                 "status": "pending",
+                # ML-1: 3-tier model — new learnings start as candidates
+                "tier": TIER_CANDIDATE,
                 # Extended fields from structured reflection
                 "confidence": learning.get("confidence", 5),
                 "source": learning.get("source", "observed"),
@@ -261,44 +277,150 @@ class LearningProcessor:
         except Exception as e:
             logger.error(f"Failed to increment recurrence: {e}")
 
-    # ── Auto-promote ──────────────────────────────────────────────────
+    # ── ML-1: 3-Tier Learning Lifecycle ─────────────────────────────────
 
-    async def auto_promote(self, learning: dict[str, Any]) -> None:
-        """Auto-promote learning to KB when recurrence threshold met.
+    async def flag_for_review(self, learning: dict[str, Any]) -> None:
+        """Flag a candidate learning for TeamLead review (ML-1).
 
-        If the learning has a suggested_rule, also creates a pending entry in
-        archon_rule_suggestions for the owner to approve/reject in the Rules UI.
-        Writes a promotion log entry regardless.
+        Sets flagged_for_review=True and notifies. Does NOT promote automatically.
+        TeamLead must call promote_to_probation() explicitly.
         """
         lid = learning["id"]
-
-        if not learning.get("suggested_rule"):
-            logger.info(f"Learning {lid} has no suggested_rule — notifying only")
+        try:
+            self._client.table(TABLE).update({
+                "flagged_for_review": True,
+                "flagged_at": datetime.now().isoformat(),
+            }).eq("id", lid).execute()
+            logger.info(f"Learning flagged for review | id={lid} | recurrence={learning.get('recurrence_count')}")
             if self._notifier:
                 await self._notifier.on_learning_pattern_detected(learning)
-            return
-
-        try:
-            # Update status
-            self._client.table(TABLE).update({
-                "status": "promoted",
-                "promoted_to": "KB",
-                "promoted_at": datetime.now().isoformat(),
-            }).eq("id", lid).execute()
-
-            logger.info(f"Learning auto-promoted to KB | id={lid} | rule={learning['suggested_rule'][:80]}")
-
-            # Write promotion audit log
-            await self._log_promotion(learning, promotion_type="auto", promoted_to="KB")
-
-            # Create a pending rule suggestion for owner review
-            await self._create_rule_suggestion(learning)
-
-            if self._notifier:
-                await self._notifier.on_learning_promoted(learning)
-
         except Exception as e:
-            logger.error(f"Failed to auto-promote learning {lid}: {e}")
+            logger.error(f"Failed to flag learning: {e}")
+
+    async def promote_to_probation(self, learning_id: str, approved_by: str = "teamlead") -> bool:
+        """Promote a candidate learning to probation tier (requires human approval).
+
+        Probation learnings are injected with higher priority and prefixed
+        [project pattern]. They expire after PROBATION_DURATION_DAYS if not
+        promoted to guidance pack.
+        """
+        try:
+            self._client.table(TABLE).update({
+                "tier": TIER_PROBATION,
+                "probation_started_at": datetime.now().isoformat(),
+                "probation_approved_by": approved_by,
+                "flagged_for_review": False,
+            }).eq("id", learning_id).execute()
+            logger.info(f"Learning promoted to probation | id={learning_id} | by={approved_by}")
+            await self._log_promotion_event(learning_id, TIER_CANDIDATE, TIER_PROBATION, approved_by)
+            return True
+        except Exception as e:
+            logger.error(f"Failed to promote to probation: {e}")
+            return False
+
+    async def promote_to_guidance_pack(self, learning_id: str, approved_by: str = "teamlead") -> bool:
+        """Promote a probation learning to repo guidance pack (requires human approval).
+
+        Creates a repo_guidance_pack entry from the learning's suggested_rule.
+        """
+        try:
+            resp = self._client.table(TABLE).select("*").eq("id", learning_id).maybe_single().execute()
+            if not resp or not resp.data:
+                return False
+            learning = resp.data
+            if learning.get("tier") != TIER_PROBATION:
+                logger.warning(f"Cannot promote non-probation learning | id={learning_id} | tier={learning.get('tier')}")
+                return False
+
+            self._client.table(TABLE).update({
+                "tier": TIER_PROMOTED,
+                "status": "promoted",
+                "promoted_to": "guidance_pack",
+                "promoted_at": datetime.now().isoformat(),
+                "promoted_by": approved_by,
+            }).eq("id", learning_id).execute()
+
+            logger.info(f"Learning promoted to guidance pack | id={learning_id} | by={approved_by}")
+            await self._log_promotion_event(learning_id, TIER_PROBATION, TIER_PROMOTED, approved_by)
+            return True
+        except Exception as e:
+            logger.error(f"Failed to promote to guidance pack: {e}")
+            return False
+
+    async def demote_to_candidate(self, learning_id: str, reason: str = "expired") -> bool:
+        """Demote a probation learning back to candidate (expiry or rejection)."""
+        try:
+            self._client.table(TABLE).update({
+                "tier": TIER_CANDIDATE,
+                "probation_started_at": None,
+            }).eq("id", learning_id).execute()
+            logger.info(f"Learning demoted to candidate | id={learning_id} | reason={reason}")
+            await self._log_promotion_event(learning_id, TIER_PROBATION, TIER_CANDIDATE, "system", reason)
+            return True
+        except Exception as e:
+            logger.error(f"Failed to demote learning: {e}")
+            return False
+
+    async def expire_stale_probations(self) -> int:
+        """Expire probation learnings older than PROBATION_DURATION_DAYS."""
+        try:
+            cutoff = (datetime.now() - timedelta(days=PROBATION_DURATION_DAYS)).isoformat()
+            resp = (
+                self._client.table(TABLE)
+                .select("id")
+                .eq("tier", TIER_PROBATION)
+                .lt("probation_started_at", cutoff)
+                .execute()
+            )
+            expired = 0
+            for row in (resp.data or []):
+                await self.demote_to_candidate(row["id"], reason="probation_expired")
+                expired += 1
+            if expired:
+                logger.info(f"Expired {expired} probation learnings older than {PROBATION_DURATION_DAYS} days")
+            return expired
+        except Exception as e:
+            logger.error(f"Failed to expire probations: {e}")
+            return 0
+
+    async def list_flagged_for_review(self, project_id: str | None = None) -> list[dict[str, Any]]:
+        """List learnings flagged for TeamLead review, sorted by recurrence."""
+        try:
+            query = self._client.table(TABLE).select("*").eq("flagged_for_review", True)
+            if project_id:
+                query = query.eq("project_id", project_id)
+            resp = query.order("recurrence_count", desc=True).execute()
+            return resp.data or []
+        except Exception as e:
+            logger.error(f"Failed to list flagged learnings: {e}")
+            return []
+
+    async def _log_promotion_event(
+        self, learning_id: str, from_tier: str, to_tier: str,
+        actor: str, reason: str | None = None,
+    ) -> None:
+        """Append a promotion event to the learning's promotion_log."""
+        try:
+            resp = self._client.table(TABLE).select("promotion_log").eq("id", learning_id).maybe_single().execute()
+            log = (resp.data or {}).get("promotion_log") or []
+            log.append({
+                "from": from_tier, "to": to_tier,
+                "actor": actor, "reason": reason,
+                "at": datetime.now().isoformat(),
+            })
+            self._client.table(TABLE).update({"promotion_log": log}).eq("id", learning_id).execute()
+        except Exception:
+            pass  # Non-fatal
+
+    # ── Legacy auto-promote (kept for backward compat) ────────────────
+
+    async def auto_promote(self, learning: dict[str, Any]) -> None:
+        """Legacy auto-promote — now redirects to flag_for_review (ML-1).
+
+        Previous behavior promoted directly to KB. New behavior flags for
+        human review per 3-tier learning model.
+        """
+        await self.flag_for_review(learning)
 
     async def _log_promotion(
         self,
