@@ -287,12 +287,49 @@ class PlanRollupService:
             all_status_dist = _merge_status_distribution([r["status_distribution"] for r in all_item_rollups])
             plan_progress = _aggregate_progress(all_items)
 
+            # N1-1: Compute done/total counts and blocked items for frontend
+            done_count = sum(1 for i in all_items if i.get("status") == "done")
+            total_count = len(all_items)
+
+            blocked_items_list = [
+                {
+                    "item_id": i["id"],
+                    "item_key": i.get("item_key"),
+                    "title": i["title"],
+                    "status": i["status"],
+                }
+                for i in all_items
+                if i.get("status") == "blocked"
+            ]
+
+            # N1-1: Build workstream aggregation from item_key prefixes
+            # Item keys follow the pattern "{Workstream}-P{Phase}-{Seq}" (e.g. "C-P1-01")
+            workstream_map: dict[str, dict[str, int]] = {}
+            for item in all_items:
+                key = item.get("item_key") or ""
+                ws_prefix = key.split("-")[0] if "-" in key else ""
+                if not ws_prefix:
+                    continue
+                if ws_prefix not in workstream_map:
+                    workstream_map[ws_prefix] = {"done": 0, "total": 0}
+                workstream_map[ws_prefix]["total"] += 1
+                if item.get("status") == "done":
+                    workstream_map[ws_prefix]["done"] += 1
+
+            workstreams = [
+                {"key": ws, "done": counts["done"], "total": counts["total"]}
+                for ws, counts in sorted(workstream_map.items())
+            ]
+
             return True, {
                 "rollup": {
                     "plan_id": plan_id,
                     "title": plan["title"],
+                    "plan_title": plan["title"],
                     "phase_count": len(phases),
-                    "item_count": len(all_items),
+                    "item_count": total_count,
+                    "done_count": done_count,
+                    "total_count": total_count,
                     "task_count": plan_task_count,
                     "status_distribution": all_status_dist,
                     "run_count": plan_run_count,
@@ -300,6 +337,8 @@ class PlanRollupService:
                     "progress_percent": plan_progress,
                     "phases": phase_rollups,
                     "unphased_items": unphased_rollups,
+                    "blocked_items": blocked_items_list,
+                    "workstreams": workstreams,
                 }
             }
         except Exception as exc:
