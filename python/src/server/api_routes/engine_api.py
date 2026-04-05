@@ -15,11 +15,13 @@ from ..services.cost_budget_service import CostBudgetService
 from ..services.credential_service import credential_service
 from ..services.engine.analytics_service import EngineAnalyticsService
 from ..services.engine.coordinator_service import CoordinatorService
+from ..services.engine.health_monitor import HealthMonitor
 from ..services.engine.runner_routing import get_runner_capabilities, get_runtime_default_runner_key
 from ..services.engine.task_decomposer import TaskDecomposer
 from ..services.projects import ProjectService, TaskService
 from ..services.projects.execution_run_service import ExecutionRunService
 from ..services.projects.task_lifecycle_service import TaskLifecycleService
+from ..utils import get_supabase_client
 
 logger = get_logger(__name__)
 
@@ -975,4 +977,132 @@ async def get_coordinator_status(task_id: str):
         raise
     except Exception as e:
         logger.error(f"Failed to get coordinator status: {e}")
+        raise HTTPException(status_code=500, detail={"error": str(e)}) from e
+
+
+# ── Metrics Aggregation (N2-0) ───────────────────────────────────────────
+
+
+@router.get("/metrics")
+async def get_engine_metrics():
+    """Aggregated engine metrics across all projects.
+
+    Returns per-project cost/quality breakdowns, global totals, and
+    recent health alerts.  Alert data is transient (in-memory, reset on
+    engine restart).
+    """
+    try:
+        project_service = ProjectService()
+        task_service = TaskService()
+        budget_service = CostBudgetService()
+
+        # List all projects
+        ok, proj_result = project_service.list_office_configs()
+        projects = proj_result.get("projects", []) if ok else []
+
+        # Get all done tasks
+        ok, task_result = task_service.list_tasks(status="done")
+        all_done_tasks = task_result.get("tasks", []) if ok else []
+
+        # Aggregate total costs from execution_runs
+        supabase = get_supabase_client()
+        cost_rows = (
+            supabase.table("archon_execution_runs")
+            .select("project_id, cost_usd")
+            .not_.is_("cost_usd", "null")
+            .execute()
+        ).data or []
+
+        # Group costs by project
+        total_costs_by_project: dict[str, float] = {}
+        for row in cost_rows:
+            pid = row.get("project_id", "")
+            cost = row.get("cost_usd", 0) or 0
+            total_costs_by_project[pid] = total_costs_by_project.get(pid, 0) + cost
+
+        # Build per-project metrics
+        project_metrics = []
+        global_today = 0.0
+        global_week = 0.0
+        global_done = 0
+        global_first_pass = 0
+        global_retries_sum = 0
+
+        for project in projects:
+            pid = project.get("id", "")
+            pname = project.get("title", "Unknown")
+
+            # Cost from budget service
+            today_cost = 0.0
+            week_cost = 0.0
+            try:
+                ok_budget, budget_data = budget_service.get_cost_status(pid)
+                if ok_budget:
+                    today_cost = (budget_data.get("today") or {}).get("cost_usd", 0.0)
+                    week_cost = (budget_data.get("weekly") or {}).get("total_cost_usd", 0.0)
+            except Exception:
+                pass
+
+            total_cost = total_costs_by_project.get(pid, 0.0)
+
+            # Quality from done tasks
+            proj_tasks = [t for t in all_done_tasks if t.get("project_id") == pid]
+            done_count = len(proj_tasks)
+            first_pass = sum(1 for t in proj_tasks if (t.get("retry_count") or 0) == 0)
+            retries_sum = sum(t.get("retry_count", 0) for t in proj_tasks)
+
+            first_pass_rate = (first_pass / done_count) if done_count > 0 else 1.0
+            avg_retries = (retries_sum / done_count) if done_count > 0 else 0.0
+
+            project_metrics.append({
+                "project_id": pid,
+                "project_name": pname,
+                "cost": {
+                    "today_usd": round(today_cost, 2),
+                    "week_usd": round(week_cost, 2),
+                    "total_usd": round(total_cost, 2),
+                },
+                "quality": {
+                    "total_done": done_count,
+                    "first_pass_count": first_pass,
+                    "first_pass_rate": round(first_pass_rate, 3),
+                    "avg_retries": round(avg_retries, 2),
+                },
+            })
+
+            global_today += today_cost
+            global_week += week_cost
+            global_done += done_count
+            global_first_pass += first_pass
+            global_retries_sum += retries_sum
+
+        # Global totals
+        global_fpr = (global_first_pass / global_done) if global_done > 0 else 1.0
+        global_avg_retries = (global_retries_sum / global_done) if global_done > 0 else 0.0
+
+        # Health alerts (transient, in-memory)
+        alerts = HealthMonitor.snapshot_alerts(max_alerts=10)
+        # Sort descending by timestamp, cap at 10
+        alerts.sort(key=lambda a: a.get("timestamp", ""), reverse=True)
+        alerts = alerts[:10]
+
+        return {
+            "projects": project_metrics,
+            "totals": {
+                "cost": {
+                    "today_usd": round(global_today, 2),
+                    "week_usd": round(global_week, 2),
+                },
+                "quality": {
+                    "total_done": global_done,
+                    "first_pass_count": global_first_pass,
+                    "first_pass_rate": round(global_fpr, 3),
+                    "avg_retries": round(global_avg_retries, 2),
+                },
+            },
+            "recent_alerts": alerts,
+        }
+
+    except Exception as e:
+        logger.error(f"Failed to get engine metrics: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail={"error": str(e)}) from e

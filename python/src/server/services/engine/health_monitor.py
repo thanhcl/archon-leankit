@@ -114,6 +114,67 @@ class HealthMonitor:
     def alert_history(self) -> list[HealthAlert]:
         return list(self._alert_history)
 
+    @classmethod
+    def snapshot_alerts(
+        cls,
+        task_service: Any = None,
+        max_alerts: int = 10,
+    ) -> list[dict[str, Any]]:
+        """Compute and return health alerts based on current task metrics.
+
+        When ``task_service`` is provided, computes first_pass_rate from
+        done tasks and evaluates against thresholds.  Returns up to
+        ``max_alerts`` entries sorted descending by timestamp.
+
+        This is a lightweight class-level accessor for the metrics API —
+        it does not require a running HealthMonitor loop.
+        """
+        if task_service is None:
+            return []
+
+        thresholds = HealthThresholds()
+        alerts: list[dict[str, Any]] = []
+
+        try:
+            ok, result = task_service.list_tasks(status="done")
+            tasks = result.get("tasks", []) if ok else []
+
+            if not tasks:
+                return []
+
+            done_count = len(tasks)
+            first_pass = sum(1 for t in tasks if (t.get("retry_count") or 0) == 0)
+            first_pass_rate = first_pass / done_count if done_count > 0 else 1.0
+            avg_retries = (
+                sum(t.get("retry_count", 0) for t in tasks) / done_count
+                if done_count > 0
+                else 0.0
+            )
+
+            if first_pass_rate < thresholds.first_pass_rate_min:
+                alerts.append(HealthAlert(
+                    metric="first_pass_rate",
+                    current_value=round(first_pass_rate, 3),
+                    threshold=thresholds.first_pass_rate_min,
+                    severity="critical" if first_pass_rate < thresholds.first_pass_rate_min * 0.5 else "warning",
+                    suggestion="Switch to API review mode or upgrade model for review stages",
+                ).to_dict())
+
+            if avg_retries > thresholds.avg_retries_max:
+                alerts.append(HealthAlert(
+                    metric="avg_retries",
+                    current_value=round(avg_retries, 2),
+                    threshold=thresholds.avg_retries_max,
+                    severity="warning",
+                    suggestion="Check task complexity classification and model routing",
+                ).to_dict())
+
+        except Exception as exc:
+            logger.warning(f"snapshot_alerts failed: {exc}")
+
+        alerts.sort(key=lambda a: a.get("timestamp", ""), reverse=True)
+        return alerts[:max_alerts]
+
     # ── Lifecycle ─────────────────────────────────────────────────────
 
     async def start(self) -> None:
