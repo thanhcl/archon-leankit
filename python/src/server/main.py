@@ -46,6 +46,8 @@ from .api_routes.projects_api import router as projects_router
 from .api_routes.providers_api import router as providers_router
 from .api_routes.rules_api import router as rules_router
 from .api_routes.service_health_api import router as service_health_router
+from .api_routes.wiki_api import router as wiki_router
+from .api_routes.discovery_api import router as discovery_router
 
 # Import modular API routers
 from .api_routes.settings_api import router as settings_router
@@ -253,6 +255,8 @@ app.include_router(cost_budget_router)
 app.include_router(service_health_router)
 app.include_router(implementation_plans_router)
 app.include_router(agent_definitions_router)
+app.include_router(wiki_router)
+app.include_router(discovery_router)
 
 
 # Root endpoint

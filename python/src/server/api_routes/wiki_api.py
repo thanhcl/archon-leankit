@@ -1,0 +1,203 @@
+"""
+Wiki API endpoints — CRUD for wiki pages, links, graph, and lint.
+"""
+
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel
+
+from ..config.logfire_config import get_logger
+from ..services.wiki.wiki_service import WikiService
+from ..services.wiki.wiki_lint_service import WikiLintService
+
+logger = get_logger(__name__)
+
+router = APIRouter(prefix="/api/wiki", tags=["wiki"])
+
+
+# ── Request Models ────────────────────────────────────────────
+
+class CreatePageRequest(BaseModel):
+    project_id: str
+    title: str
+    content: str
+    page_type: str
+    category: str | None = None
+    tags: list[str] | None = None
+    source_ids: list[str] | None = None
+    summary: str | None = None
+    status: str = "draft"
+
+
+class UpdatePageRequest(BaseModel):
+    content: str | None = None
+    title: str | None = None
+    summary: str | None = None
+    tags: list[str] | None = None
+    status: str | None = None
+    category: str | None = None
+
+
+class CreateLinkRequest(BaseModel):
+    from_page_id: str
+    to_page_id: str
+    link_type: str = "related"
+    context: str | None = None
+    strength: float = 0.5
+    created_by: str = "system"
+
+
+# ── Page Endpoints ────────────────────────────────────────────
+
+@router.post("/pages")
+async def create_page(req: CreatePageRequest):
+    svc = WikiService()
+    ok, result = svc.create_page(
+        project_id=req.project_id,
+        title=req.title,
+        content=req.content,
+        page_type=req.page_type,
+        category=req.category,
+        tags=req.tags,
+        source_ids=req.source_ids,
+        summary=req.summary,
+        status=req.status,
+    )
+    if not ok:
+        raise HTTPException(status_code=500, detail=result) from None
+    return result
+
+
+@router.get("/pages/{page_id}")
+async def get_page(page_id: str, include_links: bool = True):
+    svc = WikiService()
+    ok, result = svc.get_page(page_id=page_id, include_links=include_links)
+    if not ok:
+        raise HTTPException(status_code=404, detail=result) from None
+    return result
+
+
+@router.get("/pages/by-slug/{slug}")
+async def get_page_by_slug(slug: str, project_id: str, include_links: bool = True):
+    svc = WikiService()
+    ok, result = svc.get_page(slug=slug, project_id=project_id, include_links=include_links)
+    if not ok:
+        raise HTTPException(status_code=404, detail=result) from None
+    return result
+
+
+@router.put("/pages/{page_id}")
+async def update_page(page_id: str, req: UpdatePageRequest):
+    svc = WikiService()
+    ok, result = svc.update_page(
+        page_id=page_id,
+        content=req.content,
+        title=req.title,
+        summary=req.summary,
+        tags=req.tags,
+        status=req.status,
+        category=req.category,
+    )
+    if not ok:
+        raise HTTPException(status_code=500, detail=result) from None
+    return result
+
+
+@router.delete("/pages/{page_id}")
+async def delete_page(page_id: str):
+    svc = WikiService()
+    ok, msg = svc.delete_page(page_id)
+    if not ok:
+        raise HTTPException(status_code=500, detail={"error": msg}) from None
+    return {"message": msg}
+
+
+@router.get("/pages")
+async def list_pages(
+    project_id: str,
+    page_type: str | None = None,
+    status: str | None = None,
+    limit: int = 50,
+    offset: int = 0,
+):
+    svc = WikiService()
+    ok, result = svc.list_pages(
+        project_id=project_id,
+        page_type=page_type,
+        status=status,
+        limit=limit,
+        offset=offset,
+    )
+    if not ok:
+        raise HTTPException(status_code=500, detail={"error": "Failed to list pages"}) from None
+    return {"pages": result, "count": len(result)}
+
+
+@router.get("/search")
+async def search_pages(
+    query: str,
+    project_id: str | None = None,
+    page_type: str | None = None,
+    category: str | None = None,
+    status: str | None = None,
+    limit: int = 10,
+):
+    svc = WikiService()
+    ok, result = svc.search_pages(
+        query=query,
+        project_id=project_id,
+        page_type=page_type,
+        category=category,
+        status=status,
+        limit=limit,
+    )
+    if not ok:
+        raise HTTPException(status_code=500, detail={"error": "Search failed"}) from None
+    return {"results": result, "count": len(result)}
+
+
+# ── Link Endpoints ────────────────────────────────────────────
+
+@router.post("/links")
+async def create_link(req: CreateLinkRequest):
+    svc = WikiService()
+    ok, result = svc.create_link(
+        from_page_id=req.from_page_id,
+        to_page_id=req.to_page_id,
+        link_type=req.link_type,
+        context=req.context,
+        strength=req.strength,
+        created_by=req.created_by,
+    )
+    if not ok:
+        raise HTTPException(status_code=500, detail=result) from None
+    return result
+
+
+# ── Graph Endpoints ───────────────────────────────────────────
+
+@router.get("/graph")
+async def get_graph(
+    project_id: str | None = None,
+    page_id: str | None = None,
+    depth: int = 2,
+):
+    svc = WikiService()
+    ok, result = svc.get_graph(
+        project_id=project_id,
+        page_id=page_id,
+        depth=depth,
+    )
+    if not ok:
+        raise HTTPException(status_code=500, detail=result) from None
+    return result
+
+
+# ── Lint Endpoints ────────────────────────────────────────────
+
+@router.post("/lint/{project_id}")
+async def lint_wiki(project_id: str):
+    svc = WikiLintService()
+    ok, result = svc.lint(project_id)
+    if not ok:
+        raise HTTPException(status_code=500, detail=result) from None
+    return result

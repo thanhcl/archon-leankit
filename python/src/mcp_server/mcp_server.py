@@ -570,6 +570,40 @@ def register_modules():
         logger.error(f"✗ Failed to register GitHub tools: {e}")
         logger.error(traceback.format_exc())
 
+    # Wiki KB Tools
+    try:
+        from src.mcp_server.features.wiki import register_wiki_tools
+
+        register_wiki_tools(mcp)
+        modules_registered += 1
+        logger.info("✓ Wiki tools registered")
+    except ImportError as e:
+        logger.warning(f"⚠ Wiki tools module not available (optional): {e}")
+    except (SyntaxError, NameError, AttributeError) as e:
+        logger.error(f"✗ Code error in wiki tools - MUST FIX: {e}")
+        logger.error(traceback.format_exc())
+        raise
+    except Exception as e:
+        logger.error(f"✗ Failed to register wiki tools: {e}")
+        logger.error(traceback.format_exc())
+
+    # Discovery Tools
+    try:
+        from src.mcp_server.features.discovery import register_discovery_tools
+
+        register_discovery_tools(mcp)
+        modules_registered += 1
+        logger.info("✓ Discovery tools registered")
+    except ImportError as e:
+        logger.warning(f"⚠ Discovery tools module not available (optional): {e}")
+    except (SyntaxError, NameError, AttributeError) as e:
+        logger.error(f"✗ Code error in discovery tools - MUST FIX: {e}")
+        logger.error(traceback.format_exc())
+        raise
+    except Exception as e:
+        logger.error(f"✗ Failed to register discovery tools: {e}")
+        logger.error(traceback.format_exc())
+
     logger.info(f"📦 Total modules registered: {modules_registered}")
 
     if modules_registered == 0:
