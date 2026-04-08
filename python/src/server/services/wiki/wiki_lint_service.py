@@ -122,20 +122,26 @@ class WikiLintService:
     def _find_orphans(
         self, pages: list[dict], page_ids: set[str]
     ) -> list[dict[str, Any]]:
-        """Find pages with 0 inbound links (excluding source_summary pages)."""
+        """Find pages with 0 inbound links (excluding source_summary pages).
+
+        Uses a single batch query instead of per-page queries to avoid N+1.
+        """
+        # Batch fetch all inbound link targets in one query
+        all_inbound = (
+            self.supabase.table("archon_wiki_links")
+            .select("to_page_id")
+            .execute()
+        )
+        inbound_targets: set[str] = {
+            link["to_page_id"] for link in (all_inbound.data or [])
+        }
+
         orphans = []
         for page in pages:
             if page.get("page_type") == "source_summary":
                 continue  # Source summaries are naturally terminal
 
-            # Count inbound links
-            inbound = (
-                self.supabase.table("archon_wiki_links")
-                .select("id", count="exact")
-                .eq("to_page_id", page["id"])
-                .execute()
-            )
-            if (inbound.count or 0) == 0:
+            if page["id"] not in inbound_targets:
                 orphans.append({
                     "id": page["id"],
                     "slug": page["slug"],
@@ -175,47 +181,71 @@ class WikiLintService:
         return stale
 
     def _find_contradictions(self, page_ids: set[str]) -> list[dict[str, Any]]:
-        """Find pages connected by 'contradicts' links."""
+        """Find pages connected by 'contradicts' links.
+
+        Uses a single batch query instead of per-page queries to avoid N+1.
+        """
+        # Single query for all contradiction links
+        all_contradicts = (
+            self.supabase.table("archon_wiki_links")
+            .select("from_page_id, to_page_id, context")
+            .eq("link_type", "contradicts")
+            .execute()
+        )
+
         contradictions = []
         seen_pairs: set[tuple[str, str]] = set()
-
-        for pid in page_ids:
-            links = (
-                self.supabase.table("archon_wiki_links")
-                .select("from_page_id, to_page_id, context")
-                .eq("link_type", "contradicts")
-                .or_(f"from_page_id.eq.{pid},to_page_id.eq.{pid}")
-                .execute()
-            )
-            for link in links.data or []:
-                pair = tuple(sorted([link["from_page_id"], link["to_page_id"]]))
-                if pair not in seen_pairs:
-                    seen_pairs.add(pair)
-                    contradictions.append({
-                        "page_a": link["from_page_id"],
-                        "page_b": link["to_page_id"],
-                        "context": link.get("context"),
-                    })
+        for link in all_contradicts.data or []:
+            # Only include links where at least one side is in our project pages
+            if link["from_page_id"] not in page_ids and link["to_page_id"] not in page_ids:
+                continue
+            pair = tuple(sorted([link["from_page_id"], link["to_page_id"]]))
+            if pair not in seen_pairs:
+                seen_pairs.add(pair)
+                contradictions.append({
+                    "page_a": link["from_page_id"],
+                    "page_b": link["to_page_id"],
+                    "context": link.get("context"),
+                })
         return contradictions
 
     def _find_broken_sources(self, pages: list[dict]) -> list[dict[str, Any]]:
-        """Find pages referencing source_ids that no longer exist."""
-        broken = []
+        """Find pages referencing source_ids that no longer exist.
+
+        Uses a single batch query to fetch all known source_ids instead of
+        checking per source per page (avoids N+1).
+        """
+        # Collect all referenced source_ids across all pages
+        all_referenced: set[str] = set()
+        page_source_map: list[tuple[dict, list[str]]] = []
         for page in pages:
             source_ids_raw = page.get("source_ids", "[]")
             if isinstance(source_ids_raw, str):
                 source_ids = json.loads(source_ids_raw)
             else:
                 source_ids = source_ids_raw or []
+            if source_ids:
+                page_source_map.append((page, source_ids))
+                all_referenced.update(source_ids)
 
+        if not all_referenced:
+            return []
+
+        # Single query: fetch all existing source_ids
+        existing_sources_result = (
+            self.supabase.table("archon_sources")
+            .select("source_id")
+            .execute()
+        )
+        existing_ids: set[str] = {
+            s["source_id"] for s in (existing_sources_result.data or [])
+        }
+
+        # Check in-memory
+        broken = []
+        for page, source_ids in page_source_map:
             for sid in source_ids:
-                check = (
-                    self.supabase.table("archon_sources")
-                    .select("source_id", count="exact")
-                    .eq("source_id", sid)
-                    .execute()
-                )
-                if (check.count or 0) == 0:
+                if sid not in existing_ids:
                     broken.append({
                         "page_id": page["id"],
                         "page_slug": page["slug"],

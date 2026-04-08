@@ -323,6 +323,19 @@ class WikiIngestService:
         )
         return page if ok else None
 
+    @staticmethod
+    def _parse_jsonb_list(value: Any) -> list:
+        """Safely parse a JSONB field that may be a list or a JSON string."""
+        if isinstance(value, list):
+            return value
+        if isinstance(value, str):
+            try:
+                parsed = json.loads(value)
+                return parsed if isinstance(parsed, list) else []
+            except (json.JSONDecodeError, TypeError):
+                return []
+        return []
+
     def _create_entity_page(
         self,
         project_id: str,
@@ -341,21 +354,32 @@ class WikiIngestService:
         )
 
         if ok and existing:
-            # Append to existing page
-            existing_content = existing.get("content", "")
-            new_content = f"{existing_content}\n\n## From additional source\n\n{entity.get('description', '')}"
-            existing_sources = json.loads(existing.get("source_ids", "[]")) if isinstance(existing.get("source_ids"), str) else existing.get("source_ids", [])
-            if source_id not in existing_sources:
-                existing_sources.append(source_id)
-            self.wiki.update_page(
-                page_id=existing["id"],
-                content=new_content,
-                tags=list(set(
-                    (json.loads(existing.get("tags", "[]")) if isinstance(existing.get("tags"), str) else existing.get("tags", []))
-                    + entity.get("tags", [])
-                )),
+            # Re-fetch fresh page data to avoid stale reads
+            ok_fresh, fresh = self.wiki.get_page(
+                page_id=existing["id"], include_links=False
             )
-            return existing
+            page_data = fresh if ok_fresh else existing
+
+            # Merge content
+            existing_content = page_data.get("content", "")
+            new_content = f"{existing_content}\n\n## From additional source\n\n{entity.get('description', '')}"
+
+            # Merge source_ids
+            current_sources = self._parse_jsonb_list(page_data.get("source_ids"))
+            if source_id not in current_sources:
+                current_sources.append(source_id)
+
+            # Merge tags — read current from fresh data, union with new
+            current_tags = self._parse_jsonb_list(page_data.get("tags"))
+            new_tags = entity.get("tags", [])
+            merged_tags = list(set(current_tags + new_tags))
+
+            self.wiki.update_page(
+                page_id=page_data["id"],
+                content=new_content,
+                tags=merged_tags,
+            )
+            return page_data
 
         # Create new
         ok, page = self.wiki.create_page(
@@ -388,10 +412,32 @@ class WikiIngestService:
         )
 
         if ok and existing:
-            existing_content = existing.get("content", "")
+            # Re-fetch fresh data
+            ok_fresh, fresh = self.wiki.get_page(
+                page_id=existing["id"], include_links=False
+            )
+            page_data = fresh if ok_fresh else existing
+
+            # Merge content
+            existing_content = page_data.get("content", "")
             new_content = f"{existing_content}\n\n## Additional context\n\n{concept.get('description', '')}"
-            self.wiki.update_page(page_id=existing["id"], content=new_content)
-            return existing
+
+            # Merge tags from fresh data + new concept
+            current_tags = self._parse_jsonb_list(page_data.get("tags"))
+            new_tags = concept.get("tags", [])
+            merged_tags = list(set(current_tags + new_tags))
+
+            # Merge source_ids
+            current_sources = self._parse_jsonb_list(page_data.get("source_ids"))
+            if source_id not in current_sources:
+                current_sources.append(source_id)
+
+            self.wiki.update_page(
+                page_id=page_data["id"],
+                content=new_content,
+                tags=merged_tags,
+            )
+            return page_data
 
         ok, page = self.wiki.create_page(
             project_id=project_id,
