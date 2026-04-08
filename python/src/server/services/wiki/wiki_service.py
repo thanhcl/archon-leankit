@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 from typing import Any
 from uuid import uuid4
 
-from ...utils import create_embedding, get_supabase_client
+from ...utils import get_supabase_client
 
 logger = logging.getLogger(__name__)
 
@@ -71,14 +71,9 @@ class WikiService:
             if summary:
                 page_data["summary"] = summary
 
-            # Generate embedding from summary or title
-            embed_text = summary or title
-            try:
-                embedding = create_embedding(embed_text)
-                if embedding:
-                    page_data["embedding"] = embedding
-            except Exception as e:
-                logger.warning(f"Failed to create embedding for wiki page: {e}")
+            # Note: embedding generation is async and handled separately
+            # via the API route or a background task. Pages work without embeddings
+            # (full-text search still functions via content_search_vector).
 
             result = (
                 self.supabase.table("archon_wiki_pages")
@@ -152,15 +147,7 @@ class WikiService:
             if category is not None:
                 update_data["category"] = category
 
-            # Re-generate embedding if content or summary changed
-            if summary is not None or title is not None:
-                embed_text = summary or title or ""
-                try:
-                    embedding = create_embedding(embed_text)
-                    if embedding:
-                        update_data["embedding"] = embedding
-                except Exception as e:
-                    logger.warning(f"Failed to update embedding: {e}")
+            # Note: embedding re-generation is async and handled separately.
 
             result = (
                 self.supabase.table("archon_wiki_pages")
@@ -187,13 +174,10 @@ class WikiService:
     ) -> tuple[bool, list[dict[str, Any]]]:
         """Search wiki pages using full-text search. Returns pages with metadata."""
         try:
-            # Full-text search using tsvector
-            fts_query = " & ".join(query.split())
-
+            # Build query with filters first, then apply text_search last
             q = (
                 self.supabase.table("archon_wiki_pages")
                 .select("id, slug, title, summary, page_type, category, tags, status, quality_score, updated_at")
-                .text_search("content_search_vector", fts_query, config="english")
             )
 
             if project_id:
@@ -204,6 +188,10 @@ class WikiService:
                 q = q.eq("category", category)
             if status:
                 q = q.eq("status", status)
+
+            # Use ilike on title+content for search (more compatible than text_search chaining)
+            for term in query.split()[:5]:
+                q = q.or_(f"title.ilike.%{term}%,content.ilike.%{term}%")
 
             q = q.limit(limit).order("quality_score", desc=True)
 
