@@ -32,6 +32,8 @@ class LintReport:
     gaps: list[dict[str, Any]] = field(default_factory=list)
     broken_sources: list[dict[str, Any]] = field(default_factory=list)
     low_quality: list[dict[str, Any]] = field(default_factory=list)
+    god_nodes: list[dict[str, Any]] = field(default_factory=list)
+    surprise_connections: list[dict[str, Any]] = field(default_factory=list)
     stats: dict[str, int] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -42,6 +44,8 @@ class LintReport:
             "gaps": self.gaps,
             "broken_sources": self.broken_sources,
             "low_quality": self.low_quality,
+            "god_nodes": self.god_nodes,
+            "surprise_connections": self.surprise_connections,
             "stats": self.stats,
             "total_issues": (
                 len(self.orphans)
@@ -99,6 +103,12 @@ class WikiLintService:
             # 5. Broken source references
             report.broken_sources = self._find_broken_sources(pages)
 
+            # 6. God nodes — highly connected hubs
+            report.god_nodes = self._find_god_nodes(pages, page_ids)
+
+            # 7. Surprise connections — weak cross-community links
+            report.surprise_connections = self._find_surprise_connections(page_ids)
+
             # Stats
             report.stats = {
                 "total_pages": len(pages),
@@ -108,9 +118,11 @@ class WikiLintService:
                 "orphans": len(report.orphans),
                 "contradictions": len(report.contradictions),
                 "low_quality": len(report.low_quality),
+                "god_nodes": len(report.god_nodes),
+                "surprise_connections": len(report.surprise_connections),
             }
 
-            # 6. Create knowledge gaps for significant findings
+            # 8. Create knowledge gaps for significant findings
             self._create_gaps_from_findings(project_id, report)
 
             return True, report.to_dict()
@@ -253,6 +265,111 @@ class WikiLintService:
                     })
         return broken
 
+    def _find_god_nodes(
+        self, pages: list[dict], page_ids: set[str]
+    ) -> list[dict[str, Any]]:
+        """Find highly-connected hub pages (degree > 2× median, min 4)."""
+        # Batch fetch all links
+        all_links = (
+            self.supabase.table("archon_wiki_links")
+            .select("from_page_id, to_page_id")
+            .execute()
+        )
+        # Count degree per page
+        degree: dict[str, dict[str, int]] = {
+            pid: {"inbound": 0, "outbound": 0} for pid in page_ids
+        }
+        for link in all_links.data or []:
+            src, tgt = link["from_page_id"], link["to_page_id"]
+            if src in degree:
+                degree[src]["outbound"] += 1
+            if tgt in degree:
+                degree[tgt]["inbound"] += 1
+
+        total_degrees = [d["inbound"] + d["outbound"] for d in degree.values()]
+        if not total_degrees:
+            return []
+
+        total_degrees_sorted = sorted(total_degrees)
+        median = total_degrees_sorted[len(total_degrees_sorted) // 2]
+        threshold = max(4, median * 2)
+
+        page_map = {p["id"]: p for p in pages}
+        god_nodes = []
+        for pid, d in degree.items():
+            total = d["inbound"] + d["outbound"]
+            if total >= threshold and pid in page_map:
+                p = page_map[pid]
+                god_nodes.append({
+                    "id": pid,
+                    "slug": p["slug"],
+                    "title": p["title"],
+                    "degree": total,
+                    "inbound": d["inbound"],
+                    "outbound": d["outbound"],
+                    "median_degree": median,
+                })
+
+        return sorted(god_nodes, key=lambda x: -x["degree"])
+
+    def _find_surprise_connections(
+        self, page_ids: set[str]
+    ) -> list[dict[str, Any]]:
+        """Find weak cross-community links (potential unexplored relationships).
+
+        Gracefully returns empty if communities haven't been assigned yet.
+        """
+        # Fetch community assignments
+        pages_with_community = (
+            self.supabase.table("archon_wiki_pages")
+            .select("id, community")
+            .execute()
+        )
+        community_map: dict[str, str | None] = {
+            p["id"]: p.get("community")
+            for p in (pages_with_community.data or [])
+            if p["id"] in page_ids
+        }
+
+        # Check if any communities are assigned
+        assigned = [c for c in community_map.values() if c is not None]
+        if len(assigned) < 2:
+            return []  # No communities or only one — nothing to compare
+
+        # Fetch all links with strength
+        all_links = (
+            self.supabase.table("archon_wiki_links")
+            .select("from_page_id, to_page_id, strength, link_type, context")
+            .execute()
+        )
+
+        surprises = []
+        for link in all_links.data or []:
+            src, tgt = link["from_page_id"], link["to_page_id"]
+            if src not in page_ids or tgt not in page_ids:
+                continue
+
+            src_comm = community_map.get(src)
+            tgt_comm = community_map.get(tgt)
+
+            # Cross-community + weak strength
+            if (
+                src_comm and tgt_comm
+                and src_comm != tgt_comm
+                and (link.get("strength") or 0.5) <= 0.4
+            ):
+                surprises.append({
+                    "from_page_id": src,
+                    "to_page_id": tgt,
+                    "from_community": src_comm,
+                    "to_community": tgt_comm,
+                    "strength": link.get("strength"),
+                    "link_type": link.get("link_type"),
+                    "context": link.get("context"),
+                })
+
+        return surprises
+
     def _create_gaps_from_findings(self, project_id: str, report: LintReport) -> None:
         """Create knowledge gap entries for significant lint findings."""
         try:
@@ -276,6 +393,17 @@ class WikiLintService:
                     gap_type="orphan",
                     related_pages=[orphan["id"]],
                     priority=30,
+                )
+
+            # Surprise connections become shallow_coverage gaps
+            for surprise in report.surprise_connections[:10]:
+                self._upsert_gap(
+                    project_id=project_id,
+                    topic=f"{surprise.get('from_community', '?')} <-> {surprise.get('to_community', '?')}",
+                    description=f"Weak link between communities '{surprise.get('from_community')}' and '{surprise.get('to_community')}' — may indicate important but under-explored relationship",
+                    gap_type="shallow_coverage",
+                    related_pages=[surprise["from_page_id"], surprise["to_page_id"]],
+                    priority=60,
                 )
 
         except Exception as e:

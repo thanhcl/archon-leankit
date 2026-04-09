@@ -6,6 +6,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from ..config.logfire_config import get_logger
+from ..services.wiki.wiki_community_service import WikiCommunityService
 from ..services.wiki.wiki_service import WikiService
 from ..services.wiki.wiki_lint_service import WikiLintService
 
@@ -43,7 +44,15 @@ class CreateLinkRequest(BaseModel):
     link_type: str = "related"
     context: str | None = None
     strength: float = 0.5
+    confidence: str = "inferred"
     created_by: str = "system"
+
+
+class CreateNoteRequest(BaseModel):
+    project_id: str
+    text: str
+    link_to_slugs: list[str] | None = None
+    tags: list[str] | None = None
 
 
 # ── Page Endpoints ────────────────────────────────────────────
@@ -166,6 +175,7 @@ async def create_link(req: CreateLinkRequest):
         link_type=req.link_type,
         context=req.context,
         strength=req.strength,
+        confidence=req.confidence,
         created_by=req.created_by,
     )
     if not ok:
@@ -198,6 +208,42 @@ async def get_graph(
 async def lint_wiki(project_id: str):
     svc = WikiLintService()
     ok, result = svc.lint(project_id)
+    if not ok:
+        raise HTTPException(status_code=500, detail=result) from None
+    return result
+
+
+# ── Note Endpoints (E3: Write-Back Loop) ─────────────────────
+
+@router.post("/notes")
+async def create_note(req: CreateNoteRequest):
+    svc = WikiService()
+    ok, result = svc.create_quick_note(
+        project_id=req.project_id,
+        text=req.text,
+        link_to_slugs=req.link_to_slugs,
+        tags=req.tags,
+    )
+    if not ok:
+        raise HTTPException(status_code=500, detail=result) from None
+    return result
+
+
+# ── Community Endpoints (E4) ─────────────────────────────────
+
+@router.post("/communities/{project_id}")
+async def detect_communities(project_id: str):
+    svc = WikiCommunityService()
+    ok, result = svc.detect_communities(project_id)
+    if not ok:
+        raise HTTPException(status_code=500, detail=result) from None
+    return result
+
+
+@router.get("/communities/{project_id}")
+async def get_communities(project_id: str):
+    svc = WikiCommunityService()
+    ok, result = svc.get_communities(project_id)
     if not ok:
         raise HTTPException(status_code=500, detail=result) from None
     return result

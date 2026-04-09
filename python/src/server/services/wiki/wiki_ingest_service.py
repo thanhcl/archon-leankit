@@ -9,6 +9,7 @@ Flow:
   RAG source → get chunks/pages → LLM extraction → wiki pages + links
 """
 
+import hashlib
 import json
 import logging
 from typing import Any
@@ -77,11 +78,55 @@ class WikiIngestService:
         self.supabase = get_supabase_client()
         self.wiki = WikiService()
 
+    # ── E1: Content-Hash Caching ─────────────────────────────
+
+    def _compute_content_hash(self, source_id: str, content: str) -> str:
+        """SHA256(source_id + content) for cache invalidation."""
+        return hashlib.sha256(f"{source_id}:{content}".encode("utf-8")).hexdigest()
+
+    def _get_stored_hash(self, source_id: str) -> str | None:
+        """Read wiki_ingest_hash from archon_sources.metadata."""
+        try:
+            result = (
+                self.supabase.table("archon_sources")
+                .select("metadata")
+                .eq("source_id", source_id)
+                .single()
+                .execute()
+            )
+            metadata = result.data.get("metadata", {}) if result.data else {}
+            if isinstance(metadata, str):
+                metadata = json.loads(metadata)
+            return metadata.get("wiki_ingest_hash")
+        except Exception:
+            return None
+
+    def _store_content_hash(self, source_id: str, hash_value: str) -> None:
+        """Write wiki_ingest_hash into archon_sources.metadata."""
+        try:
+            result = (
+                self.supabase.table("archon_sources")
+                .select("metadata")
+                .eq("source_id", source_id)
+                .single()
+                .execute()
+            )
+            metadata = result.data.get("metadata", {}) if result.data else {}
+            if isinstance(metadata, str):
+                metadata = json.loads(metadata)
+            metadata["wiki_ingest_hash"] = hash_value
+            self.supabase.table("archon_sources").update(
+                {"metadata": json.dumps(metadata)}
+            ).eq("source_id", source_id).execute()
+        except Exception as e:
+            logger.warning(f"Failed to store content hash: {e}")
+
     async def ingest_source(
         self,
         source_id: str,
         project_id: str,
         llm_provider: Any | None = None,
+        force: bool = False,
     ) -> tuple[bool, dict[str, Any]]:
         """
         Ingest a RAG source into wiki pages.
@@ -91,6 +136,7 @@ class WikiIngestService:
             project_id: Target project for wiki pages
             llm_provider: Optional LLM provider for extraction.
                          If None, uses rule-based extraction (simpler).
+            force: If True, bypass content-hash cache and re-extract.
 
         Returns:
             (success, {pages_created, links_created, source_summary})
@@ -108,6 +154,13 @@ class WikiIngestService:
 
             # 3. Build content for extraction
             content = self._build_extraction_content(source, pages)
+
+            # E1: Content-hash cache check
+            if not force:
+                new_hash = self._compute_content_hash(source_id, content)
+                stored_hash = self._get_stored_hash(source_id)
+                if stored_hash == new_hash:
+                    return True, {"skipped": True, "reason": "content_unchanged", "source_id": source_id}
 
             # 4. Extract using LLM or rule-based
             if llm_provider:
@@ -150,6 +203,10 @@ class WikiIngestService:
             # 8. Handle contradictions
             for contradiction in extraction.get("contradictions", []):
                 self._flag_contradiction(project_id, contradiction, created_pages)
+
+            # E1: Store content hash after successful extraction
+            if not force:
+                self._store_content_hash(source_id, new_hash)
 
             return True, {
                 "pages_created": len(created_pages),
@@ -465,6 +522,7 @@ class WikiIngestService:
                         to_page_id=page_b["id"],
                         link_type="related",
                         context="From same source ingestion",
+                        confidence="inferred",
                         created_by="system",
                     )
                     if ok:
@@ -506,6 +564,7 @@ class WikiIngestService:
                             to_page_id=match["id"],
                             link_type="related",
                             context=f"Shared tag: {tag}",
+                            confidence="inferred",
                             created_by="system",
                         )
                         if ok:
@@ -542,6 +601,8 @@ class WikiIngestService:
                             to_page_id=existing["id"],
                             link_type="contradicts",
                             context=f"New source claims: {claim_a[:100]}. Existing claims: {claim_b[:100]}",
+                            confidence="extracted",
+                            strength=0.8,
                             created_by="system",
                         )
         except Exception as e:

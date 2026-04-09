@@ -257,6 +257,7 @@ def register_wiki_tools(mcp: FastMCP):
         to_page_id: str,
         link_type: str = "related",
         context: str | None = None,
+        confidence: str = "inferred",
     ) -> str:
         """
         Create a link between two wiki pages.
@@ -264,20 +265,15 @@ def register_wiki_tools(mcp: FastMCP):
         Args:
             from_page_id: Source page UUID
             to_page_id: Target page UUID
-            link_type: 'related' (default) | 'depends_on' | 'contradicts' | 'extends' | 'supersedes' | 'example_of' | 'part_of'
-            context: Why these pages are linked (e.g., "Both describe React state management patterns")
+            link_type: 'related' | 'depends_on' | 'contradicts' | 'extends' | 'supersedes' | 'example_of' | 'part_of'
+            context: Why these pages are linked
+            confidence: Link confidence level:
+                - 'extracted': explicit reference found in source content (strength=1.0)
+                - 'inferred' (default): reasonable inference from shared tags, topics, etc. (strength=0.5)
+                - 'ambiguous': weak signal, may not be meaningful (strength=0.2)
 
         Returns:
             Created link with metadata.
-
-        Link types:
-        - related: General semantic relationship
-        - depends_on: A requires knowledge of B
-        - contradicts: A and B contain conflicting information
-        - extends: A adds detail to B
-        - supersedes: A replaces/updates B
-        - example_of: A is a concrete example of concept B
-        - part_of: A is a component/subset of B
         """
         try:
             api_url = get_api_url()
@@ -287,6 +283,7 @@ def register_wiki_tools(mcp: FastMCP):
                 "from_page_id": from_page_id,
                 "to_page_id": to_page_id,
                 "link_type": link_type,
+                "confidence": confidence,
                 "created_by": "agent",
             }
             if context:
@@ -387,3 +384,104 @@ def register_wiki_tools(mcp: FastMCP):
         except Exception as e:
             logger.error(f"Error in wiki_lint: {e}", exc_info=True)
             return MCPErrorFormatter.from_exception(e, "wiki lint")
+
+    # ── E3: Write-Back Loop ───────────────────────────────────
+
+    @mcp.tool()
+    async def wiki_note(
+        ctx: Context,
+        text: str,
+        project_id: str,
+        link_to_slugs: list[str] | None = None,
+        tags: list[str] | None = None,
+    ) -> str:
+        """
+        Quick-capture a note into the wiki as a synthesis page.
+
+        Unlike wiki_create_page which requires full metadata, wiki_note
+        just takes text and optional link targets. Perfect for capturing
+        insights during work without breaking flow.
+
+        The title is auto-generated from the first line of text.
+        The page is created as 'active' immediately (no draft stage).
+
+        Args:
+            text: Note content in markdown. First line becomes the title.
+            project_id: Project UUID (required)
+            link_to_slugs: Optional slugs of existing pages to link to.
+                           e.g. ["react-hooks", "state-management"]
+            tags: Optional tags like ["insight", "architecture"]
+
+        Returns:
+            Created wiki page with link count.
+        """
+        try:
+            api_url = get_api_url()
+            timeout = get_default_timeout()
+
+            body: dict = {"text": text, "project_id": project_id}
+            if link_to_slugs:
+                body["link_to_slugs"] = link_to_slugs
+            if tags:
+                body["tags"] = tags
+
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                response = await client.post(
+                    urljoin(api_url, "/api/wiki/notes"), json=body
+                )
+                if response.status_code == 200:
+                    return json.dumps({"success": True, "page": response.json()}, indent=2)
+                else:
+                    return MCPErrorFormatter.from_http_error(response, "create wiki note")
+
+        except Exception as e:
+            logger.error(f"Error in wiki_note: {e}", exc_info=True)
+            return MCPErrorFormatter.from_exception(e, "create wiki note")
+
+    # ── E4: Community Detection ───────────────────────────────
+
+    @mcp.tool()
+    async def wiki_communities(
+        ctx: Context,
+        project_id: str,
+        recompute: bool = False,
+    ) -> str:
+        """
+        View or recompute topic communities in the wiki knowledge graph.
+
+        Communities are auto-detected clusters of related wiki pages using
+        label propagation on the link graph. Useful for:
+        - Understanding how knowledge is organized
+        - Finding related pages you didn't know were connected
+        - Identifying isolated topic clusters
+
+        Args:
+            project_id: Project UUID
+            recompute: If True, re-runs community detection (takes a few seconds).
+                       If False (default), returns cached community assignments.
+
+        Returns:
+            List of communities with their member pages.
+        """
+        try:
+            api_url = get_api_url()
+            timeout = httpx.Timeout(60.0, connect=5.0)
+
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                if recompute:
+                    response = await client.post(
+                        urljoin(api_url, f"/api/wiki/communities/{project_id}")
+                    )
+                else:
+                    response = await client.get(
+                        urljoin(api_url, f"/api/wiki/communities/{project_id}")
+                    )
+
+                if response.status_code == 200:
+                    return json.dumps({"success": True, **response.json()}, indent=2)
+                else:
+                    return MCPErrorFormatter.from_http_error(response, "wiki communities")
+
+        except Exception as e:
+            logger.error(f"Error in wiki_communities: {e}", exc_info=True)
+            return MCPErrorFormatter.from_exception(e, "wiki communities")

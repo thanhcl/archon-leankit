@@ -241,6 +241,63 @@ class WikiService:
             logger.error(f"Error deleting wiki page: {e}")
             return False, str(e)
 
+    # ── E3: Quick Note (Write-Back Loop) ─────────────────────
+
+    def create_quick_note(
+        self,
+        project_id: str,
+        text: str,
+        link_to_slugs: list[str] | None = None,
+        tags: list[str] | None = None,
+    ) -> tuple[bool, dict[str, Any]]:
+        """Create a lightweight synthesis page from a quick note.
+
+        Auto-generates title from first line. Sets status='active' immediately.
+        Optionally links to existing pages by slug.
+        """
+        if not text or not text.strip():
+            return False, {"error": "Note text cannot be empty"}
+
+        # Extract title from first line
+        first_line = text.strip().split("\n")[0]
+        title = first_line.lstrip("#").strip()[:80]
+        if not title:
+            title = "Untitled Note"
+
+        # Create page
+        ok, page = self.create_page(
+            project_id=project_id,
+            title=title,
+            content=text,
+            page_type="synthesis",
+            tags=tags,
+            summary=title,
+            status="active",
+        )
+        if not ok:
+            return False, page
+
+        # Auto-link to referenced pages
+        links_created = 0
+        for slug in (link_to_slugs or []):
+            ok_target, target = self.get_page(
+                slug=slug, project_id=project_id, include_links=False
+            )
+            if ok_target and target:
+                ok_link, _ = self.create_link(
+                    from_page_id=page["id"],
+                    to_page_id=target["id"],
+                    link_type="related",
+                    context=f"Referenced from note: {title}",
+                    confidence="inferred",
+                    created_by="agent",
+                )
+                if ok_link:
+                    links_created += 1
+
+        page["links_created"] = links_created
+        return True, page
+
     # ── Link CRUD ──────────────────────────────────────────────
 
     def create_link(
@@ -250,12 +307,17 @@ class WikiService:
         link_type: str = "related",
         context: str | None = None,
         strength: float = 0.5,
+        confidence: str = "inferred",
         created_by: str = "system",
     ) -> tuple[bool, dict[str, Any]]:
         """Create a link between two wiki pages. Ignores duplicates."""
         try:
             if from_page_id == to_page_id:
                 return False, {"error": "Cannot link page to itself"}
+
+            # Validate confidence
+            if confidence not in ("extracted", "inferred", "ambiguous"):
+                confidence = "inferred"
 
             link_data = {
                 "id": str(uuid4()),
@@ -264,6 +326,7 @@ class WikiService:
                 "link_type": link_type,
                 "context": context,
                 "strength": strength,
+                "confidence": confidence,
                 "created_by": created_by,
             }
 
@@ -286,7 +349,7 @@ class WikiService:
             # Outbound links
             outbound = (
                 self.supabase.table("archon_wiki_links")
-                .select("id, to_page_id, link_type, context, strength, created_by")
+                .select("id, to_page_id, link_type, context, strength, confidence, created_by")
                 .eq("from_page_id", page_id)
                 .execute()
             )
@@ -294,7 +357,7 @@ class WikiService:
             # Inbound links
             inbound = (
                 self.supabase.table("archon_wiki_links")
-                .select("id, from_page_id, link_type, context, strength, created_by")
+                .select("id, from_page_id, link_type, context, strength, confidence, created_by")
                 .eq("to_page_id", page_id)
                 .execute()
             )
