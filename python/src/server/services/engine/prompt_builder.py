@@ -71,6 +71,7 @@ class PromptBuilder:
     ):
         self._rag_service = rag_service
         self._learning_processor = learning_processor
+        self._codebase_intel = None  # Lazy-init CodebaseIntelligence
         self.max_kb_chunks = max_kb_chunks
         self.max_chunk_length = max_chunk_length
         self.default_build_command = default_build_command
@@ -122,11 +123,12 @@ class PromptBuilder:
         kb_context = await self._fetch_kb_context(task)
         code_patterns = self._fetch_relevant_patterns(task)
         learnings = self._fetch_relevant_learnings(task)
+        intel_summary = await self._fetch_codebase_intel(task)
 
         if self.compress:
-            prompt = self._render_compressed(task, project, kb_context, cmd, code_patterns, learnings, agent_definition, review_feedback=review_feedback)
+            prompt = self._render_compressed(task, project, kb_context, cmd, code_patterns, learnings, agent_definition, review_feedback=review_feedback, intel_summary=intel_summary)
         else:
-            prompt = self._render(task, project, kb_context, cmd, code_patterns, learnings, agent_definition, review_feedback=review_feedback)
+            prompt = self._render(task, project, kb_context, cmd, code_patterns, learnings, agent_definition, review_feedback=review_feedback, intel_summary=intel_summary)
 
         injection_stats = self._compute_injection_stats(prompt, kb_context, code_patterns, learnings)
         return prompt, injection_stats
@@ -216,9 +218,11 @@ class PromptBuilder:
             # Split task title into search keywords
             title = (task.get("title") or "").strip()
             keywords = [w for w in title.split() if len(w) > 2] if title else None
+            file_paths = task.get("allowed_paths") or []
             return self._learning_processor.get_relevant_learnings(
                 project_id=task.get("project_id"),
                 task_keywords=keywords,
+                file_paths=file_paths if file_paths else None,
                 limit=10,
             )
         except Exception as e:
@@ -260,6 +264,27 @@ class PromptBuilder:
             lines.append(f"- {icon}{area_tag}{recurrence_tag}{conf_tag} {desc}")
         lines.append("")
         return "\n".join(lines)
+
+    # ------------------------------------------------------------------
+    # Codebase intelligence integration
+    # ------------------------------------------------------------------
+
+    async def _fetch_codebase_intel(self, task: dict[str, Any]) -> str | None:
+        """Fetch compressed codebase intel for the project."""
+        project_id = task.get("project_id")
+        if not project_id:
+            return None
+        try:
+            if self._codebase_intel is None:
+                from ..discovery.codebase_intel import CodebaseIntelligence
+                self._codebase_intel = CodebaseIntelligence()
+            return await self._codebase_intel.get_compressed_summary(
+                project_id=project_id,
+                max_tokens=1000,
+            )
+        except Exception as e:
+            logger.warning(f"Failed to fetch codebase intel (non-fatal): {e}")
+            return None
 
     # ------------------------------------------------------------------
     # Code pattern integration
@@ -360,6 +385,71 @@ class PromptBuilder:
                 text = str(item)
             lines.append(f"- [ ] {text}")
         return "\n".join(lines)
+
+    @staticmethod
+    def _context_efficiency_hints(task: dict[str, Any], review_feedback: dict[str, Any] | None = None) -> str | None:
+        """Generate context efficiency hints based on task metadata.
+
+        Adapts RTK's filtering philosophy into prompt-level guidance for
+        cases where RTK cannot intercept (Claude Code built-in tools like
+        Read, Grep, Glob bypass PreToolUse hooks).
+
+        Hints are advisory — the CC runtime decides whether to follow them.
+        Injected between task context and compaction hints (CI-6).
+
+        See: docs/design/what-we-adopt-from-rtk.md § B-1
+        """
+        hints: list[str] = []
+
+        # Retry execution: focus on errors, don't re-read everything
+        retry_count = task.get("retry_count") or 0
+        if retry_count > 0:
+            hints.append(
+                "- **Retry efficiency:** Focus on error messages and test failures. "
+                "Do not re-read entire test suites or build logs from the previous attempt. "
+                "Summarize what changed, not what stayed the same."
+            )
+
+        # Large scope: use targeted searches
+        allowed_paths = task.get("allowed_paths") or []
+        if len(allowed_paths) > 20:
+            hints.append(
+                "- **Large scope:** Use targeted searches (`grep -r \"pattern\" path/`) "
+                "rather than recursive directory listings. Prefer specific file reads "
+                "over broad exploration."
+            )
+
+        # Test execution tasks: summarize passing, detail failures
+        task_type = (task.get("task_type") or "").lower()
+        description = (task.get("description") or "").lower()
+        has_test_context = any(
+            kw in task_type or kw in description
+            for kw in ("test", "bug", "fix", "implementation", "feature")
+        )
+        if has_test_context:
+            hints.append(
+                "- **Test output:** If all tests pass, report the summary count only. "
+                "On failure, focus on failing test names, error messages, and relevant "
+                "stack traces — skip passing test details."
+            )
+
+        # Research/exploration tasks: summarize as you go
+        if task_type in ("research", "exploration", "spike", "investigate"):
+            hints.append(
+                "- **Exploration efficiency:** Summarize findings as you go. After reading "
+                "a file, note the key takeaways. Avoid re-reading files unless a specific "
+                "section needs re-examination."
+            )
+
+        if not hints:
+            return None
+
+        return "\n".join([
+            "## Context Efficiency",
+            "Follow these guidelines to preserve context window space:",
+            "",
+            *hints,
+        ])
 
     @staticmethod
     def _compaction_hint(previous_stage: str, next_stage: str) -> str:
@@ -702,6 +792,73 @@ class PromptBuilder:
     # Compressed template (default)
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def build_team_prompt(base_prompt: str, team_policy: dict[str, Any]) -> str:
+        """Wrap an execution prompt in Agent Team orchestration instructions.
+
+        When team_policy is enabled for a project, complex tasks are executed
+        by a CC Agent Team instead of a single session. The team lead spawns
+        coder, tester, and reviewer teammates that work in parallel within
+        the same worktree.
+
+        The wrapped prompt tells the CC lead session to:
+        1. Spawn teammates using the agent definitions in .claude/agents/team/
+        2. Coordinate work: coder first → tester → reviewer
+        3. Enforce the golden rule: no file overlap between teammates
+        4. Synthesize results into the standard output format
+        """
+        team_size = team_policy.get("team_size", 3)
+        coder_model = team_policy.get("coder_model", "claude-sonnet-4-6")
+        reviewer_model = team_policy.get("reviewer_model", "claude-opus-4-6")
+
+        return "\n".join([
+            "# Agent Team Execution Mode",
+            "",
+            "You have Agent Teams enabled. Create a team to execute this task:",
+            "",
+            "## Team Structure",
+            f"Spawn {team_size} teammates:",
+            f"1. **Coder** (model: {coder_model}) — using the `coder` agent type",
+            "   - Implement the changes in the assigned domain files",
+            "   - Run compile + unit tests after each change",
+            "   - Report completion when done",
+            "",
+            f"2. **Tester** (model: {coder_model}) — using the `tester` agent type",
+            "   - Wait for Coder to complete",
+            "   - Write unit + integration tests for all changes",
+            "   - Cover: happy path, edge cases, error handling, security",
+            "   - Run full test suite and report results",
+            "",
+            f"3. **Reviewer** (model: {reviewer_model}) — using the `reviewer` agent type",
+            "   - Wait for Tester to complete",
+            "   - Cross-review all production code and test code",
+            "   - Check: consistency, security, performance, patterns",
+            "   - Report findings with severity ratings",
+            "",
+            "## Coordination Rules",
+            "- **GOLDEN RULE**: No file overlap between teammates",
+            "- Coder: ONLY production code files",
+            "- Tester: ONLY test files",
+            "- Reviewer: READ ONLY — never modify any files",
+            "- If blocked → message the lead (you)",
+            "",
+            "## Task to Accomplish",
+            "---",
+            base_prompt,
+            "---",
+            "",
+            "## Output Requirements",
+            "After ALL teammates complete, synthesize their results.",
+            "Produce the standard structured output:",
+            "- SELF_REVIEW: PASS/FAIL (based on reviewer findings)",
+            "- REVIEW_CONFIDENCE: 0.0-1.0",
+            "- REVIEW_FINDINGS: JSON array of reviewer findings",
+            "- RESULT: SUCCESS/FAILURE",
+            "- FILES_CHANGED: total count from coder + tester",
+            "- TESTS_ADDED: count from tester",
+            "- SUMMARY: combined summary of all teammates' work",
+        ])
+
     def _render_compressed(
         self,
         task: dict[str, Any],
@@ -712,6 +869,7 @@ class PromptBuilder:
         learnings: list[dict[str, Any]] | None = None,
         agent_definition: dict[str, Any] | None = None,
         review_feedback: dict[str, Any] | None = None,
+        intel_summary: str | None = None,
     ) -> str:
         """Render prompt with context compression applied.
 
@@ -792,8 +950,17 @@ class PromptBuilder:
         if repo_guidance_section:
             parts += [repo_guidance_section, ""]
 
+        # Codebase intelligence (Phase 6: cold-start reduction)
+        if intel_summary:
+            parts += [intel_summary, ""]
+
         if exec_prompt:
             parts += ["## Execution Strategy", exec_prompt, ""]
+
+        # Context efficiency hints (B-1: RTK-inspired prompt guidance)
+        efficiency_section = self._context_efficiency_hints(task, review_feedback=review_feedback)
+        if efficiency_section:
+            parts += [efficiency_section, ""]
 
         parts += [
             "## Acceptance Criteria",
@@ -835,6 +1002,7 @@ class PromptBuilder:
         learnings: list[dict[str, Any]] | None = None,
         agent_definition: dict[str, Any] | None = None,
         review_feedback: dict[str, Any] | None = None,
+        intel_summary: str | None = None,
     ) -> str:
         title = task.get("title", "Untitled")
         priority = task.get("priority", "medium")
@@ -883,6 +1051,10 @@ class PromptBuilder:
         repo_guidance_section = self._format_repo_guidance_packs(task)
         if repo_guidance_section:
             parts += [repo_guidance_section, ""]
+
+        # Codebase intelligence (Phase 6: cold-start reduction)
+        if intel_summary:
+            parts += [intel_summary, ""]
 
         if exec_prompt:
             parts += ["## Execution Strategy", exec_prompt, ""]

@@ -28,6 +28,7 @@ _POLICY_COLUMNS = (
     "isolation_policy",
     "review_policy",
     "capacity_policy",
+    "team_policy",
 )
 
 _VALID_RUNNERS = {"claude-code-cli", "codex-cli"}
@@ -81,6 +82,14 @@ _DEFAULT_POLICY: dict[str, Any] = {
         "stalled_warning_seconds": 300,
         "stalled_kill_seconds": 600,
         "guidance_pack_budget_tokens": None,
+    },
+    "team_policy": {
+        "enabled": False,
+        "min_complexity": "complex",
+        "team_size": 3,
+        "coder_model": "claude-sonnet-4-6",
+        "reviewer_model": "claude-opus-4-6",
+        "timeout_seconds": 1200,
     },
 }
 

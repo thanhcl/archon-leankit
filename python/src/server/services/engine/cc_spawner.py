@@ -24,6 +24,15 @@ from typing import Any
 
 from ...config.env_aliases import get_runner_env_allowlist, get_runner_env_stripped_prefixes
 from ...config.logfire_config import get_logger
+from .rtk_integration import (
+    RTKSetupResult,
+    cleanup_tee,
+    collect_rtk_analytics,
+    get_rtk_spawn_env,
+    get_tee_recovery_path,
+    is_rtk_enabled,
+    setup_rtk_for_workspace,
+)
 from .run_workspace import RunWorkspaceContext
 from .sandbox_provider import GitWorktreeProvider, SandboxContext, get_provider_for_isolation
 
@@ -352,6 +361,7 @@ class CCSpawner:
         previous_model: str | None = None,
         manage_sandbox: bool = True,
         sandbox_ctx: SandboxContext | None = None,
+        **kwargs: Any,
     ) -> CCExecutionResult:
         """Spawn a Claude Code CLI session for a task.
 
@@ -415,7 +425,25 @@ class CCSpawner:
                     duration_seconds=0,
                 )
 
+        # RTK setup: install output compression hooks before CC spawn (A-1)
+        rtk_setup: RTKSetupResult | None = None
+        if is_rtk_enabled():
+            try:
+                rtk_setup = await setup_rtk_for_workspace(sandbox_ctx.workspace_path)
+                if rtk_setup.enabled and rtk_setup.hook_installed:
+                    logger.info(
+                        f"RTK active | task_id={task_id} | "
+                        f"tee_dir={rtk_setup.tee_dir or 'none'}"
+                    )
+            except Exception as exc:
+                logger.warning(f"RTK setup failed (non-fatal) | task_id={task_id} | error={exc}")
+                rtk_setup = None
+
         try:
+            # Detect team_mode from kwargs (passed by pipeline)
+            is_team = kwargs.get("team_mode", False)
+            team_timeout_val = kwargs.get("team_timeout", 1200)
+
             result = await self._spawn_with_model(
                 task_id=task_id,
                 prompt=prompt,
@@ -426,7 +454,29 @@ class CCSpawner:
                 on_stream_event=on_stream_event,
                 token_profile=token_profile,
                 workspace_context=workspace_context,
+                team_mode=is_team,
+                team_timeout=team_timeout_val,
             )
+
+            # RTK post-run: collect analytics and manage tee (A-2, B-2)
+            if rtk_setup and rtk_setup.enabled:
+                try:
+                    rtk_stats = await collect_rtk_analytics(rtk_setup.binary_path)
+                    if rtk_stats:
+                        result.parsed["rtk_session_stats"] = rtk_stats.to_dict()
+                        logger.info(
+                            f"RTK savings | task_id={task_id} | "
+                            f"before={rtk_stats.tokens_before} → after={rtk_stats.tokens_after} | "
+                            f"savings={rtk_stats.savings_pct:.1f}%"
+                        )
+                except Exception as exc:
+                    logger.debug(f"RTK analytics collection failed (non-fatal) | error={exc}")
+
+                # Tee management: retain on failure, clean on success
+                tee_path = get_tee_recovery_path(rtk_setup.tee_dir)
+                if tee_path and not result.success:
+                    result.parsed["rtk_tee_path"] = tee_path
+                cleanup_tee(rtk_setup.tee_dir, keep_on_failure=True, run_success=result.success)
 
             if not result.success and _is_model_fallback_eligible(result):
                 # N3-1: Model-level fallback triggers only on rate-limit (429),
@@ -486,6 +536,8 @@ class CCSpawner:
         on_stream_event: StreamCallback | None = None,
         token_profile: dict[str, Any] | None = None,
         workspace_context: RunWorkspaceContext | None = None,
+        team_mode: bool = False,
+        team_timeout: int = 1200,
     ) -> CCExecutionResult:
         """Execute a CC spawn with a specific model.
 
@@ -499,6 +551,8 @@ class CCSpawner:
                 directory after the process completes.
         """
         effective_timeout = timeout or self.default_timeout
+        if team_mode:
+            effective_timeout = max(effective_timeout, team_timeout)
 
         command, stdin_prompt = self._build_command(prompt, model=model)
 
@@ -548,6 +602,14 @@ class CCSpawner:
         spawn_env = base_env
         injected_env_keys: list[str] = []
 
+        # Inject RTK environment variables (A-1: transparent output compression)
+        if is_rtk_enabled():
+            rtk_env = get_rtk_spawn_env()
+            for key, value in rtk_env.items():
+                if key in allowlist:
+                    spawn_env[key] = value
+                    injected_env_keys.append(key)
+
         if token_profile:
             candidate_injections: dict[str, str] = {}
             if "max_tokens" in token_profile:
@@ -588,6 +650,11 @@ class CCSpawner:
                 logger.warning(f"Failed to create per-spawn config dir, using inherited | task_id={task_id} | error={exc}")
         else:
             logger.debug(f"Config dir isolation skipped (OAuth auth) | task_id={task_id}")
+
+        # Agent Teams: enable CC team orchestration when team_mode is active
+        if team_mode:
+            spawn_env["CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS"] = "1"
+            logger.info(f"Agent Teams enabled for spawn | task_id={task_id}")
 
         try:
             process = await asyncio.create_subprocess_shell(

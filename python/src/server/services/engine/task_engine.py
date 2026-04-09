@@ -59,7 +59,8 @@ from .architect_reviewer import (
 )
 from .bug_task_creator import BugTaskCreator
 from .capacity_tracker import GlobalCapacityTracker, SharedAgentPool
-from .cc_spawner import MODEL_SONNET, CCExecutionResult, CCSpawner, ProjectConfig, is_runner_level_failure
+from .cc_spawner import MODEL_HAIKU, MODEL_OPUS, MODEL_SONNET, CCExecutionResult, CCSpawner, ProjectConfig, is_runner_level_failure
+from .stall_detector import StallDetector
 from .sandbox_provider import SandboxContext, get_provider_for_isolation
 from .codex_runner import CodexRunnerAdapter
 from .evaluator_templates import (
@@ -74,6 +75,7 @@ from .execution_health_monitor import (
 from .health_monitor import HealthMonitor
 from .learning_processor import LearningProcessor
 from .notifier import EVENT_TASK_CONTRACT_GATE_BLOCKED, Notifier
+from .verification_agent import VerificationAgent
 from .prompt_builder import PromptBuilder
 from .review_prompts import build_adversarial_code_review_prompt
 from .run_workspace import RunWorkspaceContext, RunWorkspaceManager
@@ -129,6 +131,7 @@ class TaskExecutionState:
     boundary_snapshot_error: str | None = None
     sandbox_workspace_path: str | None = None
     sandbox_provider: Any | None = None
+    team_mode: bool = False
     runner: ExecutionRunner | None = None
     runner_key: str = DEFAULT_RUNNER_KEY
     routing_reason: str | None = None
@@ -150,6 +153,7 @@ class TaskExecutionState:
     execution_result: dict[str, Any] | None = None
     executed_by: dict[str, Any] | None = None
     run_status: str | None = None
+    deviation_type: str | None = None
     run_metadata: dict[str, Any] | None = None
     llm_metrics: dict[str, Any] = field(default_factory=dict)
     result_summary: str | None = None
@@ -211,6 +215,8 @@ class TaskEngine:
             task_service=self.task_service,
             notifier=self.notifier,
         )
+        self.stall_detector = StallDetector()
+        self.verification_agent = VerificationAgent()
         self.default_runner_key = get_engine_default_runner_key()
         self.runner_adapters: dict[str, ExecutionRunner] = {}
         self._run_heartbeat_interval_seconds = 15.0
@@ -1701,6 +1707,62 @@ class TaskEngine:
                     await self.notifier.on_task_failed(task_id, policy_reason, runtime=runtime)
                 return
 
+            # Stall detection gate — detect infinite retry loops before scheduling another retry
+            stall_result = await self.stall_detector.check(task_id)
+            if stall_result.stalled:
+                stall_payload = {
+                    "consecutive_count": stall_result.consecutive_count,
+                    "outcome_hash": stall_result.outcome_hash,
+                    "recommendation": stall_result.recommendation,
+                    "models_tried": stall_result.models_tried,
+                    "last_error_preview": stall_result.last_error_preview,
+                }
+                await self.notifier.on_stall_detected(task_id, stall_payload, runtime=runtime)
+
+                if stall_result.should_pause:
+                    # Hard-stop: transition to on-hold and notify
+                    hold_reason = (
+                        f"Stall detected — {stall_result.consecutive_count} consecutive identical "
+                        f"outcomes (hash={stall_result.outcome_hash}). "
+                        f"Recommendation: {stall_result.recommendation}. "
+                        f"Models tried: {stall_result.models_tried}."
+                    )
+                    await self.lifecycle_service.execute_transition(
+                        task_id=task_id,
+                        new_status="failed",
+                        changed_by="task-engine",
+                        reason=hold_reason,
+                    )
+                    if self._escalation_enabled:
+                        await self.lifecycle_service.execute_transition(
+                            task_id=task_id,
+                            new_status="escalated",
+                            changed_by="task-engine",
+                            reason=hold_reason,
+                        )
+                        await self.notifier.on_task_escalated(task_id, hold_reason, runtime=runtime)
+                    else:
+                        await self.notifier.on_task_failed(task_id, hold_reason, runtime=runtime)
+                    logger.warning(
+                        f"Task paused due to stall | task_id={task_id} | "
+                        f"consecutive={stall_result.consecutive_count} | "
+                        f"recommendation={stall_result.recommendation}"
+                    )
+                    return
+
+                if stall_result.should_escalate:
+                    # Escalate model tier for next retry
+                    current_model = task.get("model") or MODEL_SONNET
+                    if current_model == MODEL_HAIKU:
+                        task["model"] = MODEL_SONNET
+                    elif current_model == MODEL_SONNET:
+                        task["model"] = MODEL_OPUS
+                    # If already opus, proceed with retry as-is
+                    logger.info(
+                        f"Stall escalation — upgrading model | task_id={task_id} | "
+                        f"from={current_model} | to={task.get('model')}"
+                    )
+
             await self.lifecycle_service.execute_transition(
                 task_id=task_id,
                 new_status="failed",
@@ -2886,6 +2948,25 @@ class TaskEngine:
                     "decomposition_reason": reason,
                 })
 
+        # AT-4: Agent Teams eligibility — spawn CC Team for complex tasks
+        # when project team_policy is enabled. Opt-in per project, first attempt only.
+        team_policy = (state.policy or {}).get("team_policy", {})
+        if (
+            team_policy.get("enabled")
+            and state.full_task.get("complexity") in (
+                team_policy.get("min_complexity", "complex"), "complex",
+            )
+            and state.full_task.get("parent_task_id") is None
+            and state.full_task.get("decomposition_mode") != "coordinator"
+            and state.retry_index == 0
+        ):
+            state.team_mode = True
+            logger.info(
+                f"Agent Team mode enabled | task_id={state.task_id} | "
+                f"complexity={state.full_task.get('complexity')} | "
+                f"team_size={team_policy.get('team_size', 3)}"
+            )
+
         # Collaboration mode gate: check how architect-planned tasks should be handled
         collaboration_blocked, collaboration_reason = await self._check_collaboration_gate(
             state.task_id,
@@ -3079,6 +3160,13 @@ class TaskEngine:
             build_command=self.project_config.build_command,
             review_feedback=review_feedback,
         )
+
+        # AT-4: Wrap prompt in Agent Team orchestration when team_mode active
+        if state.team_mode and state.prompt:
+            team_policy = (state.policy or {}).get("team_policy", {})
+            state.prompt = PromptBuilder.build_team_prompt(state.prompt, team_policy)
+            logger.info(f"Team prompt wrapped | task_id={state.task_id}")
+
         logger.info(
             f"Injection stats | task_id={state.task_id} | "
             f"learnings={state.injection_stats['learnings']} | "
@@ -3349,6 +3437,12 @@ class TaskEngine:
         if not manage_sandbox:
             spawn_kwargs["manage_sandbox"] = False
             spawn_kwargs["sandbox_ctx"] = sandbox_ctx
+
+        # AT-4: Pass team_mode to runner spawn
+        if state.team_mode:
+            team_policy = (state.policy or {}).get("team_policy", {})
+            spawn_kwargs["team_mode"] = True
+            spawn_kwargs["team_timeout"] = team_policy.get("timeout_seconds", 1200)
 
         state.runner_result = await state.runner.spawn(
             task_id=state.task_id,
@@ -3622,6 +3716,26 @@ class TaskEngine:
             if state.runner_result.success and state.runner_result.parsed.get("result", "").upper() != "FAILURE"
             else "failed"
         )
+
+        # Classify deviation type for failed runs (Phase 3 — GSD adoption)
+        if state.run_status == "failed":
+            from .deviation_classifier import DeviationClassifier
+            classifier = DeviationClassifier()
+            state.deviation_type = classifier.classify(
+                error_summary=(
+                    state.runner_result.stderr[:500]
+                    if state.runner_result.stderr
+                    else None
+                ),
+                result_summary=state.runner_result.parsed.get("summary"),
+                boundary_validation=state.boundary_validation,
+            )
+            logger.info(
+                f"Deviation classified | task_id={state.task_id} | "
+                f"run_id={state.execute_run_id} | "
+                f"deviation_type={state.deviation_type}"
+            )
+
         # Preserve any metadata set by earlier stages (e.g. retry_context from B-P4-01)
         prior_metadata = state.run_metadata or {}
         state.run_metadata = {
@@ -3641,6 +3755,8 @@ class TaskEngine:
         injected_env_keys = state.runner_result.parsed.get("injected_env_keys")
         if injected_env_keys is not None:
             state.run_metadata["injected_env_keys"] = injected_env_keys
+        if state.deviation_type is not None:
+            state.run_metadata["deviation_type"] = state.deviation_type
 
         # Lifecycle hook: capture run stop context
         stop_metrics = {}
@@ -3743,6 +3859,7 @@ class TaskEngine:
             result_summary=state.result_summary,
             error_summary=(state.runner_result.stderr[:500] if state.runner_result.stderr else None),
             workspace_path=workspace_path_str,
+            deviation_type=state.deviation_type,
             metadata=state.run_metadata,
             **state.llm_metrics,
         )
@@ -3753,6 +3870,24 @@ class TaskEngine:
                 "executed_by": state.executed_by,
             },
         )
+
+        # Process learnings and code patterns from runner output
+        learnings_raw = state.runner_result.parsed.get("learnings", [])
+        code_patterns_raw = state.runner_result.parsed.get("code_patterns", [])
+        if learnings_raw or code_patterns_raw:
+            try:
+                await self.learning_processor.process(
+                    task=state.current_task or {"id": state.task_id, "project_id": self.project_id},
+                    learnings=learnings_raw,
+                    code_patterns=code_patterns_raw,
+                    execution_run_id=state.execute_run_id,
+                )
+            except Exception as exc:
+                logger.warning(
+                    f"Learning extraction failed (non-fatal) | "
+                    f"task_id={state.task_id} | error={exc}"
+                )
+
         if self.project_id and state.execution_result is not None:
             self.cost_budget_service.record_task_cost(self.project_id, state.task_id, state.execution_result)
         return state
@@ -4466,6 +4601,52 @@ class TaskEngine:
 
         # Decide next action based on verdict
         if verdict == "APPROVE":
+            # Goal-backward verification: check deliverables against acceptance criteria
+            verification_result = self.verification_agent.verify(
+                task=task,
+                execution_result=execution_result,
+                code_review=code_review_data,
+            )
+
+            # Store verification result on task
+            await self.task_service.update_task(
+                task_id=task_id,
+                update_fields={
+                    "verification": verification_result.to_dict(),
+                },
+            )
+
+            # Emit verification event
+            await self.notifier.on_verification_complete(
+                task_id,
+                verification_result.to_dict(),
+                runtime=self._build_runtime_context(
+                    task, stage="verification", session_id=f"{task_id}-review",
+                ),
+            )
+
+            if verification_result.recommendation == "rework":
+                # Verification failed — bounce back to assigned for rework
+                gap_summary = "; ".join(verification_result.gaps[:5])
+                await self.lifecycle_service.execute_transition(
+                    task_id=task_id,
+                    new_status="assigned",
+                    changed_by="verification-agent",
+                    reason=f"Verification failed: {gap_summary[:500]}",
+                )
+                logger.warning(
+                    f"Verification failed — rework required | task_id={task_id} | "
+                    f"gaps={len(verification_result.gaps)}"
+                )
+                return  # Don't proceed to review/done
+
+            # If follow_up, log gaps but proceed
+            if verification_result.recommendation == "follow_up":
+                logger.info(
+                    f"Verification follow-up gaps noted | task_id={task_id} | "
+                    f"gaps={len(verification_result.gaps)}"
+                )
+
             # Check auto-approval policy (B-P4-03)
             auto_tier = self._get_auto_approval_tier(policy)
             can_auto, auto_reason = evaluate_auto_approval(
