@@ -98,6 +98,8 @@ from .runner_routing import (
 )
 from .auto_approval import evaluate_auto_approval
 from .coordinator_service import CoordinatorService
+from .env_leak_gate import EnvLeakError, EnvLeakGate, get_env_leak_gate
+from .error_classifier import ErrorCategory, ErrorClassifier, get_error_classifier
 from .lifecycle_hooks import LifecycleHooks
 from .task_boundaries import task_has_boundary_rules, validate_task_boundaries
 from .task_conflicts import predict_task_overlap
@@ -217,6 +219,8 @@ class TaskEngine:
         )
         self.stall_detector = StallDetector()
         self.verification_agent = VerificationAgent()
+        self.error_classifier = get_error_classifier()
+        self.env_leak_gate = get_env_leak_gate()
         self.default_runner_key = get_engine_default_runner_key()
         self.runner_adapters: dict[str, ExecutionRunner] = {}
         self._run_heartbeat_interval_seconds = 15.0
@@ -1664,8 +1668,15 @@ class TaskEngine:
         task: dict[str, Any],
         reason: str,
         runtime: dict[str, Any] | None = None,
+        exception_name: str | None = None,
+        stderr: str | None = None,
     ) -> None:
         """Apply retry-or-escalate policy after a task execution failure.
+
+        Error classification (adopted from upstream Archon v0.3.2):
+        - FATAL errors (auth, permissions, budget) → immediate escalation, never retry
+        - TRANSIENT errors (timeout, rate-limit, network) → retry with backoff
+        - UNKNOWN errors → fallback to legacy retry policy
 
         If retry attempts remain: transitions to 'failed', then schedules a
         background retry after exponential-backoff delay.
@@ -1675,11 +1686,45 @@ class TaskEngine:
         """
         retry_count = int(task.get("retry_count") or 0)
         max_retries = int(task.get("max_retries") or 3)
+
+        # Classify error before deciding retry policy
+        error_category, should_retry = self.error_classifier.classify_and_decide(
+            error_text=reason,
+            exception_name=exception_name,
+            stderr=stderr,
+        )
+
         logger.warning(
             f"Task failure | task_id={task_id} | attempt={retry_count} | "
-            f"max_retries={max_retries} | escalation_enabled={self._escalation_enabled} | "
+            f"max_retries={max_retries} | error_category={error_category.value} | "
+            f"escalation_enabled={self._escalation_enabled} | "
             f"reason={reason[:200]}"
         )
+
+        # FATAL errors: immediately escalate, never retry
+        if error_category == ErrorCategory.FATAL:
+            fatal_reason = f"FATAL error (no retry): {reason[:300]}"
+            await self.lifecycle_service.execute_transition(
+                task_id=task_id,
+                new_status="failed",
+                changed_by="task-engine",
+                reason=fatal_reason,
+            )
+            if self._escalation_enabled:
+                await self.lifecycle_service.execute_transition(
+                    task_id=task_id,
+                    new_status="escalated",
+                    changed_by="task-engine",
+                    reason=fatal_reason,
+                )
+                await self.notifier.on_task_escalated(task_id, fatal_reason, runtime=runtime)
+                logger.warning(
+                    f"Task escalated — FATAL error, no retry | task_id={task_id} | "
+                    f"category={error_category.value}"
+                )
+            else:
+                await self.notifier.on_task_failed(task_id, fatal_reason, runtime=runtime)
+            return
 
         if retry_count < max_retries:
             # Check feedback policy — escalate rather than retry if no actionable feedback exists
