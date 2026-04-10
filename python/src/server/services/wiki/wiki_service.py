@@ -12,7 +12,7 @@ import hashlib
 import json
 import logging
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from uuid import uuid4
 
@@ -377,12 +377,18 @@ class WikiService:
         page_id: str | None = None,
         depth: int = 2,
         link_types: list[str] | None = None,
+        follow_tunnels: bool = False,
     ) -> tuple[bool, dict[str, Any]]:
-        """Get knowledge graph (nodes + edges) around a page or for a project."""
+        """Get knowledge graph (nodes + edges) around a page or for a project.
+
+        Args:
+            follow_tunnels: When True, also follow approved cross-project
+                tunnels during BFS traversal (depth limited to 1 for tunnels).
+        """
         try:
             if page_id:
                 # BFS from page_id up to depth
-                return self._bfs_graph(page_id, depth, link_types)
+                return self._bfs_graph(page_id, depth, link_types, follow_tunnels=follow_tunnels)
             elif project_id:
                 # Full project graph
                 return self._full_project_graph(project_id, link_types)
@@ -394,7 +400,8 @@ class WikiService:
             return False, {"error": str(e)}
 
     def _bfs_graph(
-        self, start_page_id: str, depth: int, link_types: list[str] | None
+        self, start_page_id: str, depth: int, link_types: list[str] | None,
+        follow_tunnels: bool = False,
     ) -> tuple[bool, dict[str, Any]]:
         """BFS graph traversal from a starting page."""
         visited_ids: set[str] = set()
@@ -402,7 +409,7 @@ class WikiService:
         edges: list[dict[str, Any]] = []
         frontier = {start_page_id}
 
-        for _level in range(depth):
+        for level in range(depth):
             if not frontier:
                 break
 
@@ -446,6 +453,20 @@ class WikiService:
                         "strength": link.get("strength"),
                     })
                     next_frontier.add(link["from_page_id"])
+
+                # Follow cross-project tunnels (depth-1 only)
+                if follow_tunnels and level == 0:
+                    tunnel_edges = self._get_active_tunnels_for_page(pid)
+                    for te in tunnel_edges:
+                        target = te["to_page_id"] if te["from_page_id"] == pid else te["from_page_id"]
+                        edges.append({
+                            "from": te["from_page_id"],
+                            "to": te["to_page_id"],
+                            "type": te["tunnel_type"],
+                            "is_tunnel": True,
+                            "tunnel_id": te["id"],
+                        })
+                        next_frontier.add(target)
 
             frontier = next_frontier - visited_ids
 
@@ -523,3 +544,209 @@ class WikiService:
         except Exception as e:
             logger.error(f"Error recalculating quality: {e}")
             return 0.5
+
+    # ── Verbatim Evidence (MemPalace-inspired) ───────────────────
+
+    MAX_EVIDENCE_PER_PAGE = 50
+
+    def add_evidence(
+        self,
+        page_id: str,
+        quote: str,
+        source_url: str = "",
+        source_page_id: str = "",
+        context: str = "",
+        captured_by: str = "agent",
+        stale_after_days: int = 90,
+    ) -> tuple[bool, dict[str, Any]]:
+        """Append a verbatim evidence item to a wiki page.
+
+        Deduplicates by quote hash. Evicts oldest items when the per-page
+        cap (MAX_EVIDENCE_PER_PAGE) is reached. Bumps quality_score.
+        """
+        try:
+            normalized = re.sub(r"\s+", " ", quote.strip().lower())
+            quote_hash = hashlib.sha256(normalized.encode()).hexdigest()[:16]
+
+            # Read current evidence
+            resp = (
+                self.supabase.table("archon_wiki_pages")
+                .select("evidence,quality_score")
+                .eq("id", page_id)
+                .execute()
+            )
+            if not resp.data:
+                return False, {"error": f"Page {page_id} not found"}
+
+            raw_evidence = resp.data[0].get("evidence") or "[]"
+            evidence_list: list[dict[str, Any]] = (
+                json.loads(raw_evidence) if isinstance(raw_evidence, str) else raw_evidence
+            )
+
+            # Dedup check
+            for item in evidence_list:
+                if item.get("quote_hash") == quote_hash:
+                    return True, {"message": "Duplicate quote — already stored", "quote_hash": quote_hash}
+
+            # Build evidence item
+            now = datetime.now(timezone.utc).isoformat()
+            evidence_item = {
+                "quote": quote.strip(),
+                "quote_hash": quote_hash,
+                "source_url": source_url,
+                "source_page_id": source_page_id,
+                "captured_at": now,
+                "captured_by": captured_by,
+                "context": context[:500] if context else "",
+                "stale_after_days": stale_after_days,
+                "verified_at": None,
+            }
+
+            evidence_list.append(evidence_item)
+
+            # Evict oldest if over cap
+            if len(evidence_list) > self.MAX_EVIDENCE_PER_PAGE:
+                evidence_list.sort(key=lambda x: x.get("captured_at", ""))
+                evidence_list = evidence_list[-self.MAX_EVIDENCE_PER_PAGE:]
+
+            # Write back
+            current_quality = resp.data[0].get("quality_score") or 0.5
+            # Bump quality slightly for having evidence (capped at 1.0)
+            new_quality = min(1.0, current_quality + 0.02)
+
+            self.supabase.table("archon_wiki_pages").update({
+                "evidence": json.dumps(evidence_list),
+                "quality_score": new_quality,
+                "updated_at": now,
+            }).eq("id", page_id).execute()
+
+            return True, {
+                "quote_hash": quote_hash,
+                "evidence_count": len(evidence_list),
+                "quality_score": new_quality,
+            }
+
+        except Exception as e:
+            logger.error(f"Error adding evidence to page {page_id}: {e}")
+            return False, {"error": str(e)}
+
+    def search_evidence(
+        self,
+        project_id: str,
+        query: str,
+        limit: int = 10,
+    ) -> tuple[bool, list[dict[str, Any]]]:
+        """Search verbatim evidence quotes across all pages in a project.
+
+        Returns page metadata plus matching evidence items.
+        """
+        try:
+            query_lower = query.lower().strip()
+            if not query_lower:
+                return True, []
+
+            # Fetch pages with non-empty evidence
+            resp = (
+                self.supabase.table("archon_wiki_pages")
+                .select("id,title,slug,evidence")
+                .eq("project_id", project_id)
+                .neq("evidence", "[]")
+                .execute()
+            )
+            pages = resp.data or []
+
+            matches: list[dict[str, Any]] = []
+            query_terms = set(query_lower.split())
+
+            for page in pages:
+                raw = page.get("evidence") or "[]"
+                evidence_list = json.loads(raw) if isinstance(raw, str) else raw
+
+                matching_evidence = []
+                for item in evidence_list:
+                    quote_text = (item.get("quote") or "").lower()
+                    context_text = (item.get("context") or "").lower()
+                    combined = f"{quote_text} {context_text}"
+
+                    # Match if any query term appears in quote or context
+                    if any(term in combined for term in query_terms):
+                        matching_evidence.append(item)
+
+                if matching_evidence:
+                    matches.append({
+                        "page_id": page["id"],
+                        "page_title": page.get("title", ""),
+                        "page_slug": page.get("slug", ""),
+                        "matching_evidence": matching_evidence[:5],  # Limit per page
+                    })
+
+                if len(matches) >= limit:
+                    break
+
+            return True, matches
+
+        except Exception as e:
+            logger.error(f"Error searching evidence: {e}")
+            return False, []
+
+    def get_stale_evidence(
+        self,
+        project_id: str,
+    ) -> tuple[bool, list[dict[str, Any]]]:
+        """Find evidence items past their staleness threshold.
+
+        Returns pages with stale evidence for re-verification queue.
+        """
+        try:
+            resp = (
+                self.supabase.table("archon_wiki_pages")
+                .select("id,title,slug,evidence")
+                .eq("project_id", project_id)
+                .neq("evidence", "[]")
+                .execute()
+            )
+            pages = resp.data or []
+            now = datetime.now(timezone.utc)
+
+            stale_results: list[dict[str, Any]] = []
+
+            for page in pages:
+                raw = page.get("evidence") or "[]"
+                evidence_list = json.loads(raw) if isinstance(raw, str) else raw
+
+                stale_items = []
+                for item in evidence_list:
+                    captured_at_str = item.get("captured_at")
+                    if not captured_at_str:
+                        continue
+
+                    captured_at = datetime.fromisoformat(
+                        captured_at_str.replace("Z", "+00:00")
+                    )
+                    stale_days = item.get("stale_after_days", 90)
+                    expiry = captured_at + timedelta(days=stale_days)
+
+                    # Check if verified_at is also past threshold
+                    verified_at_str = item.get("verified_at")
+                    if verified_at_str:
+                        verified_at = datetime.fromisoformat(
+                            verified_at_str.replace("Z", "+00:00")
+                        )
+                        expiry = verified_at + timedelta(days=stale_days)
+
+                    if now > expiry:
+                        stale_items.append(item)
+
+                if stale_items:
+                    stale_results.append({
+                        "page_id": page["id"],
+                        "page_title": page.get("title", ""),
+                        "stale_count": len(stale_items),
+                        "stale_evidence": stale_items,
+                    })
+
+            return True, stale_results
+
+        except Exception as e:
+            logger.error(f"Error getting stale evidence: {e}")
+            return False, []

@@ -19,6 +19,8 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from .api_routes.agent_chat_api import router as agent_chat_router
 from .api_routes.agent_definitions_api import router as agent_definitions_router
+from .api_routes.agent_runtimes_api import router as agent_runtimes_router
+from .api_routes.inbox_api import router as inbox_router
 from .api_routes.agent_work_orders_proxy import router as agent_work_orders_router
 from .api_routes.approval_requests_api import router as approval_requests_router
 from .api_routes.bootstrap_plans_api import router as bootstrap_plans_router
@@ -255,6 +257,8 @@ app.include_router(cost_budget_router)
 app.include_router(service_health_router)
 app.include_router(implementation_plans_router)
 app.include_router(agent_definitions_router)
+app.include_router(agent_runtimes_router)
+app.include_router(inbox_router)
 app.include_router(wiki_router)
 app.include_router(discovery_router)
 

@@ -283,3 +283,53 @@ async def export_obsidian(project_id: str):
         media_type="application/zip",
         headers={"Content-Disposition": f"attachment; filename=wiki-vault-{project_id[:8]}.zip"},
     )
+
+
+# ── Verbatim Evidence Endpoints (MemPalace-inspired) ─────────
+
+
+class AddEvidenceRequest(BaseModel):
+    quote: str
+    source_url: str = ""
+    source_page_id: str = ""
+    context: str = ""
+    captured_by: str = "agent"
+    stale_after_days: int = 90
+
+
+@router.post("/pages/{page_id}/evidence")
+async def add_evidence(page_id: str, body: AddEvidenceRequest):
+    """Add a verbatim evidence item to a wiki page."""
+    svc = WikiService()
+    ok, result = svc.add_evidence(
+        page_id=page_id,
+        quote=body.quote,
+        source_url=body.source_url,
+        source_page_id=body.source_page_id,
+        context=body.context,
+        captured_by=body.captured_by,
+        stale_after_days=body.stale_after_days,
+    )
+    if not ok:
+        raise HTTPException(status_code=400, detail=result.get("error", "Failed to add evidence")) from None
+    return result
+
+
+@router.get("/evidence/search")
+async def search_evidence(project_id: str, query: str, limit: int = 10):
+    """Search verbatim evidence quotes across project wiki pages."""
+    svc = WikiService()
+    ok, results = svc.search_evidence(project_id=project_id, query=query, limit=limit)
+    if not ok:
+        raise HTTPException(status_code=500, detail="Evidence search failed") from None
+    return {"results": results, "count": len(results)}
+
+
+@router.get("/evidence/stale")
+async def get_stale_evidence(project_id: str):
+    """Get evidence items past their staleness threshold for re-verification."""
+    svc = WikiService()
+    ok, results = svc.get_stale_evidence(project_id=project_id)
+    if not ok:
+        raise HTTPException(status_code=500, detail="Stale evidence query failed") from None
+    return {"results": results, "count": len(results)}

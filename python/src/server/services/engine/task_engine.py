@@ -3155,9 +3155,22 @@ class TaskEngine:
         if formal_criteria:
             task_for_prompt = {**state.full_task, "_formal_contract_criteria": formal_criteria}
 
+        # Resolve agent definition and project metadata for wake-up context
+        agent_definition = self._resolve_agent_definition_for_prompt(state)
+        project_metadata = self._get_project_metadata_for_prompt(state)
+
+        # Apply wakeup budget from engine policy (additive JSONB key)
+        if state.policy:
+            capacity = state.policy.get("capacity_policy") or {}
+            wakeup_budget = capacity.get("wakeup_budget_tokens")
+            if isinstance(wakeup_budget, int) and wakeup_budget > 0:
+                self.prompt_builder._wakeup_budget = wakeup_budget
+
         state.prompt, state.injection_stats = await self.prompt_builder.build(
             task=task_for_prompt,
+            project=project_metadata,
             build_command=self.project_config.build_command,
+            agent_definition=agent_definition,
             review_feedback=review_feedback,
         )
 
@@ -3173,6 +3186,7 @@ class TaskEngine:
             f"patterns={state.injection_stats['patterns']} | "
             f"kb_chunks={state.injection_stats['kb_chunks']} | "
             f"tokens={state.injection_stats['tokens']} | "
+            f"wakeup_tokens={state.injection_stats.get('wakeup_tokens', 0)} | "
             f"guidance_hash={state.injection_stats.get('guidance_pack_hash', '')}"
         )
 
@@ -3198,7 +3212,64 @@ class TaskEngine:
                         },
                     )
 
+        # Emit wake-up context event for observability
+        wakeup_tokens = state.injection_stats.get("wakeup_tokens", 0)
+        if wakeup_tokens > 0:
+            await self.notifier.emit(
+                "learning.wakeup_context_injected",
+                task_id=state.task_id,
+                data={
+                    "task_id": state.task_id,
+                    "project_id": state.project_id,
+                    "wakeup_tokens": wakeup_tokens,
+                    "agent_name": (agent_definition or {}).get("name", ""),
+                },
+            )
+
         return state
+
+    def _resolve_agent_definition_for_prompt(
+        self, state: "TaskExecutionState",
+    ) -> dict[str, Any] | None:
+        """Resolve agent definition for wake-up context injection.
+
+        Looks up the agent definition for the task's assignee from the cached
+        agent definitions. Returns None if not found (graceful fallback).
+        """
+        if state.full_task is None:
+            return None
+        try:
+            assignee = state.full_task.get("assignee") or ""
+            # Check cached agent definitions from policy
+            agent_defs = (state.policy or {}).get("agent_definitions") or []
+            for adef in agent_defs:
+                if adef.get("name") == assignee or adef.get("id") == assignee:
+                    return adef
+            # Fallback: build a minimal definition from task metadata
+            if assignee:
+                return {"name": assignee, "role": "execution", "specialization": ""}
+            return None
+        except Exception:
+            return None
+
+    @staticmethod
+    def _get_project_metadata_for_prompt(
+        state: "TaskExecutionState",
+    ) -> dict[str, Any] | None:
+        """Extract project metadata for wake-up context injection.
+
+        Assembles a lightweight project dict from the task and project config.
+        """
+        if state.full_task is None:
+            return None
+        try:
+            return {
+                "id": state.project_id,
+                "title": state.full_task.get("source_app") or "",
+                "tech_stack": "",  # Will be enriched from codebase intel if available
+            }
+        except Exception:
+            return None
 
     async def _stage_boundary_injection(self, state: TaskExecutionState) -> TaskExecutionState:
         """Capture the pre-run workspace snapshot used for boundary validation.

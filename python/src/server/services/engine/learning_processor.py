@@ -768,6 +768,7 @@ class LearningProcessor:
         self,
         project_id: str | None,
         task_keywords: list[str] | None = None,
+        file_paths: list[str] | None = None,
         limit: int = 10,
     ) -> list[dict[str, Any]]:
         """Fetch relevant learnings for prompt injection.
@@ -775,7 +776,8 @@ class LearningProcessor:
         Queries pending/promoted learnings for the project, applies confidence
         decay (observed/inferred lose 1 point per 30 days), filters out stale
         entries below CONFIDENCE_FLOOR, and returns top learnings sorted by
-        effective confidence then recurrence count.
+        a composite score of file-path overlap, keyword overlap, effective
+        confidence, and recurrence count.
         """
         try:
             query = (
@@ -803,25 +805,51 @@ class LearningProcessor:
                     alive.append(learning)
             results = alive
 
-            # Filter by keyword overlap if task keywords provided
-            if task_keywords:
-                task_words = {w.lower() for w in task_keywords if len(w) > 2}
-                if task_words:
-                    scored = []
-                    for learning in results:
-                        desc_words = set(_normalize(learning.get("description", "")).split())
-                        overlap = len(task_words & desc_words)
-                        scored.append((overlap, learning))
-                    # Sort by overlap desc, then effective confidence, then recurrence
-                    scored.sort(
-                        key=lambda x: (
-                            x[0],
-                            x[1].get("effective_confidence", 5),
-                            x[1].get("recurrence_count", 0),
-                        ),
-                        reverse=True,
-                    )
-                    results = [item for _, item in scored]
+            # Score by file-path overlap when task has allowed_paths
+            if file_paths:
+                task_dirs: set[str] = set()
+                for fp in file_paths:
+                    parts = fp.strip("/").split("/")
+                    for i in range(len(parts)):
+                        task_dirs.add("/".join(parts[: i + 1]))
+
+                for learning in results:
+                    learning_files = learning.get("files") or []
+                    if learning_files:
+                        learning_dirs: set[str] = set()
+                        for lf in learning_files:
+                            lf_parts = lf.strip("/").split("/")
+                            for i in range(len(lf_parts)):
+                                learning_dirs.add("/".join(lf_parts[: i + 1]))
+                        overlap = len(task_dirs & learning_dirs)
+                        learning["_file_overlap"] = overlap
+                    else:
+                        learning["_file_overlap"] = 0
+
+            # Combined scoring: keyword overlap + file overlap + confidence + recurrence
+            scored = []
+            for learning in results:
+                kw_score = 0
+                if task_keywords:
+                    task_words = {w.lower() for w in task_keywords if len(w) > 2}
+                    desc_words = set(_normalize(learning.get("description", "")).split())
+                    kw_score = len(task_words & desc_words) if task_words else 0
+
+                file_score = learning.get("_file_overlap", 0)
+                eff_conf = learning.get("effective_confidence", 5)
+                recurrence = learning.get("recurrence_count", 0)
+
+                # Composite score: file overlap weighted higher when available
+                composite = (
+                    file_score * 3   # file overlap most relevant
+                    + kw_score * 2   # keyword overlap
+                    + eff_conf       # confidence
+                    + recurrence     # recurrence
+                )
+                scored.append((composite, learning))
+
+            scored.sort(key=lambda x: x[0], reverse=True)
+            results = [item for _, item in scored]
 
             return results[:limit]
         except Exception as e:
@@ -846,6 +874,71 @@ class LearningProcessor:
             return resp.data or []
         except Exception as e:
             logger.error(f"Failed to fetch relevant patterns: {e}")
+            return []
+
+    def get_project_top_learnings(
+        self,
+        project_id: str | None,
+        limit: int = 5,
+        min_tier: str = TIER_PROBATION,
+    ) -> list[dict[str, Any]]:
+        """Fetch top project-wide learnings for agent wake-up context.
+
+        Unlike ``get_relevant_learnings`` which is task-keyword-scoped, this
+        method returns the highest-confidence learnings across the entire project
+        without filtering by task keywords or file paths.  Only human-approved
+        learnings (probation/promoted) are returned by default.
+
+        Used by the wake-up context builder so agents start each session
+        with awareness of established project patterns.
+        """
+        allowed_tiers = []
+        if min_tier == TIER_PROBATION:
+            allowed_tiers = [TIER_PROBATION, TIER_PROMOTED]
+        elif min_tier == TIER_PROMOTED:
+            allowed_tiers = [TIER_PROMOTED]
+        else:
+            allowed_tiers = [TIER_CANDIDATE, TIER_PROBATION, TIER_PROMOTED]
+
+        try:
+            query = (
+                self._client.table(TABLE)
+                .select("*")
+                .in_("tier", allowed_tiers)
+                .in_("status", ["pending", "promoted"])
+            )
+            if project_id:
+                query = query.eq("project_id", project_id)
+            # Fetch more than needed for post-filter
+            query = query.order("recurrence_count", desc=True).limit(limit * 3)
+            resp = query.execute()
+            results = resp.data or []
+
+            if not results:
+                return []
+
+            now = datetime.now()
+
+            # Apply confidence decay and filter stale learnings
+            alive = []
+            for learning in results:
+                eff_conf = _effective_confidence(learning, now)
+                if eff_conf >= CONFIDENCE_FLOOR:
+                    learning["effective_confidence"] = eff_conf
+                    alive.append(learning)
+
+            # Sort by effective confidence DESC, then recurrence DESC
+            alive.sort(
+                key=lambda x: (
+                    x.get("effective_confidence", 0),
+                    x.get("recurrence_count", 0),
+                ),
+                reverse=True,
+            )
+
+            return alive[:limit]
+        except Exception as e:
+            logger.error(f"Failed to fetch project top learnings: {e}")
             return []
 
     # ── Validation ────────────────────────────────────────────────────

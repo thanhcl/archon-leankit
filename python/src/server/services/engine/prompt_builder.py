@@ -32,6 +32,7 @@ DEFAULT_BUILD_COMMAND = "pnpm build && pnpm test"
 DEFAULT_TOKEN_BUDGET = 1500
 DEFAULT_MIN_RELEVANCE = 0.60
 MAX_RETRY_CONTEXT_TOKENS = 300
+DEFAULT_WAKEUP_BUDGET = 200
 
 # Compact report template — replaces verbose per-field descriptions with a single block.
 # This alone saves ~250 tokens compared to the old verbose template.
@@ -68,6 +69,7 @@ class PromptBuilder:
         token_budget: int = DEFAULT_TOKEN_BUDGET,
         min_relevance: float = DEFAULT_MIN_RELEVANCE,
         compress: bool = True,
+        wakeup_budget: int = DEFAULT_WAKEUP_BUDGET,
     ):
         self._rag_service = rag_service
         self._learning_processor = learning_processor
@@ -78,6 +80,7 @@ class PromptBuilder:
         self.token_budget = token_budget
         self.min_relevance = min_relevance
         self.compress = compress
+        self._wakeup_budget = wakeup_budget
 
     @property
     def rag_service(self) -> Any:
@@ -125,12 +128,18 @@ class PromptBuilder:
         learnings = self._fetch_relevant_learnings(task)
         intel_summary = await self._fetch_codebase_intel(task)
 
-        if self.compress:
-            prompt = self._render_compressed(task, project, kb_context, cmd, code_patterns, learnings, agent_definition, review_feedback=review_feedback, intel_summary=intel_summary)
-        else:
-            prompt = self._render(task, project, kb_context, cmd, code_patterns, learnings, agent_definition, review_feedback=review_feedback, intel_summary=intel_summary)
+        # Build wake-up context (MemPalace-inspired tiered loading)
+        wakeup_text, wakeup_tokens = await self._build_wakeup_context(
+            task, project=project, agent_definition=agent_definition,
+            wakeup_budget=self._wakeup_budget,
+        )
 
-        injection_stats = self._compute_injection_stats(prompt, kb_context, code_patterns, learnings)
+        if self.compress:
+            prompt = self._render_compressed(task, project, kb_context, cmd, code_patterns, learnings, agent_definition, review_feedback=review_feedback, intel_summary=intel_summary, wakeup_context=wakeup_text)
+        else:
+            prompt = self._render(task, project, kb_context, cmd, code_patterns, learnings, agent_definition, review_feedback=review_feedback, intel_summary=intel_summary, wakeup_context=wakeup_text)
+
+        injection_stats = self._compute_injection_stats(prompt, kb_context, code_patterns, learnings, wakeup_tokens=wakeup_tokens)
         return prompt, injection_stats
 
     def _compute_injection_stats(
@@ -139,6 +148,7 @@ class PromptBuilder:
         kb_chunks: list[dict[str, Any]],
         code_patterns: list[dict[str, Any]],
         learnings: list[dict[str, Any]],
+        wakeup_tokens: int = 0,
     ) -> dict[str, Any]:
         """Compute stats about what was injected into the prompt."""
         parts: list[str] = []
@@ -151,7 +161,7 @@ class PromptBuilder:
         guidance_text = "".join(parts) if parts else ""
         injection_tokens = estimate_tokens(guidance_text) if guidance_text else 0
         total_prompt_tokens = estimate_tokens(prompt) if prompt else 0
-        task_context_tokens = total_prompt_tokens - injection_tokens
+        task_context_tokens = total_prompt_tokens - injection_tokens - wakeup_tokens
 
         # Guidance pack hash for versioning — correlate pack changes with success rate
         guidance_hash = hashlib.md5(guidance_text.encode()).hexdigest()[:12] if guidance_text else ""
@@ -161,9 +171,11 @@ class PromptBuilder:
             "patterns": len(code_patterns),
             "kb_chunks": len(kb_chunks),
             "tokens": injection_tokens,
+            "wakeup_tokens": wakeup_tokens,
             "guidance_pack_hash": guidance_hash,
             "prompt_token_breakdown": {
                 "guidance_pack_tokens": injection_tokens,
+                "wakeup_tokens": wakeup_tokens,
                 "task_context_tokens": max(0, task_context_tokens),
                 "total_prompt_tokens": total_prompt_tokens,
             },
@@ -264,6 +276,134 @@ class PromptBuilder:
             lines.append(f"- {icon}{area_tag}{recurrence_tag}{conf_tag} {desc}")
         lines.append("")
         return "\n".join(lines)
+
+    # ------------------------------------------------------------------
+    # Agent Wake-Up Context (MemPalace-inspired tiered loading)
+    # ------------------------------------------------------------------
+
+    async def _build_wakeup_context(
+        self,
+        task: dict[str, Any],
+        project: dict[str, Any] | None = None,
+        agent_definition: dict[str, Any] | None = None,
+        wakeup_budget: int = DEFAULT_WAKEUP_BUDGET,
+    ) -> tuple[str, int]:
+        """Build a compact wake-up context blob for agent session start.
+
+        Assembles four sections (each gracefully omitted if data unavailable):
+        1. Agent Identity — role and specialization (~20 tokens)
+        2. Project Context — name and tech stack (~40 tokens)
+        3. Top-N Promoted Learnings — project-wide patterns (~80 tokens)
+        4. Recent Execution Context — last 3 completed runs (~60 tokens)
+
+        Returns:
+            Tuple of (wakeup_text, wakeup_token_count).
+            Empty string and 0 if no context is available.
+        """
+        sections: list[str] = []
+
+        # 1. Agent Identity
+        if agent_definition:
+            name = agent_definition.get("name") or "Agent"
+            role = agent_definition.get("role") or ""
+            specialization = agent_definition.get("specialization") or ""
+            identity_parts = [f"You are **{name}**"]
+            if role:
+                identity_parts.append(f"a {role} agent")
+            if specialization:
+                identity_parts.append(f"specializing in {specialization}")
+            sections.append(", ".join(identity_parts) + ".")
+
+        # 2. Project Context
+        project_name = (project or {}).get("title") or task.get("source_app") or ""
+        if project_name:
+            # Tech stack from codebase intel (already fetched separately)
+            stack = (project or {}).get("tech_stack") or ""
+            proj_line = f"Project: **{project_name}**"
+            if stack:
+                proj_line += f" | Stack: {stack}"
+            sections.append(proj_line)
+
+        # 3. Top-N Promoted Learnings (project-wide, not task-scoped)
+        project_id = task.get("project_id")
+        top_learnings = self._fetch_project_top_learnings(project_id)
+        if top_learnings:
+            learning_lines = ["Key project patterns:"]
+            for learning in top_learnings[:5]:
+                desc = (learning.get("description") or "")[:100]
+                tier = learning.get("tier", "")
+                tier_tag = " [promoted]" if tier == "promoted" else ""
+                learning_lines.append(f"- {desc}{tier_tag}")
+            sections.append("\n".join(learning_lines))
+
+        # 4. Recent Execution Context
+        recent_runs = await self._fetch_recent_execution_summaries(project_id)
+        if recent_runs:
+            run_lines = ["Recent work:"]
+            for i, run in enumerate(recent_runs[:3], 1):
+                summary = (run.get("result_summary") or "completed")[:80]
+                run_lines.append(f"{i}) {summary}")
+            sections.append("\n".join(run_lines))
+
+        if not sections:
+            return "", 0
+
+        wakeup_text = "## Agent Context\n" + "\n".join(sections)
+
+        # Enforce token budget — truncate if over budget
+        wakeup_tokens = estimate_tokens(wakeup_text)
+        if wakeup_tokens > wakeup_budget:
+            # Progressive truncation: drop recent runs first, then learnings
+            if recent_runs and len(sections) > 2:
+                sections = sections[:-1]  # Drop recent runs
+                wakeup_text = "## Agent Context\n" + "\n".join(sections)
+                wakeup_tokens = estimate_tokens(wakeup_text)
+            if wakeup_tokens > wakeup_budget and top_learnings and len(sections) > 1:
+                sections = sections[:-1]  # Drop learnings
+                wakeup_text = "## Agent Context\n" + "\n".join(sections)
+                wakeup_tokens = estimate_tokens(wakeup_text)
+
+        return wakeup_text, wakeup_tokens
+
+    def _fetch_project_top_learnings(
+        self, project_id: str | None,
+    ) -> list[dict[str, Any]]:
+        """Fetch top project-wide learnings (probation/promoted) for wake-up context."""
+        if self._learning_processor is None:
+            return []
+        try:
+            return self._learning_processor.get_project_top_learnings(
+                project_id=project_id,
+                limit=5,
+            )
+        except Exception as e:
+            logger.warning(f"Failed to fetch project top learnings (non-fatal): {e}")
+            return []
+
+    async def _fetch_recent_execution_summaries(
+        self, project_id: str | None,
+    ) -> list[dict[str, Any]]:
+        """Fetch result summaries from the last 3 completed runs for this project."""
+        if not project_id:
+            return []
+        try:
+            from ...utils import get_supabase_client
+
+            client = get_supabase_client()
+            resp = (
+                client.table("archon_execution_runs")
+                .select("task_id,result_summary,finished_at")
+                .eq("project_id", project_id)
+                .eq("status", "completed")
+                .not_.is_("result_summary", "null")
+                .order("finished_at", desc=True)
+                .limit(3)
+                .execute()
+            )
+            return resp.data or []
+        except Exception as e:
+            logger.warning(f"Failed to fetch recent execution summaries (non-fatal): {e}")
+            return []
 
     # ------------------------------------------------------------------
     # Codebase intelligence integration
@@ -870,6 +1010,7 @@ class PromptBuilder:
         agent_definition: dict[str, Any] | None = None,
         review_feedback: dict[str, Any] | None = None,
         intel_summary: str | None = None,
+        wakeup_context: str = "",
     ) -> str:
         """Render prompt with context compression applied.
 
@@ -905,7 +1046,13 @@ class PromptBuilder:
             f"tokens: ~{metrics['final_estimated_tokens']}"
         )
 
-        parts: list[str] = [
+        parts: list[str] = []
+
+        # Wake-up context — agent identity, project context, top learnings, recent runs
+        if wakeup_context:
+            parts += [wakeup_context, "", "---", ""]
+
+        parts += [
             f"# Task: {title}",
             f"# Priority: {priority} | Assigned: {assignee}",
             f"# Project: {source_app}",
@@ -1003,6 +1150,7 @@ class PromptBuilder:
         agent_definition: dict[str, Any] | None = None,
         review_feedback: dict[str, Any] | None = None,
         intel_summary: str | None = None,
+        wakeup_context: str = "",
     ) -> str:
         title = task.get("title", "Untitled")
         priority = task.get("priority", "medium")
@@ -1011,7 +1159,13 @@ class PromptBuilder:
         description = task.get("description") or "_No description provided._"
         exec_prompt = task.get("execution_prompt") or ""
 
-        parts: list[str] = [
+        parts: list[str] = []
+
+        # Wake-up context — agent identity, project context, top learnings, recent runs
+        if wakeup_context:
+            parts += [wakeup_context, "", "---", ""]
+
+        parts += [
             f"# Task: {title}",
             f"# Priority: {priority} | Assigned: {assignee}",
             f"# Project: {source_app}",

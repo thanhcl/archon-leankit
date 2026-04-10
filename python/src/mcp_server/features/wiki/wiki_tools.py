@@ -521,3 +521,97 @@ def register_wiki_tools(mcp: FastMCP):
         except Exception as e:
             logger.error(f"Error in wiki_export_obsidian: {e}", exc_info=True)
             return MCPErrorFormatter.from_exception(e, "export obsidian vault")
+
+    @mcp.tool()
+    async def wiki_quote(
+        ctx: Context,
+        page_id: str,
+        quote: str,
+        source_url: str = "",
+        context: str = "",
+        stale_after_days: int = 90,
+    ) -> str:
+        """
+        Capture a verbatim quote as evidence attached to a wiki page.
+
+        Use this to preserve exact text (error messages, API constraints,
+        code review findings) with full provenance. Verbatim evidence
+        achieves higher recall than summarized content.
+
+        The quote is deduplicated by content hash — calling with the same
+        quote twice will not create a duplicate.
+
+        Args:
+            page_id: UUID of the wiki page to attach evidence to
+            quote: Exact verbatim text to preserve (max ~500 chars recommended)
+            source_url: Where the quote came from (URL, file path, etc.)
+            context: Surrounding context explaining the quote's relevance
+            stale_after_days: Days before the quote is flagged for re-verification (default: 90)
+
+        Returns:
+            JSON with quote_hash, evidence_count, and quality_score.
+        """
+        try:
+            api_url = get_api_url()
+            timeout = get_default_timeout()
+
+            payload = {
+                "quote": quote,
+                "source_url": source_url,
+                "context": context,
+                "captured_by": "agent",
+                "stale_after_days": stale_after_days,
+            }
+
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                response = await client.post(
+                    urljoin(api_url, f"/api/wiki/pages/{page_id}/evidence"),
+                    json=payload,
+                )
+                response.raise_for_status()
+                data = response.json()
+
+            return json.dumps(data, indent=2)
+        except Exception as e:
+            logger.error(f"Error in wiki_quote: {e}", exc_info=True)
+            return MCPErrorFormatter.from_exception(e, "capture wiki evidence")
+
+    @mcp.tool()
+    async def wiki_search_evidence(
+        ctx: Context,
+        project_id: str,
+        query: str,
+        limit: int = 10,
+    ) -> str:
+        """
+        Search verbatim evidence quotes across all wiki pages in a project.
+
+        Returns matching quotes with their source pages. Use this when you
+        need to find exact text that was previously captured.
+
+        Args:
+            project_id: Project UUID to search within
+            query: Keywords to search in quote text and context
+            limit: Max results (default: 10)
+
+        Returns:
+            JSON with matching pages and their evidence items.
+        """
+        try:
+            api_url = get_api_url()
+            timeout = get_default_timeout()
+
+            params = {"project_id": project_id, "query": query, "limit": limit}
+
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                response = await client.get(
+                    urljoin(api_url, "/api/wiki/evidence/search"),
+                    params=params,
+                )
+                response.raise_for_status()
+                data = response.json()
+
+            return json.dumps(data, indent=2)
+        except Exception as e:
+            logger.error(f"Error in wiki_search_evidence: {e}", exc_info=True)
+            return MCPErrorFormatter.from_exception(e, "search wiki evidence")

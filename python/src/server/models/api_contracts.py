@@ -77,6 +77,18 @@ class ExecutionRunStage(str, Enum):
     RETRY = "retry"
 
 
+class AgentRuntimeStatus(str, Enum):
+    ONLINE = "online"
+    OFFLINE = "offline"
+    DEGRADED = "degraded"
+
+
+class AssigneeType(str, Enum):
+    AGENT = "agent"
+    HUMAN = "human"
+    UNASSIGNED = "unassigned"
+
+
 class RuleSource(str, Enum):
     MANUAL = "manual"
     AUTO = "auto"
@@ -1814,6 +1826,87 @@ class ReviewFeedbackListResponse(BaseModel):
 
     feedback: list[ReviewFeedbackResponse] = Field(default_factory=list)
     total_count: int = 0
+
+
+# ── Agent Runtime Models ──────────────────────────────────────────────
+
+
+class AgentRuntimeResponse(BaseModel):
+    """Response shape for a single agent runtime."""
+
+    id: str
+    device_name: str
+    status: AgentRuntimeStatus
+    capabilities: list[str] = Field(default_factory=list)
+    supported_runners: list[str] = Field(default_factory=list)
+    max_concurrent_tasks: int = 1
+    current_task_count: int = 0
+    agent_id: str | None = None
+    version: str | None = None
+    last_heartbeat: str | None = None
+    registered_at: str | None = None
+    unregistered_at: str | None = None
+    metadata: dict[str, Any] | None = None
+    created_at: str | None = None
+    updated_at: str | None = None
+
+    model_config = {"use_enum_values": True}
+
+
+class AgentRuntimeListResponse(BaseModel):
+    """Response shape for runtime list endpoint."""
+
+    runtimes: list[AgentRuntimeResponse]
+    total_count: int
+    filters_applied: str = "none"
+
+    model_config = {"use_enum_values": True}
+
+
+class RegisterRuntimeRequest(BaseModel):
+    """Request shape for registering a new agent runtime."""
+
+    device_name: str
+    capabilities: list[str]
+    supported_runners: list[str]
+    max_concurrent_tasks: int = 1
+    agent_id: str | None = None
+    version: str | None = None
+    metadata: dict[str, Any] | None = None
+
+    model_config = {"use_enum_values": True}
+
+
+class RuntimeHeartbeatRequest(BaseModel):
+    """Request shape for runtime heartbeat."""
+
+    current_task_count: int | None = None
+
+
+class RuntimeProgressRequest(BaseModel):
+    """Request shape for task execution progress report."""
+
+    runtime_id: str
+    step_count: int | None = None
+    percentage: float | None = None
+    current_action: str | None = None
+
+
+class ClaimTaskResponse(BaseModel):
+    """Response shape for task claim endpoint."""
+
+    task: dict[str, Any] | None = None
+    message: str | None = None
+
+
+class AssignTaskRequest(BaseModel):
+    """Request shape for polymorphic task assignment."""
+
+    assignee_type: AssigneeType
+    assignee_id: str | None = None
+    reason: str | None = None
+
+    model_config = {"use_enum_values": True}
 
 
 # ── Validation Helpers ─────────────────────────────────────────────────

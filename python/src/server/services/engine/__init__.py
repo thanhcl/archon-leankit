@@ -11,6 +11,7 @@ Modules:
 - architect_reviewer: Hybrid reviewer (self-review / multi-provider API)
 - task_engine: Main daemon loop — polls, spawns, monitors
 - notifier: Pushes task lifecycle events to channels
+- deviation_classifier: Classifies execution failures for smart retry routing
 - health_monitor: Computes metrics and fires health alerts
 
 Package boundary rules
@@ -47,10 +48,21 @@ from .cc_spawner import (
     ProjectConfig,
 )
 from .codex_hook_publisher import CodexHookPublisher
+from .deviation_classifier import (
+    DEVIATION_ARCHITECTURAL_ISSUE,
+    DEVIATION_BOUNDARY_VIOLATION,
+    DEVIATION_BUG_FIX,
+    DEVIATION_DEPENDENCY_BLOCKER,
+    DEVIATION_MISSING_REQUIREMENT,
+    DEVIATION_TEST_FAILURE,
+    VALID_DEVIATION_TYPES,
+    DeviationClassifier,
+)
 from .codex_runner import CODEX_DEFAULT_MODEL, CODEX_RUNNER_KEY, CodexRunnerAdapter
 from .health_monitor import EngineMetrics, HealthAlert, HealthMonitor, HealthThresholds
 from .learning_processor import LearningProcessor
 from .notifier import Notifier, NotifierConfig, TaskEvent
+from .plan_validator import PlanValidationResult, PlanValidator, ValidationDimension
 from .prompt_builder import PromptBuilder
 from .runner_adapter import DEFAULT_RUNNER_KEY, ClaudeCodeRunnerAdapter, ExecutionRunner
 from .runner_routing import (
@@ -67,7 +79,9 @@ from .sandbox_provider import (
     SandboxProvider,
     get_provider_for_isolation,
 )
+from .stall_detector import StallDetector, StallResult
 from .task_engine import TaskEngine
+from .verification_agent import CriterionVerification, VerificationAgent, VerificationResult
 
 __all__ = [
     "ArchitectReviewer",
@@ -92,11 +106,20 @@ __all__ = [
     "LearningProcessor",
     "Notifier",
     "NotifierConfig",
+    "PlanValidationResult",
+    "PlanValidator",
     "ProjectConfig",
     "PromptBuilder",
     "ClaudeCodeRunnerAdapter",
     "ReviewAction",
     "ReviewConfig",
+    "DEVIATION_ARCHITECTURAL_ISSUE",
+    "DEVIATION_BOUNDARY_VIOLATION",
+    "DEVIATION_BUG_FIX",
+    "DEVIATION_DEPENDENCY_BLOCKER",
+    "DEVIATION_MISSING_REQUIREMENT",
+    "DEVIATION_TEST_FAILURE",
+    "DeviationClassifier",
     "DEFAULT_RUNNER_KEY",
     "ExecutionRunner",
     "RUNNER_CAPABILITY_MATRIX",
@@ -106,8 +129,14 @@ __all__ = [
     "SandboxProvider",
     "GlobalCapacityTracker",
     "SharedAgentPool",
+    "StallDetector",
+    "StallResult",
     "TaskEngine",
     "TaskEvent",
+    "ValidationDimension",
+    "CriterionVerification",
+    "VerificationAgent",
+    "VerificationResult",
     "get_provider_for_isolation",
     "get_runner_capabilities",
     "resolve_runner_selection",

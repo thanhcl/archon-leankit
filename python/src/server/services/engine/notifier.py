@@ -114,12 +114,24 @@ EVENT_APPROVAL_REQUESTED = "approval_requested"
 EVENT_APPROVAL_DECIDED = "approval_decided"
 EVENT_TASK_CONTRACT_GATE_BLOCKED = "task_contract_gate_blocked"
 EVENT_REVIEW_FEEDBACK_WRITTEN = "review_feedback_written"
+EVENT_STALL_DETECTED = "stall_detected"
+EVENT_VERIFICATION_COMPLETE = "verification_complete"
+EVENT_PLAN_VALIDATION = "plan_validation_complete"
+
+# Runtime lifecycle events (Multica adoption — Workstream M)
+EVENT_RUNTIME_REGISTERED = "runtime_registered"
+EVENT_RUNTIME_UNREGISTERED = "runtime_unregistered"
+EVENT_RUNTIME_STATUS_CHANGED = "runtime_status_changed"
+EVENT_TASK_CLAIMED = "task_claimed"
+EVENT_TASK_RELEASED = "task_released"
+EVENT_ASSIGNMENT_CHANGED = "assignment_changed"
 
 _CRITICAL_EVENTS = frozenset({
     EVENT_TASK_ESCALATED,
     EVENT_TASK_FAILED,
     EVENT_HEALTH_ALERT,
     EVENT_BUDGET_EXCEEDED,
+    EVENT_STALL_DETECTED,
 })
 
 
@@ -145,6 +157,7 @@ def _resolve_unified_type(event_name: str) -> str:
         EVENT_HEALTH_ALERT,
         EVENT_BUDGET_WARNING,
         EVENT_BUDGET_EXCEEDED,
+        EVENT_STALL_DETECTED,
     }:
         return "health"
     if event_name in {
@@ -163,6 +176,16 @@ def _resolve_unified_type(event_name: str) -> str:
         EVENT_APPROVAL_DECIDED,
     }:
         return "approval"
+    if event_name in {EVENT_VERIFICATION_COMPLETE, EVENT_PLAN_VALIDATION}:
+        return "execution"
+    if event_name in {
+        EVENT_RUNTIME_REGISTERED,
+        EVENT_RUNTIME_UNREGISTERED,
+        EVENT_RUNTIME_STATUS_CHANGED,
+        EVENT_TASK_CLAIMED,
+        EVENT_TASK_RELEASED,
+    }:
+        return "runtime"
     return "task"
 
 
@@ -493,6 +516,64 @@ class Notifier:
                 "stage": payload.get("stage"),
                 "contract_revision": payload.get("contract_revision"),
             },
+        )
+
+    async def on_stall_detected(
+        self,
+        task_id: str,
+        stall_result: dict[str, Any],
+        runtime: dict[str, Any] | None = None,
+    ) -> None:
+        """Emit a stall detection event."""
+        data = self._merge_runtime_context(
+            {
+                "consecutive_count": stall_result.get("consecutive_count"),
+                "outcome_hash": stall_result.get("outcome_hash"),
+                "recommendation": stall_result.get("recommendation"),
+                "models_tried": stall_result.get("models_tried"),
+                "last_error_preview": stall_result.get("last_error_preview"),
+            },
+            runtime,
+        )
+        await self.emit(
+            event=EVENT_STALL_DETECTED,
+            task_id=task_id,
+            data=data,
+            is_critical=True,
+        )
+
+    async def on_verification_complete(
+        self,
+        task_id: str,
+        verification_data: dict[str, Any],
+        runtime: dict[str, Any] | None = None,
+    ) -> None:
+        """Emit a verification complete event."""
+        data = self._merge_runtime_context(verification_data, runtime)
+        await self.emit(
+            event=EVENT_VERIFICATION_COMPLETE,
+            task_id=task_id,
+            data=data,
+        )
+
+    async def on_plan_validation_complete(
+        self,
+        project_id: str,
+        validation_data: dict[str, Any],
+        runtime: dict[str, Any] | None = None,
+    ) -> None:
+        """Emit a plan validation complete event."""
+        data = self._merge_runtime_context(
+            {
+                "project_id": project_id,
+                **validation_data,
+            },
+            runtime,
+        )
+        await self.emit(
+            event=EVENT_PLAN_VALIDATION,
+            task_id="",  # Plan-level, not task-level
+            data=data,
         )
 
     async def on_approval_decided(self, approval: dict[str, Any], decision: str) -> None:

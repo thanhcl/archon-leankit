@@ -224,7 +224,7 @@ def get_runner_token_profiles_path(env: Mapping[str, str] | None = None) -> str 
     return get_env_value("LEANKIT_RUNNER_TOKEN_PROFILES_PATH", env=env)
 
 
-_DEFAULT_RUNNER_ENV_ALLOWLIST = "MAX_THINKING_TOKENS,CLAUDE_AUTOCOMPACT_PCT_OVERRIDE,CLAUDE_CODE_SUBAGENT_MODEL"
+_DEFAULT_RUNNER_ENV_ALLOWLIST = "MAX_THINKING_TOKENS,CLAUDE_AUTOCOMPACT_PCT_OVERRIDE,CLAUDE_CODE_SUBAGENT_MODEL,RTK_CONFIG_PATH,RTK_TRACKING,RTK_DISABLED"
 
 # Prefixes stripped from the inherited environment before spawning runner subprocesses.
 # This prevents the engine's own API keys from leaking into runner sessions and is a
@@ -348,3 +348,29 @@ def get_channel_health_alert_dedupe_seconds(env: Mapping[str, str] | None = None
         return max(60, int(value))
     except ValueError:
         return 1800
+
+
+# ---------------------------------------------------------------------------
+# RTK token optimization
+# ---------------------------------------------------------------------------
+
+
+def get_rtk_enabled(env: Mapping[str, str] | None = None) -> bool:
+    """Resolve whether RTK output compression is enabled for runner sessions.
+
+    See: docs/design/what-we-adopt-from-rtk.md
+    """
+    value = get_env_value("LEANKIT_RTK_ENABLED", env=env)
+    if value is None:
+        return False
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def get_rtk_config_path(env: Mapping[str, str] | None = None) -> str | None:
+    """Resolve the optional RTK config.toml override path."""
+    return get_env_value("LEANKIT_RTK_CONFIG_PATH", env=env)
+
+
+def get_rtk_binary_path(env: Mapping[str, str] | None = None) -> str | None:
+    """Resolve the RTK binary path override."""
+    return get_env_value("LEANKIT_RTK_BINARY_PATH", env=env)

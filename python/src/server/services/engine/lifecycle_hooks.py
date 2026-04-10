@@ -107,6 +107,16 @@ class LifecycleHooks:
             context["duration_seconds"] = getattr(runner_result, "duration_seconds", None)
             context["timed_out"] = getattr(runner_result, "timed_out", False)
 
+            # RTK token savings (A-2): capture from parsed result metadata
+            parsed = getattr(runner_result, "parsed", None)
+            if isinstance(parsed, dict):
+                rtk_stats = parsed.get("rtk_session_stats")
+                if rtk_stats and isinstance(rtk_stats, dict):
+                    context["rtk_session_stats"] = rtk_stats
+                rtk_tee = parsed.get("rtk_tee_path")
+                if rtk_tee:
+                    context["rtk_tee_path"] = rtk_tee
+
         if metrics and isinstance(metrics, dict):
             context["token_input"] = metrics.get("token_input")
             context["token_output"] = metrics.get("token_output")
