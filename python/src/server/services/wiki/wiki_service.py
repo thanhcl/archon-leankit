@@ -750,3 +750,269 @@ class WikiService:
         except Exception as e:
             logger.error(f"Error getting stale evidence: {e}")
             return False, []
+
+    # ── Cross-Project Knowledge Tunnels (MemPalace-inspired) ─────
+
+    TUNNEL_TABLE = "archon_wiki_tunnels"
+    VALID_TUNNEL_TYPES = {"reference", "extends", "consumes", "publishes"}
+    VALID_VISIBILITY = {"read_only", "bidirectional"}
+
+    def create_tunnel(
+        self,
+        from_page_id: str,
+        to_page_id: str,
+        tunnel_type: str = "reference",
+        visibility: str = "read_only",
+        context: str = "",
+        created_by: str = "system",
+    ) -> tuple[bool, dict[str, Any]]:
+        """Create a cross-project knowledge tunnel (pending approval).
+
+        The tunnel is created without approval — TeamLead must call
+        approve_tunnel() before it becomes active in graph traversal.
+        """
+        if tunnel_type not in self.VALID_TUNNEL_TYPES:
+            return False, {"error": f"Invalid tunnel_type: {tunnel_type}"}
+        if visibility not in self.VALID_VISIBILITY:
+            return False, {"error": f"Invalid visibility: {visibility}"}
+        if from_page_id == to_page_id:
+            return False, {"error": "Cannot tunnel a page to itself"}
+
+        try:
+            tunnel_data = {
+                "id": str(uuid4()),
+                "from_page_id": from_page_id,
+                "to_page_id": to_page_id,
+                "tunnel_type": tunnel_type,
+                "visibility": visibility,
+                "context": context[:500] if context else "",
+                "created_by": created_by,
+            }
+
+            result = (
+                self.supabase.table(self.TUNNEL_TABLE)
+                .insert(tunnel_data)
+                .execute()
+            )
+
+            if result.data:
+                return True, result.data[0]
+            return False, {"error": "Insert returned no data"}
+
+        except Exception as e:
+            error_str = str(e)
+            if "uq_wiki_tunnel" in error_str or "duplicate" in error_str.lower():
+                return False, {"error": "Duplicate tunnel already exists"}
+            logger.error(f"Error creating tunnel: {e}")
+            return False, {"error": error_str}
+
+    def approve_tunnel(
+        self,
+        tunnel_id: str,
+        approved_by: str,
+    ) -> tuple[bool, dict[str, Any]]:
+        """Approve a pending tunnel (TeamLead action)."""
+        try:
+            now = datetime.now(timezone.utc).isoformat()
+            result = (
+                self.supabase.table(self.TUNNEL_TABLE)
+                .update({"approved_by": approved_by, "approved_at": now})
+                .eq("id", tunnel_id)
+                .is_("revoked_at", "null")
+                .execute()
+            )
+            if result.data:
+                return True, result.data[0]
+            return False, {"error": f"Tunnel {tunnel_id} not found or already revoked"}
+        except Exception as e:
+            logger.error(f"Error approving tunnel: {e}")
+            return False, {"error": str(e)}
+
+    def revoke_tunnel(
+        self,
+        tunnel_id: str,
+    ) -> tuple[bool, str]:
+        """Soft-revoke a tunnel (sets revoked_at, preserves audit trail)."""
+        try:
+            now = datetime.now(timezone.utc).isoformat()
+            result = (
+                self.supabase.table(self.TUNNEL_TABLE)
+                .update({"revoked_at": now})
+                .eq("id", tunnel_id)
+                .is_("revoked_at", "null")
+                .execute()
+            )
+            if result.data:
+                return True, "Tunnel revoked"
+            return False, f"Tunnel {tunnel_id} not found or already revoked"
+        except Exception as e:
+            logger.error(f"Error revoking tunnel: {e}")
+            return False, str(e)
+
+    def list_tunnels(
+        self,
+        page_id: str | None = None,
+        project_id: str | None = None,
+        tunnel_type: str | None = None,
+    ) -> tuple[bool, list[dict[str, Any]]]:
+        """List active (non-revoked) tunnels for a page or project."""
+        try:
+            query = (
+                self.supabase.table(self.TUNNEL_TABLE)
+                .select("*")
+                .is_("revoked_at", "null")
+            )
+
+            if tunnel_type:
+                query = query.eq("tunnel_type", tunnel_type)
+
+            if page_id:
+                # Tunnels where this page is either endpoint
+                # Supabase doesn't support OR directly — fetch both directions
+                from_result = query.eq("from_page_id", page_id).execute()
+                to_query = (
+                    self.supabase.table(self.TUNNEL_TABLE)
+                    .select("*")
+                    .is_("revoked_at", "null")
+                    .eq("to_page_id", page_id)
+                )
+                if tunnel_type:
+                    to_query = to_query.eq("tunnel_type", tunnel_type)
+                to_result = to_query.execute()
+
+                combined = (from_result.data or []) + (to_result.data or [])
+                # Dedup by id
+                seen = set()
+                tunnels = []
+                for t in combined:
+                    if t["id"] not in seen:
+                        seen.add(t["id"])
+                        tunnels.append(t)
+                return True, tunnels
+
+            elif project_id:
+                # Get all page ids for the project, then find tunnels involving them
+                pages_resp = (
+                    self.supabase.table("archon_wiki_pages")
+                    .select("id")
+                    .eq("project_id", project_id)
+                    .execute()
+                )
+                page_ids = [p["id"] for p in (pages_resp.data or [])]
+                if not page_ids:
+                    return True, []
+
+                all_tunnels: list[dict[str, Any]] = []
+                for pid in page_ids:
+                    ok, tunnels = self.list_tunnels(page_id=pid, tunnel_type=tunnel_type)
+                    if ok:
+                        all_tunnels.extend(tunnels)
+
+                # Dedup
+                seen = set()
+                unique = []
+                for t in all_tunnels:
+                    if t["id"] not in seen:
+                        seen.add(t["id"])
+                        unique.append(t)
+                return True, unique
+
+            else:
+                result = query.limit(100).execute()
+                return True, result.data or []
+
+        except Exception as e:
+            logger.error(f"Error listing tunnels: {e}")
+            return False, []
+
+    def _get_active_tunnels_for_page(
+        self, page_id: str,
+    ) -> list[dict[str, Any]]:
+        """Get active (approved + non-revoked) tunnels for a page.
+
+        Used internally by BFS graph traversal.
+        """
+        try:
+            # From this page
+            from_resp = (
+                self.supabase.table(self.TUNNEL_TABLE)
+                .select("*")
+                .eq("from_page_id", page_id)
+                .not_.is_("approved_at", "null")
+                .is_("revoked_at", "null")
+                .execute()
+            )
+            # To this page
+            to_resp = (
+                self.supabase.table(self.TUNNEL_TABLE)
+                .select("*")
+                .eq("to_page_id", page_id)
+                .not_.is_("approved_at", "null")
+                .is_("revoked_at", "null")
+                .execute()
+            )
+            return (from_resp.data or []) + (to_resp.data or [])
+        except Exception as e:
+            logger.warning(f"Error fetching tunnels for page {page_id}: {e}")
+            return []
+
+    def search_tunneled_pages(
+        self,
+        project_id: str,
+        query: str,
+        limit: int = 5,
+    ) -> tuple[bool, list[dict[str, Any]]]:
+        """Search pages in OTHER projects that are tunneled to this project.
+
+        Used by the prompt builder to discover cross-project knowledge.
+        """
+        try:
+            # 1. Get page ids for this project
+            pages_resp = (
+                self.supabase.table("archon_wiki_pages")
+                .select("id")
+                .eq("project_id", project_id)
+                .execute()
+            )
+            local_page_ids = {p["id"] for p in (pages_resp.data or [])}
+            if not local_page_ids:
+                return True, []
+
+            # 2. Find active tunnels pointing TO our pages from other projects
+            remote_page_ids: set[str] = set()
+            for pid in local_page_ids:
+                tunnels = self._get_active_tunnels_for_page(pid)
+                for t in tunnels:
+                    # Get the "other" end of the tunnel
+                    other = t["from_page_id"] if t["to_page_id"] == pid else t["to_page_id"]
+                    if other not in local_page_ids:
+                        remote_page_ids.add(other)
+
+            if not remote_page_ids:
+                return True, []
+
+            # 3. Search those remote pages by query
+            query_lower = query.lower().strip()
+            results: list[dict[str, Any]] = []
+            for rpid in remote_page_ids:
+                ok, page = self.get_page(page_id=rpid, include_links=False)
+                if not ok:
+                    continue
+                content = (page.get("content") or "").lower()
+                title = (page.get("title") or "").lower()
+                if query_lower in content or query_lower in title:
+                    results.append({
+                        "page_id": page["id"],
+                        "title": page.get("title", ""),
+                        "summary": (page.get("summary") or "")[:200],
+                        "project_id": page.get("project_id"),
+                        "is_cross_project": True,
+                    })
+                    if len(results) >= limit:
+                        break
+
+            return True, results
+
+        except Exception as e:
+            logger.error(f"Error searching tunneled pages: {e}")
+            return False, []
