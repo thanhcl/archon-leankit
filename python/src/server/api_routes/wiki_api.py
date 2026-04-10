@@ -1,12 +1,16 @@
 """
-Wiki API endpoints — CRUD for wiki pages, links, graph, and lint.
+Wiki API endpoints — CRUD for wiki pages, links, graph, lint, viewer, and export.
 """
 
+from pathlib import Path
+
 from fastapi import APIRouter, HTTPException
+from fastapi.responses import HTMLResponse, Response
 from pydantic import BaseModel
 
 from ..config.logfire_config import get_logger
 from ..services.wiki.wiki_community_service import WikiCommunityService
+from ..services.wiki.wiki_export_service import WikiExportService
 from ..services.wiki.wiki_service import WikiService
 from ..services.wiki.wiki_lint_service import WikiLintService
 
@@ -247,3 +251,35 @@ async def get_communities(project_id: str):
     if not ok:
         raise HTTPException(status_code=500, detail=result) from None
     return result
+
+
+# ── Viewer Endpoint (C1) ─────────────────────────────────────
+
+@router.get("/viewer", response_class=HTMLResponse)
+async def wiki_viewer():
+    """Serve the standalone Wiki KB HTML viewer."""
+    # Look for the HTML file in multiple locations (Docker + local)
+    candidates = [
+        Path("/app/src/server/static/wiki-viewer.html"),
+        Path(__file__).parent.parent / "static" / "wiki-viewer.html",
+    ]
+    for path in candidates:
+        if path.exists():
+            return HTMLResponse(content=path.read_text(encoding="utf-8"))
+    raise HTTPException(status_code=404, detail="wiki-viewer.html not found") from None
+
+
+# ── Export Endpoint (C3) ──────────────────────────────────────
+
+@router.get("/export/obsidian/{project_id}")
+async def export_obsidian(project_id: str):
+    """Export wiki pages as Obsidian vault (zip download)."""
+    svc = WikiExportService()
+    ok, result = svc.export_obsidian_vault(project_id)
+    if not ok:
+        raise HTTPException(status_code=500, detail=result) from None
+    return Response(
+        content=result,
+        media_type="application/zip",
+        headers={"Content-Disposition": f"attachment; filename=wiki-vault-{project_id[:8]}.zip"},
+    )

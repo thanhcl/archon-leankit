@@ -485,3 +485,39 @@ def register_wiki_tools(mcp: FastMCP):
         except Exception as e:
             logger.error(f"Error in wiki_communities: {e}", exc_info=True)
             return MCPErrorFormatter.from_exception(e, "wiki communities")
+
+    # ── C3: Obsidian Export ───────────────────────────────────
+
+    @mcp.tool()
+    async def wiki_export_obsidian(
+        ctx: Context,
+        project_id: str,
+    ) -> str:
+        """
+        Export wiki pages as an Obsidian vault (zip download).
+
+        Generates a zip archive containing:
+        - One .md file per wiki page with YAML frontmatter
+        - [[wiki-links]] for cross-references
+        - _Index.md listing all pages by type
+        - Community overview files
+
+        The exported vault can be opened directly in Obsidian for
+        graph visualization and offline browsing.
+
+        Args:
+            project_id: Project UUID to export
+
+        Returns:
+            Download URL for the zip file.
+        """
+        try:
+            api_url = get_api_url()
+            return json.dumps({
+                "success": True,
+                "download_url": f"{api_url}/api/wiki/export/obsidian/{project_id}",
+                "message": "Use the download URL to save the Obsidian vault zip file.",
+            }, indent=2)
+        except Exception as e:
+            logger.error(f"Error in wiki_export_obsidian: {e}", exc_info=True)
+            return MCPErrorFormatter.from_exception(e, "export obsidian vault")

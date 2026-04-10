@@ -1,4 +1,4 @@
-import { BookOpen, Bot, Palette, Settings } from "lucide-react";
+import { BookOpen, Bot, Globe, Palette, Settings } from "lucide-react";
 import type React from "react";
 import { Link, useLocation } from "react-router-dom";
 // TEMPORARY: Use old SettingsContext until settings are migrated
@@ -32,6 +32,12 @@ export function Navigation({ className }: NavigationProps) {
       path: "/",
       icon: <BookOpen className="h-5 w-5" />,
       label: "Knowledge Base",
+      enabled: true,
+    },
+    {
+      path: "/wiki",
+      icon: <Globe className="h-5 w-5" />,
+      label: "Wiki KB",
       enabled: true,
     },
     {
