@@ -29,6 +29,7 @@ from .api_routes.bug_report_api import router as bug_report_router
 from .api_routes.channel_health_api import router as channel_health_router
 from .api_routes.cost_budget_api import router as cost_budget_router
 from .api_routes.engine_api import router as engine_router
+from .api_routes.engine_sse_api import router as engine_sse_router
 from .api_routes.engine_policies_api import router as engine_policies_router
 from .api_routes.execution_runs_api import router as execution_runs_router
 from .api_routes.external_requests_api import router as external_requests_router
@@ -247,6 +248,7 @@ app.include_router(channel_health_router)
 app.include_router(version_router)
 app.include_router(migration_router)
 app.include_router(engine_router)
+app.include_router(engine_sse_router)
 app.include_router(engine_policies_router)
 app.include_router(execution_runs_router)
 app.include_router(learnings_router)
